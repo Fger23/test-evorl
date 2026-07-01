@@ -89,9 +89,16 @@ class EagleBackbone(nn.Module):
         else:
             self.eagle_linear = torch.nn.Identity()
 
-        # needed since we don't use these layers. Also saves compute
-        while len(self.eagle_model.language_model.model.layers) > select_layer:
-            self.eagle_model.language_model.model.layers.pop(-1)
+        # ===== 修复 select_layer 为负数时的错误逻辑 =====
+        # 原代码: while len(layers) > select_layer: layers.pop()
+        # 当 select_layer = -1 时条件恒真，会清空所有层。现修正为：
+        # 仅当 select_layer >= 0 时才截断，保留前 select_layer 层；
+        # 若 select_layer == -1 则保留全部层。
+        layers = self.eagle_model.language_model.model.layers
+        if select_layer >= 0:
+            while len(layers) > select_layer:
+                layers.pop()
+        # ============================================
 
         self.select_layer = select_layer
         self.set_trainable_parameters(tune_llm, tune_visual)
@@ -175,14 +182,14 @@ N_COLOR_CHANNELS = 3
 # config
 @dataclass
 class GR00TN15Config(PretrainedConfig):
-    model_type = "gr00t_n1_5"
+    # 所有无默认值的字段（init=False且无default）
     backbone_cfg: dict = field(init=False, metadata={"help": "Backbone configuration."})
-
     action_head_cfg: dict = field(init=False, metadata={"help": "Action head configuration."})
-
     action_horizon: int = field(init=False, metadata={"help": "Action horizon."})
-
     action_dim: int = field(init=False, metadata={"help": "Action dimension."})
+
+    # 然后是有默认值的字段
+    model_type: str = "gr00t_n1_5"
     compute_dtype: str = field(default="float32", metadata={"help": "Compute dtype."})
 
     def __init__(self, **kwargs):

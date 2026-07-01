@@ -1,0 +1,73 @@
+# 合并数据
+python aggregation_data.py
+
+# 验证数据
+lerobot-dataset-report --dataset /nfs/lerobot/s101/datasets/aggregation/evo-rl/insert_card_0630/
+输出：
+[Success Metrics]
+- counts: success=81, failure=0, unlabeled=0
+- success ratio (all episodes): 1.0000
+- success ratio (labeled episodes): 1.0000
+
+# 价值函数训练
+CUDA_VISIBLE_DEVICES=3 lerobot-value-train \
+  --dataset.repo_id=insert_card_0630 \
+  --dataset.root=/nfs/lerobot/s101/datasets/aggregation/evo-rl/insert_card_0630/ \
+  --value.type=pistar06 \
+  --value.push_to_hub=false \
+  --value.repo_id=so101/insert_card_pistar06 \
+  --batch_size=32 \
+  --output_dir=/nfs/lerobot/s101/models/evo/so101/insert_card_pistar06 \
+  --job_name=so101/insert_card_pistar06 \
+  --wandb.enable=false
+
+CUDA_VISIBLE_DEVICES=7 lerobot-value-train \
+  --dataset.repo_id=insert_card_0630 \
+  --dataset.root=/nfs/lerobot/s101/datasets/aggregation/evo-rl/insert_card_0630/ \
+  --steps=20000 \
+  --save_freq=5000 \
+  --value.type=pistar06 \
+  --value.push_to_hub=false \
+  --value.repo_id=so101/insert_card_pistar06 \
+  --batch_size=32 \
+  --output_dir=/nfs/lerobot/s101/models/evo/so101/insert_card_pistar06_2 \
+  --job_name=so101/insert_card_pistar06 \
+  --wandb.enable=false
+
+# 价值函数推理
+lerobot-value-infer \
+  --dataset.repo_id=insert_card_0630 \
+  --dataset.root=/nfs/lerobot/s101/datasets/aggregation/evo-rl/insert_card_0630/ \
+  --inference.checkpoint_path=/nfs/lerobot/s101/models/evo/so101/insert_card_pistar06_2/checkpoints/last/pretrained_model/ \
+  --runtime.device=cuda:7 \
+  --runtime.batch_size=32 \
+  --acp.enable=true \
+  --acp.n_step=50 \
+  --acp.positive_ratio=0.3 \
+  --acp.value_field=complementary_info.value \
+  --acp.advantage_field=complementary_info.advantage \
+  --acp.indicator_field=complementary_info.acp_indicator \
+  --output_dir=/nfs/lerobot/s101/models/evo/so101/value_infer/insert_card_pistar06 \
+  --job_name=insert_card_pistar06.infer
+
+
+# 训练策略   --policy.dtype=bfloat16 (现存不够时可选)
+CUDA_VISIBLE_DEVICES=3 lerobot-train \
+  --dataset.repo_id=insert_card_0630 \
+  --dataset.root=/nfs/lerobot/s101/datasets/aggregation/evo-rl/insert_card_0630/ \
+  --policy.type=pi05 \
+  --policy.pretrained_path=/nfs/zxlong10/models/lerobot/pi05_base/ \
+  --policy.freeze_vision_encoder=false \
+  --policy.train_expert_only=false \
+  --policy.device=cuda \
+  --batch_size=16 \
+  --steps=80000 \
+  --save_freq=20000 \
+  --num_workers=4 \
+  --acp.enable=true \
+  --acp.indicator_field=complementary_info.acp_indicator \
+  --acp.indicator_dropout_prob=0.3 \
+  --output_dir=/nfs/lerobot/s101/models/evo/so101/insert_card_pi05 \
+  --job_name=insert_card_pi05 \
+  --wandb.enable=false \
+  --policy.push_to_hub=false

@@ -15,8 +15,10 @@ class Pistar06Config(PreTrainedConfig):
     """Value model config using the Pistar06 stack (SigLIP + Gemma)."""
 
     # Backbone components
-    vision_repo_id: str = "google/siglip-so400m-patch14-384"
-    language_repo_id: str = "google/gemma-3-270m"
+    # vision_repo_id: str = "google/siglip-so400m-patch14-384"
+    # language_repo_id: str = "google/gemma-3-270m"
+    vision_repo_id: str = "/nfs/zxlong10/models/google/siglip-so400m-patch14-384"
+    language_repo_id: str = "/nfs/zxlong10/models/google/gemma-3-270m"
     vision_revision: str | None = None
     language_revision: str | None = None
 

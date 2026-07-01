@@ -136,14 +136,19 @@ def human_inloop_record(cfg: RecordConfig):
     if cfg.teleop is None:
         raise ValueError("`lerobot-human-inloop-record` requires `teleop` config.")
 
-    cfg.policy_sync_to_teleop = cfg.policy is not None
-    cfg.intervention_state_machine_enabled = cfg.policy is not None
+    has_policy_source = cfg.policy is not None or cfg.remote_policy.enable
+    cfg.policy_sync_to_teleop = has_policy_source
+    cfg.intervention_state_machine_enabled = has_policy_source
     cfg.enable_episode_outcome_labeling = True
     cfg.default_episode_success = "failure"
     cfg.enable_collector_policy_id = True
     if cfg.collector_policy_id_policy is None:
-        cfg.collector_policy_id_policy = infer_collector_policy_version(cfg.policy)
-    if cfg.policy is not None:
+        cfg.collector_policy_id_policy = (
+            cfg.remote_policy.pretrained_name_or_path
+            if cfg.remote_policy.enable
+            else infer_collector_policy_version(cfg.policy)
+        )
+    if has_policy_source:
         failure_reset_controller = _HumanInloopFailureResetController(cfg)
         cfg._on_record_connected = failure_reset_controller.on_record_connected
         cfg._on_record_episode_outcome = failure_reset_controller.on_episode_outcome
@@ -152,7 +157,7 @@ def human_inloop_record(cfg: RecordConfig):
         "Human-in-loop recording is enabled. Press '%s' to toggle takeover. "
         "Press '%s' to mark success and end, '%s' to mark failure and end. "
         "Recorded `action` is the executed action. "
-        "Policy output (when policy is enabled) is stored in `complementary_info.policy_action`. "
+        "Policy output (when local or remote policy is enabled) is stored in `complementary_info.policy_action`. "
         "Collector source is stored in `complementary_info.collector_policy_id`. "
         "ACP inference: enable=%s use_cfg=%s cfg_beta=%.3f.",
         cfg.intervention_toggle_key,

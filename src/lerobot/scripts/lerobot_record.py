@@ -106,6 +106,7 @@ from lerobot.scripts.recording_hil import (
     _predict_policy_action_with_acp_inference,  # noqa: F401
 )
 from lerobot.scripts.recording_loop import record_loop
+from lerobot.scripts.recording_remote_policy import RemotePolicyActionClient, RemotePolicyRecordConfig
 from lerobot.teleoperators import (  # noqa: F401
     TeleoperatorConfig,
     bi_openarm_leader,
@@ -235,6 +236,8 @@ class RecordConfig:
     collector_policy_id_human: str = "human"
     # ACP inference controls for policy-driven recording.
     acp_inference: ACPInferenceConfig = field(default_factory=ACPInferenceConfig)
+    # Optional remote async policy source used during recording.
+    remote_policy: RemotePolicyRecordConfig = field(default_factory=RemotePolicyRecordConfig)
     # Retry timeout for transient communication errors (seconds). Set to 0 to fail immediately.
     communication_retry_timeout_s: float = 2.0
     # Sleep interval between communication retries (seconds).
@@ -250,7 +253,10 @@ class RecordConfig:
             self.policy = PreTrainedConfig.from_pretrained(policy_path, cli_overrides=cli_overrides)
             self.policy.pretrained_path = policy_path
 
-        if self.teleop is None and self.policy is None:
+        if self.policy is not None and self.remote_policy.enable:
+            raise ValueError("Choose either `policy` or `remote_policy.enable=true`, not both.")
+
+        if self.teleop is None and self.policy is None and not self.remote_policy.enable:
             raise ValueError("Choose a policy, a teleoperator or both to control the robot")
         sanity_check_bimanual_piper_pair(self.robot, self.teleop)
         if not self.intervention_toggle_key or len(self.intervention_toggle_key) != 1:
@@ -282,6 +288,8 @@ class RecordConfig:
             raise ValueError("`collector_policy_id_human` must be a non-empty string.")
         if self.acp_inference.use_cfg and not self.acp_inference.enable:
             raise ValueError("`acp_inference.use_cfg=true` requires `acp_inference.enable=true`.")
+        if self.acp_inference.enable and self.remote_policy.enable:
+            raise ValueError("`acp_inference` is only supported for local `policy`, not `remote_policy`.")
         if self.acp_inference.cfg_beta < 0:
             raise ValueError("`acp_inference.cfg_beta` must be >= 0.")
         if self.communication_retry_timeout_s < 0:
@@ -367,8 +375,10 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
     dataset = None
     listener = None
     policy_sync_executor = None
+    remote_policy_client = None
 
     try:
+        cfg.remote_policy.rename_map = cfg.dataset.rename_map
         if cfg.resume:
             dataset = LeRobotDataset(
                 cfg.dataset.repo_id,
@@ -415,24 +425,36 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                     "rename_observations_processor": {"rename_map": cfg.dataset.rename_map},
                 },
             )
+        if cfg.remote_policy.enable:
+            remote_policy_client = RemotePolicyActionClient(
+                cfg=cfg.remote_policy,
+                robot=robot,
+                fps=cfg.dataset.fps,
+            )
 
         collector_policy_id_policy = (
             cfg.collector_policy_id_policy
             if cfg.collector_policy_id_policy is not None
-            else infer_collector_policy_id(cfg.policy)
+            else (
+                remote_policy_client.policy_id
+                if remote_policy_client is not None
+                else infer_collector_policy_id(cfg.policy)
+            )
         )
         collector_policy_id_human = cfg.collector_policy_id_human
 
         robot.connect()
         if teleop is not None:
             teleop.connect()
+        if remote_policy_client is not None:
+            remote_policy_client.start()
         on_record_connected = getattr(cfg, "_on_record_connected", None)
         if callable(on_record_connected):
             on_record_connected(robot, teleop)
 
         if cfg.policy_sync_to_teleop:
-            if cfg.policy is None:
-                raise ValueError("`policy_sync_to_teleop=true` requires `policy` to be set.")
+            if cfg.policy is None and remote_policy_client is None:
+                raise ValueError("`policy_sync_to_teleop=true` requires `policy` or `remote_policy`.")
             if teleop is None or isinstance(teleop, list):
                 raise ValueError(
                     "`policy_sync_to_teleop=true` requires exactly one teleoperator with send_feedback support."
@@ -471,6 +493,7 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                     display_data=cfg.display_data,
                     display_compressed_images=display_compressed_images,
                     policy_sync_executor=policy_sync_executor,
+                    remote_policy_client=remote_policy_client,
                     intervention_state_machine_enabled=cfg.intervention_state_machine_enabled,
                     collector_policy_id_policy=collector_policy_id_policy,
                     collector_policy_id_human=collector_policy_id_human,
@@ -520,6 +543,7 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                         single_task=cfg.dataset.single_task,
                         display_data=cfg.display_data,
                         policy_sync_executor=policy_sync_executor,
+                        remote_policy_client=None,
                         intervention_state_machine_enabled=cfg.intervention_state_machine_enabled,
                         collector_policy_id_policy=collector_policy_id_policy,
                         collector_policy_id_human=collector_policy_id_human,
@@ -554,6 +578,8 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
 
         if policy_sync_executor is not None:
             policy_sync_executor.shutdown()
+        if remote_policy_client is not None:
+            remote_policy_client.stop()
 
         if robot.is_connected:
             robot.disconnect()

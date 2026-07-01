@@ -14,18 +14,18 @@
 
 """Core recording loop used by `lerobot_record.py`."""
 
+from __future__ import annotations
+
 import logging
 import time
 from collections.abc import Callable
-from typing import Any, TypeVar
+from typing import TYPE_CHECKING, Any, TypeVar
 
 import numpy as np
 
 from lerobot.datasets.image_writer import safe_stop_image_writer
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.datasets.utils import build_dataset_frame
-from lerobot.policies.pretrained import PreTrainedPolicy
-from lerobot.policies.utils import make_robot_action
 from lerobot.processor import (
     PolicyAction,
     PolicyProcessorPipeline,
@@ -43,6 +43,7 @@ from lerobot.scripts.recording_hil import (
     _capture_policy_runtime_state,
     _predict_policy_action_with_acp_inference,
 )
+from lerobot.scripts.recording_remote_policy import RemotePolicyActionClient
 from lerobot.teleoperators import Teleoperator, koch_leader, omx_leader, so_leader
 from lerobot.teleoperators.keyboard.teleop_keyboard import KeyboardTeleop
 from lerobot.utils.constants import ACTION, OBS_STR
@@ -50,6 +51,9 @@ from lerobot.utils.recording_annotations import resolve_collector_policy_id
 from lerobot.utils.robot_utils import precise_sleep
 from lerobot.utils.utils import get_safe_torch_device
 from lerobot.utils.visualization_utils import log_rerun_data
+
+if TYPE_CHECKING:
+    from lerobot.policies.pretrained import PreTrainedPolicy
 
 T = TypeVar("T")
 
@@ -108,6 +112,7 @@ def record_loop(
     display_data: bool = False,
     display_compressed_images: bool = False,
     policy_sync_executor: PolicySyncDualArmExecutor | None = None,
+    remote_policy_client: RemotePolicyActionClient | None = None,
     intervention_state_machine_enabled: bool = True,
     collector_policy_id_policy: str = "policy",
     collector_policy_id_human: str = "human",
@@ -146,7 +151,7 @@ def record_loop(
                 "For multi-teleop, the list must contain exactly one KeyboardTeleop and one arm teleoperator. Currently only supported for LeKiwi robot."
             )
 
-    if dataset is None and policy is not None:
+    if dataset is None and (policy is not None or remote_policy_client is not None):
         raise ValueError("Policy-driven recording requires a dataset for feature mapping.")
 
     action_feature_names = dataset.features[ACTION]["names"] if dataset is not None else None
@@ -157,7 +162,8 @@ def record_loop(
             action_feature_names = list(robot.action_features)
     zero_policy_action = dict.fromkeys(action_feature_names, 0.0)
     has_teleop = isinstance(teleop, (Teleoperator, list))
-    intervention_enabled = intervention_state_machine_enabled and policy is not None and has_teleop
+    has_policy_source = policy is not None or remote_policy_client is not None
+    intervention_enabled = intervention_state_machine_enabled and has_policy_source and has_teleop
     intervention_state = INTERVENTION_STATE_POLICY
     last_teleop_action: RobotAction | None = None
     teleop_fallback_warned = False
@@ -178,7 +184,7 @@ def record_loop(
         except Exception:
             logging.exception("Failed to switch teleop manual-control mode to %s", enabled)
 
-    if policy is None:
+    if not has_policy_source:
         # During reset/teleop-only loops keep leader backdrivable for manual dragging.
         set_teleop_manual_control(True)
 
@@ -187,6 +193,8 @@ def record_loop(
         policy.reset()
         preprocessor.reset()
         postprocessor.reset()
+    if remote_policy_client is not None:
+        remote_policy_client.reset()
 
     cond_policy_runtime_state: dict[str, Any] | None = None
     uncond_policy_runtime_state: dict[str, Any] | None = None
@@ -238,10 +246,11 @@ def record_loop(
                 sleep_s = interval_s if interval_s > 0.0 else remaining_s
                 time.sleep(min(sleep_s, remaining_s))
 
-    timestamp = 0
-    start_episode_t = time.perf_counter()
+    timestamp = 0 # 从录制开始到当前帧累计运行秒数
+    step_idx = 0
+    start_episode_t = time.perf_counter() # 录制开始的时间戳
     while timestamp < control_time_s:
-        start_loop_t = time.perf_counter()
+        start_loop_t = time.perf_counter() # 当前帧录制开始的时间戳
 
         if events["exit_early"]:
             events["exit_early"] = False
@@ -264,8 +273,12 @@ def record_loop(
                         if acp_inference.enable and acp_inference.use_cfg:
                             cond_policy_runtime_state = _capture_policy_runtime_state(policy)
                             uncond_policy_runtime_state = _capture_policy_runtime_state(policy)
+                    if remote_policy_client is not None:
+                        remote_policy_client.reset()
                     if policy is not None and preprocessor is not None and postprocessor is not None:
                         logging.info("Policy cache reset on release: next policy action is recomputed.")
+                    if remote_policy_client is not None:
+                        logging.info("Remote policy action queue reset on release.")
                     logging.info("Intervention release requested (S2): returning control to policy.")
             else:
                 logging.info("Intervention toggle ignored because policy+teleop are not both active.")
@@ -282,26 +295,30 @@ def record_loop(
         # Get action from policy and/or teleop
         act_processed_policy: RobotAction | None = None
         act_processed_teleop: RobotAction | None = None
-        if (
-            policy is not None
-            and preprocessor is not None
-            and postprocessor is not None
-            and not (intervention_enabled and intervention_state == INTERVENTION_STATE_ACTIVE)
-        ):
-            policy_action = _predict_policy_action_with_acp_inference(
-                observation_frame=observation_frame,
-                policy=policy,
-                device=get_safe_torch_device(policy.config.device),
-                preprocessor=preprocessor,
-                postprocessor=postprocessor,
-                use_amp=policy.config.use_amp,
-                task=single_task,
-                robot_type=robot.robot_type,
-                acp_inference=acp_inference,
-                cond_runtime_state=cond_policy_runtime_state,
-                uncond_runtime_state=uncond_policy_runtime_state,
-            )
-            act_processed_policy = make_robot_action(policy_action, dataset.features)
+        if not (intervention_enabled and intervention_state == INTERVENTION_STATE_ACTIVE):
+            if remote_policy_client is not None:
+                act_processed_policy = remote_policy_client.get_action(
+                    observation=obs,
+                    task=single_task,
+                    timestep=step_idx,
+                )
+            elif policy is not None and preprocessor is not None and postprocessor is not None:
+                from lerobot.policies.utils import make_robot_action
+
+                policy_action = _predict_policy_action_with_acp_inference(
+                    observation_frame=observation_frame,
+                    policy=policy,
+                    device=get_safe_torch_device(policy.config.device),
+                    preprocessor=preprocessor,
+                    postprocessor=postprocessor,
+                    use_amp=policy.config.use_amp,
+                    task=single_task,
+                    robot_type=robot.robot_type,
+                    acp_inference=acp_inference,
+                    cond_runtime_state=cond_policy_runtime_state,
+                    uncond_runtime_state=uncond_policy_runtime_state,
+                )
+                act_processed_policy = make_robot_action(policy_action, dataset.features)
 
         if isinstance(teleop, Teleoperator):
             act = run_with_connection_retry("teleop.get_action", teleop.get_action)
@@ -416,4 +433,5 @@ def record_loop(
         dt_s = time.perf_counter() - start_loop_t
         precise_sleep(max(1 / fps - dt_s, 0.0))
 
-        timestamp = time.perf_counter() - start_episode_t
+        timestamp = time.perf_counter() - start_episode_t ## 更新已录制时长
+        step_idx += 1

@@ -362,6 +362,16 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
             f"Preprocessing and inference took {inference_time:.4f}s, action shape: {action_tensor.shape}"
         )
 
+        # ========== 调试信息开始 ==========
+        print(f"[DEBUG] action_tensor.shape = {action_tensor.shape}")   # 预期 (B, chunk_size, action_dim)
+        print(f"[DEBUG] self.policy.config.action_dim = {self.policy.config.action_dim}")
+        # 如果 postprocessor 内部有 mean, std，也可打印（需要访问内部属性）
+        if hasattr(self.postprocessor, 'steps'):
+            for step in self.postprocessor.steps:
+                if hasattr(step, 'mean') and hasattr(step, 'std'):
+                    print(f"[DEBUG] step {step.__class__.__name__} mean len={len(step.mean)} std len={len(step.std)}")
+        # ========== 调试信息结束 ==========
+
         """4. Apply postprocessor"""
         # Apply postprocessor (handles unnormalization and device movement)
         # Postprocessor expects (B, action_dim) per action, but we have (B, chunk_size, action_dim)
@@ -374,6 +384,8 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         for i in range(chunk_size):
             # Extract action at timestep i: (B, action_dim)
             single_action = action_tensor[:, i, :]
+            # 再打印每个 single_action 的形状
+            print(f"[DEBUG] single_action[{i}].shape = {single_action.shape}")  # 应该是 (B, action_dim)
             processed_action = self.postprocessor(single_action)
             processed_actions.append(processed_action)
 
