@@ -922,7 +922,25 @@ class PI05Policy(PreTrainedPolicy):
         if config.gradient_checkpointing:
             self.model.gradient_checkpointing_enable()
 
-        self.model.to(config.device)
+        # Only move model to device if device is specified
+        # If device is None, the model will be moved to device later (e.g., in policy_server)
+        if config.device is not None:
+            # Normalize device string: "cuda" -> "cuda:0"
+            target_device = config.device
+            if target_device == "cuda" and torch.cuda.is_available():
+                target_device = "cuda:0"
+            elif target_device.startswith("cuda:") and torch.cuda.is_available():
+                # Validate CUDA device index
+                device_idx = int(target_device.split(":")[1])
+                if device_idx >= torch.cuda.device_count():
+                    raise ValueError(
+                        f"CUDA device {device_idx} is not available. "
+                        f"Available devices: 0-{torch.cuda.device_count() - 1}"
+                    )
+                # Device index is valid, keep the specified device
+            self.model.to(target_device)
+
+        # self.model.to(config.device)
 
         self.reset()
 
@@ -965,9 +983,57 @@ class PI05Policy(PreTrainedPolicy):
                 **kwargs,
             )
 
+        # Set device if provided in kwargs (override config device)
+        if "device" in kwargs:
+            # Use the device from kwargs, but normalize it
+            requested_device = kwargs["device"]
+            if requested_device == "cuda" and torch.cuda.is_available():
+                config.device = "cuda:0"
+            elif requested_device.startswith("cuda:") and torch.cuda.is_available():
+                # Validate CUDA device index
+                device_idx = int(requested_device.split(":")[1])
+                if device_idx >= torch.cuda.device_count():
+                    raise ValueError(
+                        f"CUDA device {device_idx} is not available. "
+                        f"Available devices: 0-{torch.cuda.device_count() - 1}"
+                    )
+                # Use the specified device index
+                config.device = requested_device
+            else:
+                config.device = requested_device
+        elif config.device is not None:
+            # If device is set in config but not in kwargs, normalize it
+            if config.device == "cuda" and torch.cuda.is_available():
+                config.device = "cuda:0"
+            elif config.device.startswith("cuda:") and torch.cuda.is_available():
+                # Validate CUDA device index
+                device_idx = int(config.device.split(":")[1])
+                if device_idx >= torch.cuda.device_count():
+                    raise ValueError(
+                        f"CUDA device {device_idx} is not available. "
+                        f"Available devices: 0-{torch.cuda.device_count() - 1}"
+                    )
+                # Device index is valid, keep the specified device
+
         # Initialize model without loading weights
         # Check if dataset_stats were provided in kwargs
         model = cls(config, **kwargs)
+
+        # Ensure model is on the correct device before loading weights
+        # This is important to avoid device mismatch errors when loading state dict
+        target_device = config.device if config.device is not None else "cpu"
+        # Normalize device string: "cuda" -> "cuda:0"
+        if target_device == "cuda" and torch.cuda.is_available():
+            target_device = "cuda:0"
+        elif target_device.startswith("cuda:") and torch.cuda.is_available():
+            # Validate CUDA device index
+            device_idx = int(target_device.split(":")[1])
+            if device_idx >= torch.cuda.device_count():
+                raise ValueError(
+                    f"CUDA device {device_idx} is not available. "
+                    f"Available devices: 0-{torch.cuda.device_count() - 1}"
+                )
+        model.to(target_device)
 
         # Now manually load and remap the state dict
         try:
@@ -1016,6 +1082,13 @@ class PI05Policy(PreTrainedPolicy):
 
             if remap_count > 0:
                 print(f"Remapped {remap_count} state dict keys")
+
+            # Ensure all tensors in state dict are on the correct device
+            device_obj = torch.device(target_device)
+            for key, value in remapped_state_dict.items():
+                if isinstance(value, torch.Tensor):
+                    remapped_state_dict[key] = value.to(device_obj)
+
             # Load the remapped state dict into the model
             missing_keys, unexpected_keys = model.load_state_dict(remapped_state_dict, strict=strict)
 

@@ -426,9 +426,11 @@ class RobotClient:
 
             obs_capture_time = time.perf_counter() - start_time
 
-            # If there are no actions left in the queue, the observation must go through processing!
+            # Force inference whenever we send an observation. When chunk_size_threshold > 0
+            # we also send while the queue still has actions; those obs used to use
+            # must_go=False and could be filtered as "too similar", starving GetActions.
             with self.action_queue_lock:
-                observation.must_go = self.must_go.is_set() and self.action_queue.empty()
+                observation.must_go = True
                 current_queue_size = self.action_queue.qsize()
 
             _ = self.send_observation(observation)

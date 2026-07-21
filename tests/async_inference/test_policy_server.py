@@ -148,6 +148,17 @@ def test_maybe_enqueue_observation_must_go(policy_server):
     assert policy_server.observation_queue.get_nowait() is obs
 
 
+def test_must_go_clears_predicted_timesteps(policy_server):
+    """must_go should allow timestep reuse across episodes."""
+    policy_server._predicted_timesteps.add(35)
+    policy_server.last_processed_obs = _make_obs(torch.zeros(6), timestep=35)
+
+    obs = _make_obs(torch.ones(6) * 5, timestep=35, must_go=True)
+    assert policy_server._enqueue_observation(obs) is True
+    assert 35 not in policy_server._predicted_timesteps
+    assert policy_server.last_processed_obs is None
+
+
 def test_maybe_enqueue_observation_dissimilar(policy_server):
     """A dissimilar observation (not `must_go`) is enqueued."""
     # Set a last predicted observation.

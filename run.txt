@@ -1,45 +1,69 @@
-# 合并数据
+# 1.合并数据
 python aggregation_data.py
 
-# 验证数据
+# 2.验证数据
 lerobot-dataset-report --dataset /nfs/lerobot/s101/datasets/aggregation/evo-rl/insert_card_0630/
+lerobot-dataset-report --dataset /nfs/lerobot/s101/datasets/aggregation/evo-rl/insert_card_iteration_2/
+lerobot-dataset-report --dataset /nfs/lerobot/s101/datasets/aggregation/evo-rl/take_and_read_card_06160617/
 输出：
 [Success Metrics]
 - counts: success=81, failure=0, unlabeled=0
 - success ratio (all episodes): 1.0000
 - success ratio (labeled episodes): 1.0000
 
-# 价值函数训练
+# 3.价值函数训练
+# 插卡
+CUDA_VISIBLE_DEVICES=6 lerobot-value-train \
+  --dataset.repo_id=insert_card_0714_15 \
+  --dataset.root=/nfs/lerobot/s101/datasets/aggregation/evo-rl/insert_card_0714_15/ \
+  --steps=60000 \
+  --save_freq=30000 \
+  --value.type=pistar06 \
+  --value.push_to_hub=false \
+  --value.repo_id=so101/insert_card_pistar06 \
+  --batch_size=32 \
+  --output_dir=/nfs/lerobot/s101/models/evo/so101/value_train/insert_card_0714_15 \
+  --job_name=so101/insert_card_pistar06 \
+  --wandb.enable=false
+
+# 刷卡
 CUDA_VISIBLE_DEVICES=3 lerobot-value-train \
-  --dataset.repo_id=insert_card_0630 \
-  --dataset.root=/nfs/lerobot/s101/datasets/aggregation/evo-rl/insert_card_0630/ \
+  --dataset.repo_id=take_and_read_card_06160617 \
+  --dataset.root=/nfs/lerobot/s101/datasets/aggregation/evo-rl/take_and_read_card_06160617/ \
+  --steps=100000 \
+  --save_freq=50000 \
   --value.type=pistar06 \
   --value.push_to_hub=false \
-  --value.repo_id=so101/insert_card_pistar06 \
-  --batch_size=32 \
-  --output_dir=/nfs/lerobot/s101/models/evo/so101/insert_card_pistar06 \
-  --job_name=so101/insert_card_pistar06 \
+  --value.repo_id=so101/take_and_read_card_pistar06 \
+  --batch_size=16 \
+  --output_dir=/nfs/lerobot/s101/models/evo/so101/value_train/take_and_read_card_pistar06_iteration_1 \
+  --job_name=so101/take_and_read_card_pistar06 \
   --wandb.enable=false
 
-CUDA_VISIBLE_DEVICES=7 lerobot-value-train \
-  --dataset.repo_id=insert_card_0630 \
-  --dataset.root=/nfs/lerobot/s101/datasets/aggregation/evo-rl/insert_card_0630/ \
-  --steps=20000 \
-  --save_freq=5000 \
+
+# 扎钞
+CUDA_VISIBLE_DEVICES=3 lerobot-value-train \
+  --dataset.repo_id=banknote_binding_iteration_1 \
+  --dataset.root=/nfs/lerobot/s101/datasets/aggregation/evo-rl/banknote_binding_iteration_1/ \
+  --steps=50000 \
+  --save_freq=25000 \
   --value.type=pistar06 \
   --value.push_to_hub=false \
-  --value.repo_id=so101/insert_card_pistar06 \
-  --batch_size=32 \
-  --output_dir=/nfs/lerobot/s101/models/evo/so101/insert_card_pistar06_2 \
-  --job_name=so101/insert_card_pistar06 \
+  --value.repo_id=so101/banknote_binding_pistar06 \
+  --batch_size=16 \
+  --output_dir=/nfs/lerobot/s101/models/evo/so101/value_train/banknote_binding_pistar06_iteration_1 \
+  --job_name=so101/banknote_binding_pistar06 \
   --wandb.enable=false
 
-# 价值函数推理
-lerobot-value-infer \
-  --dataset.repo_id=insert_card_0630 \
-  --dataset.root=/nfs/lerobot/s101/datasets/aggregation/evo-rl/insert_card_0630/ \
-  --inference.checkpoint_path=/nfs/lerobot/s101/models/evo/so101/insert_card_pistar06_2/checkpoints/last/pretrained_model/ \
-  --runtime.device=cuda:7 \
+
+
+# 4.价值函数推理
+# 插卡
+CUDA_VISIBLE_DEVICES=6 lerobot-value-infer \
+  --dataset.repo_id=insert_card_0714_15 \
+  --dataset.root=/nfs/lerobot/s101/datasets/aggregation/evo-rl/insert_card_0714_15/ \
+  --inference.checkpoint_path=/nfs/lerobot/s101/models/evo/so101/value_train/insert_card_0714_15/checkpoints/last/pretrained_model/ \
+  --runtime.device=cuda \
   --runtime.batch_size=32 \
   --acp.enable=true \
   --acp.n_step=50 \
@@ -47,27 +71,150 @@ lerobot-value-infer \
   --acp.value_field=complementary_info.value \
   --acp.advantage_field=complementary_info.advantage \
   --acp.indicator_field=complementary_info.acp_indicator \
-  --output_dir=/nfs/lerobot/s101/models/evo/so101/value_infer/insert_card_pistar06 \
+  --output_dir=/nfs/lerobot/s101/models/evo/so101/value_infer/insert_card_0714_15 \
   --job_name=insert_card_pistar06.infer
 
+# 刷卡
+CUDA_VISIBLE_DEVICES=3 lerobot-value-infer \
+  --dataset.repo_id=take_and_read_card_06160617 \
+  --dataset.root=/nfs/lerobot/s101/datasets/aggregation/evo-rl/take_and_read_card_06160617/ \
+  --inference.checkpoint_path=/nfs/lerobot/s101/models/evo/so101/value_train/take_and_read_card_pistar06_iteration_1/checkpoints/last/pretrained_model/ \
+  --runtime.device=cuda \
+  --runtime.batch_size=32 \
+  --acp.enable=true \
+  --acp.n_step=50 \
+  --acp.positive_ratio=0.3 \
+  --acp.value_field=complementary_info.value \
+  --acp.advantage_field=complementary_info.advantage \
+  --acp.indicator_field=complementary_info.acp_indicator \
+  --output_dir=/nfs/lerobot/s101/models/evo/so101/value_infer/take_and_read_card_06160617_pistar06 \
+  --job_name=take_and_read_card_pistar06.infer
 
-# 训练策略   --policy.dtype=bfloat16 (现存不够时可选)
-CUDA_VISIBLE_DEVICES=3 lerobot-train \
-  --dataset.repo_id=insert_card_0630 \
-  --dataset.root=/nfs/lerobot/s101/datasets/aggregation/evo-rl/insert_card_0630/ \
+
+# 扎钞
+CUDA_VISIBLE_DEVICES=5 lerobot-value-infer \
+  --dataset.repo_id=banknote_binding_iteration_1 \
+  --dataset.root=/nfs/lerobot/s101/datasets/aggregation/evo-rl/banknote_binding_iteration_1/ \
+  --inference.checkpoint_path=/nfs/lerobot/s101/models/evo/so101/value_train/banknote_binding_pistar06_iteration_1/checkpoints/last/pretrained_model/ \
+  --runtime.device=cuda \
+  --runtime.batch_size=32 \
+  --acp.enable=true \
+  --acp.n_step=50 \
+  --acp.positive_ratio=0.3 \
+  --acp.value_field=complementary_info.value \
+  --acp.advantage_field=complementary_info.advantage \
+  --acp.indicator_field=complementary_info.acp_indicator \
+  --output_dir=/nfs/lerobot/s101/models/evo/so101/value_infer/banknote_binding_iteration_1_pistar06 \
+  --job_name=banknote_binding_iteration_1_pistar06.infer
+
+从数据集当中的info.json可以看见：
+complementary_info.value，complementary_info.advantage，complementary_info.acp_indicator 
+这些值被写回由指定的原始数据集中。
+
+
+# 5.训练策略   --policy.dtype=bfloat16 (显存不够时可选)
+# 插卡
+CUDA_VISIBLE_DEVICES=6 lerobot-train \
+  --dataset.repo_id=insert_card_0714_15 \
+  --dataset.root=/nfs/lerobot/s101/datasets/aggregation/evo-rl/insert_card_0714_15/ \
   --policy.type=pi05 \
   --policy.pretrained_path=/nfs/zxlong10/models/lerobot/pi05_base/ \
   --policy.freeze_vision_encoder=false \
   --policy.train_expert_only=false \
   --policy.device=cuda \
   --batch_size=16 \
-  --steps=80000 \
+  --steps=160000 \
+  --save_freq=40000 \
+  --num_workers=4 \
+  --acp.enable=true \
+  --acp.indicator_field=complementary_info.acp_indicator \
+  --acp.indicator_dropout_prob=0.3 \
+  --output_dir=/nfs/lerobot/s101/models/evo/so101/policy/insert_card_0714_15 \
+  --job_name=insert_card_pi05 \
+  --wandb.enable=false \
+  --policy.push_to_hub=false
+
+# 刷卡
+CUDA_VISIBLE_DEVICES=3 lerobot-train \
+  --dataset.repo_id=take_and_read_card_06160617 \
+  --dataset.root=/nfs/lerobot/s101/datasets/aggregation/evo-rl/take_and_read_card_06160617/ \
+  --policy.type=pi05 \
+  --policy.pretrained_path=/nfs/zxlong10/models/lerobot/pi05_base/ \
+  --policy.freeze_vision_encoder=false \
+  --policy.train_expert_only=false \
+  --policy.device=cuda \
+  --batch_size=8 \
+  --steps=200000 \
   --save_freq=20000 \
   --num_workers=4 \
   --acp.enable=true \
   --acp.indicator_field=complementary_info.acp_indicator \
   --acp.indicator_dropout_prob=0.3 \
-  --output_dir=/nfs/lerobot/s101/models/evo/so101/insert_card_pi05 \
+  --output_dir=/nfs/lerobot/s101/models/evo/so101/policy/take_and_read_card_06160617_iteration_1 \
   --job_name=insert_card_pi05 \
   --wandb.enable=false \
   --policy.push_to_hub=false
+
+# 扎钞
+CUDA_VISIBLE_DEVICES=7 lerobot-train \
+  --dataset.repo_id=banknote_binding_iteration_1 \
+  --dataset.root=/nfs/lerobot/s101/datasets/aggregation/evo-rl/banknote_binding_iteration_1/ \
+  --policy.type=pi05 \
+  --policy.pretrained_path=/nfs/zxlong10/models/lerobot/pi05_base/ \
+  --policy.freeze_vision_encoder=false \
+  --policy.train_expert_only=false \
+  --policy.device=cuda \
+  --batch_size=8 \
+  --steps=160000 \
+  --save_freq=40000 \
+  --num_workers=4 \
+  --acp.enable=true \
+  --acp.indicator_field=complementary_info.acp_indicator \
+  --acp.indicator_dropout_prob=0.3 \
+  --output_dir=/nfs/lerobot/s101/models/evo/so101/policy/banknote_binding_iteration_1_pi05 \
+  --job_name=banknote_binding_pi05 \
+  --wandb.enable=false \
+  --policy.push_to_hub=false
+
+finetune
+CUDA_VISIBLE_DEVICES=5 lerobot-train \
+  --dataset.repo_id=insert_card_iteration_2 \
+  --dataset.root=/nfs/lerobot/s101/datasets/aggregation/evo-rl/insert_card_iteration_2/ \
+  --policy.type=pi05 \
+  --policy.pretrained_path=/nfs/lerobot/s101/models/evo/so101/policy/insert_card_pi05/checkpoints/last/pretrained_model/ \
+  --policy.freeze_vision_encoder=false \
+  --policy.train_expert_only=false \
+  --policy.device=cuda \
+  --batch_size=16 \
+  --steps=100000 \
+  --save_freq=20000 \
+  --num_workers=4 \
+  --acp.enable=true \
+  --acp.indicator_field=complementary_info.acp_indicator \
+  --acp.indicator_dropout_prob=0.3 \
+  --output_dir=/nfs/lerobot/s101/models/evo/so101/policy/insert_card_pi05_iteration_2_finetune \
+  --job_name=insert_card_pi05 \
+  --wandb.enable=false \
+  --policy.push_to_hub=false
+
+
+# 6.启动远程推理服务
+python -m lerobot.async_inference.policy_server  --host=0.0.0.0 --port=8099
+
+# 7.真机端启动人在环采集
+lerobot-human-inloop-record \
+--robot.type=... \
+--robot.id=... \
+--teleop.type=... \
+--teleop.id=... \
+--dataset.repo_id=... \
+--dataset.single_task="..." \
+--dataset.num_episodes=20 \
+--remote_policy.enable=true \
+--remote_policy.server_address=10.61.5.8:8099 \
+--remote_policy.policy_type=pi05 \
+--remote_policy.pretrained_name_or_path=/nfs/lerobot/s101/models/evo/so101/policy/insert_card_pi05/checkpoints/last/pretrained_model/ \
+--remote_policy.policy_device=cuda:0 \
+--remote_policy.client_device=cpu \
+--remote_policy.actions_per_chunk=50 \
+--remote_policy.chunk_size_threshold=0.5

@@ -151,7 +151,14 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         policy_class = get_policy_class(self.policy_type)
 
         start = time.perf_counter()
-        self.policy = policy_class.from_pretrained(policy_specs.pretrained_name_or_path)
+        # self.policy = policy_class.from_pretrained(policy_specs.pretrained_name_or_path)
+        # self.policy.to(self.device)
+        # Pass device parameter to from_pretrained to ensure model is initialized with correct device
+        self.policy = policy_class.from_pretrained(
+            policy_specs.pretrained_name_or_path,
+            device=self.device,
+        )
+        # Move policy to device (in case device wasn't set during initialization)
         self.policy.to(self.device)
 
         # Load preprocessor and postprocessor, overriding device to match requested device
@@ -209,7 +216,11 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         if not self._enqueue_observation(
             timed_observation  # wrapping a RawObservation
         ):
-            self.logger.debug(f"Observation #{obs_timestep} has been filtered out")
+            self.logger.warning(
+                f"Observation #{obs_timestep} was filtered out (must_go={timed_observation.must_go}). "
+                f"GetActions will return empty until a must_go observation is enqueued; "
+                f"sync clients that block on GetActions may time out."
+            )
 
         return services_pb2.Empty()
 
@@ -364,7 +375,7 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
 
         # ========== 调试信息开始 ==========
         print(f"[DEBUG] action_tensor.shape = {action_tensor.shape}")   # 预期 (B, chunk_size, action_dim)
-        print(f"[DEBUG] self.policy.config.action_dim = {self.policy.config.action_dim}")
+        # print(f"[DEBUG] self.policy.config.action_dim = {self.policy.config.action_dim}")
         # 如果 postprocessor 内部有 mean, std，也可打印（需要访问内部属性）
         if hasattr(self.postprocessor, 'steps'):
             for step in self.postprocessor.steps:
@@ -385,7 +396,7 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
             # Extract action at timestep i: (B, action_dim)
             single_action = action_tensor[:, i, :]
             # 再打印每个 single_action 的形状
-            print(f"[DEBUG] single_action[{i}].shape = {single_action.shape}")  # 应该是 (B, action_dim)
+            # print(f"[DEBUG] single_action[{i}].shape = {single_action.shape}")  # 应该是 (B, action_dim)
             processed_action = self.postprocessor(single_action)
             processed_actions.append(processed_action)
 
