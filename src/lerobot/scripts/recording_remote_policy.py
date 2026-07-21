@@ -132,6 +132,9 @@ class RemotePolicyActionClient:
     def reset(self) -> None:
         self.action_queue.clear()
         self.latest_action_timestep = -1
+        # Sync server dedup / policy internal state when a new episode starts or
+        # control returns to the policy after human takeover.
+        self.stub.Ready(self.services_pb2.Empty())
 
     def _ready_to_send_observation(self) -> bool:
         if not self.action_queue:
@@ -195,6 +198,16 @@ class RemotePolicyActionClient:
                 )
             merged[timestep] = action
 
+        if incoming_actions and not merged:
+            logging.warning(
+                "Remote policy returned %d actions but all were discarded because their timesteps "
+                "<= latest_action_timestep=%d. Incoming range: %d..%d.",
+                len(incoming_actions),
+                self.latest_action_timestep,
+                incoming_actions[0].get_timestep(),
+                incoming_actions[-1].get_timestep(),
+            )
+
         self.action_queue = [merged[timestep] for timestep in sorted(merged)]
 
     def _tensor_to_action(self, action_tensor: torch.Tensor) -> RobotAction:
@@ -206,11 +219,16 @@ class RemotePolicyActionClient:
 
     def get_action(self, observation: dict, task: str | None, timestep: int) -> RobotAction:
         if self._ready_to_send_observation():
+            # This client sends an observation and then blocks on GetActions. Unlike the
+            # async RobotClient, there is no background thread to retry later, so we must
+            # always force inference here. Otherwise the server may filter a similar obs
+            # (must_go=False) and GetActions times out while the action queue still has
+            # steps left to execute.
             self._send_observation(
                 observation=observation,
                 timestep=timestep,
                 task=task,
-                must_go=len(self.action_queue) == 0,
+                must_go=True,
             )
             self._receive_actions()
 
