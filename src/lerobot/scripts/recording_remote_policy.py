@@ -164,7 +164,11 @@ class RemotePolicyActionClient:
             log_prefix="[RECORD_REMOTE_POLICY] Observation",
             silent=True,
         )
+        start_time = time.time()
         self.stub.SendObservations(observation_iterator)
+        end_time = time.time()
+        send_time = end_time - start_time
+        # logging.info(f"SendObservations时间: {send_time*1000} 毫秒")
 
     def _receive_actions(self) -> None:
         deadline_t = time.perf_counter() + self.cfg.obs_queue_timeout_s
@@ -241,7 +245,41 @@ class RemotePolicyActionClient:
     #     self.latest_action_timestep = timed_action.get_timestep()
     #     return self._tensor_to_action(timed_action.get_action())
 
-    # 异步推理，无需等待
+    # #异步推理，无需等待
+    # def get_action(self, observation: dict, task: str | None, timestep: int) -> RobotAction:
+    #     if self._ready_to_send_observation():
+    #         # This client sends an observation and then blocks on GetActions. Unlike the
+    #         # async RobotClient, there is no background thread to retry later, so we must
+    #         # always force inference here. Otherwise the server may filter a similar obs
+    #         # (must_go=False) and GetActions times out while the action queue still has
+    #         # steps left to execute.
+    #         start_time = time.time()
+    #         self._send_observation(
+    #             observation=observation,
+    #             timestep=timestep,
+    #             task=task,
+    #             must_go=True,
+    #         )
+    #         end_time = time.time()
+    #         send_time = end_time - start_time
+    #         logging.info(f"发送执行时间: {send_time*1000} 毫秒")
+    #         if not self.action_queue or self.latest_action is None:
+    #             logging.warning("action queue is null or latest_action is None, wait for receive actions.")
+    #             self._receive_actions() # 如果动作队列为空，则需要等待推理完成
+    #         else:
+    #             threading.Thread(target=self._receive_actions, daemon=True).start()
+
+    #     if not self.action_queue:
+    #         # raise TimeoutError("Remote policy returned no actions.")
+    #         logging.warning("Remote policy action queue is null, use latest_action.")
+    #         timed_action = self.latest_action
+
+    #     timed_action = self.action_queue.pop(0)
+    #     self.latest_action = timed_action
+    #     self.latest_action_timestep = timed_action.get_timestep()
+    #     return self._tensor_to_action(timed_action.get_action())
+
+    # 2异步推理，无需等待
     def get_action(self, observation: dict, task: str | None, timestep: int) -> RobotAction:
         if self._ready_to_send_observation():
             # This client sends an observation and then blocks on GetActions. Unlike the
@@ -249,24 +287,39 @@ class RemotePolicyActionClient:
             # always force inference here. Otherwise the server may filter a similar obs
             # (must_go=False) and GetActions times out while the action queue still has
             # steps left to execute.
-            self._send_observation(
-                observation=observation,
-                timestep=timestep,
-                task=task,
-                must_go=True,
-            )
+
+            def worker():
+                self.is_send = getattr(self, "is_send", None)
+                if self.is_send is None or self.is_send == False:
+                    self.is_send = True
+                    start_time = time.time()
+                    self._send_observation(
+                        observation=observation,
+                        timestep=timestep,
+                        task=task,
+                        must_go=True,
+                    )
+                    end_time = time.time()
+                    send_time = end_time - start_time
+                    # logging.info(f"发送执行时间: {send_time*1000} 毫秒")
+                    self._receive_actions() # 如果动作队列为空，则需要等待推理完成
+                    self.is_send = False
+                # else:
+                #     time.sleep(0.1)
+
             if not self.action_queue or self.latest_action is None:
                 logging.warning("action queue is null or latest_action is None, wait for receive actions.")
-                self._receive_actions() # 如果动作队列为空，则需要等待推理完成
+                worker()
             else:
-                threading.Thread(target=self._receive_actions(), daemon=True).start()
+                threading.Thread(target=worker, daemon=True).start()
 
         if not self.action_queue:
             # raise TimeoutError("Remote policy returned no actions.")
             logging.warning("Remote policy action queue is null, use latest_action.")
             timed_action = self.latest_action
-
-        timed_action = self.action_queue.pop(0)
-        self.latest_action = timed_action
+        else:
+            timed_action = self.action_queue.pop(0)
+            self.latest_action = timed_action
+            
         self.latest_action_timestep = timed_action.get_timestep()
         return self._tensor_to_action(timed_action.get_action())
