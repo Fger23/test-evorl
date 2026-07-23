@@ -56,7 +56,7 @@ class RemotePolicyRecordConfig:
     actions_per_chunk: int = 1
     chunk_size_threshold: float = 0.0
     aggregate_fn_name: str = "latest_only"
-    obs_queue_timeout_s: float = 2.0
+    obs_queue_timeout_s: float = 10.0
     rename_map: dict[str, str] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
