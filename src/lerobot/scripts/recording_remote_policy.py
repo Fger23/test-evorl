@@ -18,9 +18,9 @@ This adapter talks to ``lerobot.async_inference.policy_server`` but leaves robot
 control and dataset writing inside ``recording_loop.py`` so human-in-loop
 takeover semantics stay in one place.
 """
-import threading
 import logging
 import pickle  # nosec
+import threading
 import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
@@ -107,6 +107,13 @@ class RemotePolicyActionClient:
         self.latest_action_timestep = -1
         self.latest_action = None
         self.aggregate_fn = AGGREGATE_FUNCTIONS[cfg.aggregate_fn_name]
+        self._state_lock = threading.Lock()
+        self._request_thread: threading.Thread | None = None
+        self._generation = 0
+
+    @property
+    def _rpc_timeout_s(self) -> float:
+        return max(self.cfg.obs_queue_timeout_s, self.environment_dt)
 
     @property
     def policy_id(self) -> str:
@@ -115,7 +122,7 @@ class RemotePolicyActionClient:
     def start(self) -> None:
         from lerobot.async_inference.helpers import RemotePolicyConfig, map_robot_keys_to_lerobot_features
 
-        self.stub.Ready(self.services_pb2.Empty())
+        self.stub.Ready(self.services_pb2.Empty(), timeout=self._rpc_timeout_s)
         policy_config = RemotePolicyConfig(
             policy_type=self.cfg.policy_type,
             pretrained_name_or_path=self.cfg.pretrained_name_or_path,
@@ -131,17 +138,21 @@ class RemotePolicyActionClient:
         self.channel.close()
 
     def reset(self) -> None:
-        self.action_queue.clear()
-        self.latest_action_timestep = -1
-        self.latest_action = None
+        self._wait_for_background_request()
+        with self._state_lock:
+            self._generation += 1
+            self.action_queue.clear()
+            self.latest_action_timestep = -1
+            self.latest_action = None
         # Sync server dedup / policy internal state when a new episode starts or
         # control returns to the policy after human takeover.
-        self.stub.Ready(self.services_pb2.Empty())
+        self.stub.Ready(self.services_pb2.Empty(), timeout=self._rpc_timeout_s)
 
     def _ready_to_send_observation(self) -> bool:
-        if not self.action_queue:
-            return True
-        return len(self.action_queue) / self.cfg.actions_per_chunk <= self.cfg.chunk_size_threshold
+        with self._state_lock:
+            if not self.action_queue:
+                return True
+            return len(self.action_queue) / self.cfg.actions_per_chunk <= self.cfg.chunk_size_threshold
 
     def _send_observation(self, observation: dict, timestep: int, task: str | None, must_go: bool) -> None:
         from lerobot.async_inference.helpers import TimedObservation
@@ -164,57 +175,153 @@ class RemotePolicyActionClient:
             log_prefix="[RECORD_REMOTE_POLICY] Observation",
             silent=True,
         )
-        start_time = time.time()
-        self.stub.SendObservations(observation_iterator)
-        end_time = time.time()
-        send_time = end_time - start_time
-        # logging.info(f"SendObservations时间: {send_time*1000} 毫秒")
+        self.stub.SendObservations(observation_iterator, timeout=self._rpc_timeout_s)
 
-    def _receive_actions(self) -> None:
+    def _receive_actions(self, generation: int) -> None:
         deadline_t = time.perf_counter() + self.cfg.obs_queue_timeout_s
         while True:
-            actions_chunk = self.stub.GetActions(self.services_pb2.Empty())
+            if self.cfg.obs_queue_timeout_s == 0:
+                rpc_timeout_s = self._rpc_timeout_s
+            else:
+                remaining_s = deadline_t - time.perf_counter()
+                if remaining_s <= 0:
+                    raise TimeoutError("Timed out waiting for remote policy actions.")
+                rpc_timeout_s = remaining_s
+
+            actions_chunk = self.stub.GetActions(
+                self.services_pb2.Empty(),
+                timeout=rpc_timeout_s,
+            )
             if actions_chunk.data:
                 timed_actions = pickle.loads(actions_chunk.data)  # nosec
-                self._merge_actions(timed_actions)
+                self._merge_actions(timed_actions, generation=generation)
                 return
 
             if self.cfg.obs_queue_timeout_s == 0 or time.perf_counter() >= deadline_t:
                 raise TimeoutError("Timed out waiting for remote policy actions.")
 
-    def _merge_actions(self, incoming_actions: list["TimedAction"]) -> None:
-        current_actions = {action.get_timestep(): action for action in self.action_queue}
-        merged = {}
+    def _merge_actions(self, incoming_actions: list["TimedAction"], generation: int) -> None:
+        with self._state_lock:
+            if generation != self._generation:
+                logging.info("Discarding remote actions from stale generation %d.", generation)
+                return
 
-        for action in self.action_queue:
-            if action.get_timestep() > self.latest_action_timestep:
-                merged[action.get_timestep()] = action
+            current_actions = {action.get_timestep(): action for action in self.action_queue}
+            merged = {}
 
-        for action in incoming_actions:
-            timestep = action.get_timestep()
-            if timestep <= self.latest_action_timestep:
-                continue
-            if timestep in current_actions:
-                from lerobot.async_inference.helpers import TimedAction
+            for action in self.action_queue:
+                if action.get_timestep() > self.latest_action_timestep:
+                    merged[action.get_timestep()] = action
 
-                action = TimedAction(
-                    timestamp=action.get_timestamp(),
-                    timestep=timestep,
-                    action=self.aggregate_fn(current_actions[timestep].get_action(), action.get_action()),
+            for action in incoming_actions:
+                timestep = action.get_timestep()
+                if timestep <= self.latest_action_timestep:
+                    continue
+                if timestep in current_actions:
+                    from lerobot.async_inference.helpers import TimedAction
+
+                    action = TimedAction(
+                        timestamp=action.get_timestamp(),
+                        timestep=timestep,
+                        action=self.aggregate_fn(current_actions[timestep].get_action(), action.get_action()),
+                    )
+                merged[timestep] = action
+
+            if incoming_actions and not merged:
+                logging.warning(
+                    "Remote policy returned %d actions but all were discarded because their timesteps "
+                    "<= latest_action_timestep=%d. Incoming range: %d..%d.",
+                    len(incoming_actions),
+                    self.latest_action_timestep,
+                    incoming_actions[0].get_timestep(),
+                    incoming_actions[-1].get_timestep(),
                 )
-            merged[timestep] = action
 
-        if incoming_actions and not merged:
-            logging.warning(
-                "Remote policy returned %d actions but all were discarded because their timesteps "
-                "<= latest_action_timestep=%d. Incoming range: %d..%d.",
-                len(incoming_actions),
-                self.latest_action_timestep,
-                incoming_actions[0].get_timestep(),
-                incoming_actions[-1].get_timestep(),
+            self.action_queue = [merged[timestep] for timestep in sorted(merged)]
+
+    def _request_actions(
+        self,
+        observation: dict,
+        task: str | None,
+        timestep: int,
+        generation: int,
+    ) -> None:
+        self._send_observation(
+            observation=observation,
+            timestep=timestep,
+            task=task,
+            must_go=True,
+        )
+        self._receive_actions(generation=generation)
+
+    def _background_request(
+        self,
+        observation: dict,
+        task: str | None,
+        timestep: int,
+        generation: int,
+    ) -> None:
+        try:
+            self._request_actions(observation, task, timestep, generation)
+        except Exception:
+            logging.exception("Remote policy background request failed.")
+        finally:
+            current_thread = threading.current_thread()
+            with self._state_lock:
+                if self._request_thread is current_thread:
+                    self._request_thread = None
+
+    def _start_background_request(self, observation: dict, task: str | None, timestep: int) -> None:
+        with self._state_lock:
+            if self._request_thread is not None:
+                return
+            if (
+                self.action_queue
+                and len(self.action_queue) / self.cfg.actions_per_chunk > self.cfg.chunk_size_threshold
+            ):
+                return
+            generation = self._generation
+            request_thread = threading.Thread(
+                target=self._background_request,
+                args=(observation, task, timestep, generation),
+                daemon=True,
+                name="remote-policy-request",
             )
+            self._request_thread = request_thread
+        request_thread.start()
 
-        self.action_queue = [merged[timestep] for timestep in sorted(merged)]
+    def _wait_for_background_request(self) -> None:
+        with self._state_lock:
+            request_thread = self._request_thread
+        if request_thread is None or request_thread is threading.current_thread():
+            return
+
+        request_thread.join(timeout=2 * self._rpc_timeout_s + self.environment_dt)
+        if request_thread.is_alive():
+            raise TimeoutError("Timed out waiting for the in-flight remote policy request to stop.")
+
+    def _wait_for_actions(self, observation: dict, task: str | None, timestep: int) -> None:
+        while True:
+            with self._state_lock:
+                if self.action_queue:
+                    return
+                request_thread = self._request_thread
+                generation = self._generation
+
+            if request_thread is not None:
+                request_thread.join(timeout=self._rpc_timeout_s + self.environment_dt)
+                if request_thread.is_alive():
+                    logging.warning("Remote policy action queue is empty; still waiting for in-flight inference.")
+                continue
+
+            try:
+                self._request_actions(observation, task, timestep, generation)
+            except Exception:
+                logging.exception(
+                    "Remote policy action queue is empty and inference failed; retrying in %.3fs.",
+                    self.environment_dt,
+                )
+                time.sleep(self.environment_dt)
 
     def _tensor_to_action(self, action_tensor: torch.Tensor) -> RobotAction:
         if self.cfg.client_device != "cpu" and action_tensor.device.type != self.cfg.client_device:
@@ -223,103 +330,17 @@ class RemotePolicyActionClient:
             action_tensor = action_tensor.cpu()
         return {key: action_tensor[i].item() for i, key in enumerate(self.robot.action_features)}
 
-    # def get_action(self, observation: dict, task: str | None, timestep: int) -> RobotAction:
-    #     if self._ready_to_send_observation():
-    #         # This client sends an observation and then blocks on GetActions. Unlike the
-    #         # async RobotClient, there is no background thread to retry later, so we must
-    #         # always force inference here. Otherwise the server may filter a similar obs
-    #         # (must_go=False) and GetActions times out while the action queue still has
-    #         # steps left to execute.
-    #         self._send_observation(
-    #             observation=observation,
-    #             timestep=timestep,
-    #             task=task,
-    #             must_go=True,
-    #         )
-    #         self._receive_actions()
-
-    #     if not self.action_queue:
-    #         raise TimeoutError("Remote policy returned no actions.")
-
-    #     timed_action = self.action_queue.pop(0)
-    #     self.latest_action_timestep = timed_action.get_timestep()
-    #     return self._tensor_to_action(timed_action.get_action())
-
-    # #异步推理，无需等待
-    # def get_action(self, observation: dict, task: str | None, timestep: int) -> RobotAction:
-    #     if self._ready_to_send_observation():
-    #         # This client sends an observation and then blocks on GetActions. Unlike the
-    #         # async RobotClient, there is no background thread to retry later, so we must
-    #         # always force inference here. Otherwise the server may filter a similar obs
-    #         # (must_go=False) and GetActions times out while the action queue still has
-    #         # steps left to execute.
-    #         start_time = time.time()
-    #         self._send_observation(
-    #             observation=observation,
-    #             timestep=timestep,
-    #             task=task,
-    #             must_go=True,
-    #         )
-    #         end_time = time.time()
-    #         send_time = end_time - start_time
-    #         logging.info(f"发送执行时间: {send_time*1000} 毫秒")
-    #         if not self.action_queue or self.latest_action is None:
-    #             logging.warning("action queue is null or latest_action is None, wait for receive actions.")
-    #             self._receive_actions() # 如果动作队列为空，则需要等待推理完成
-    #         else:
-    #             threading.Thread(target=self._receive_actions, daemon=True).start()
-
-    #     if not self.action_queue:
-    #         # raise TimeoutError("Remote policy returned no actions.")
-    #         logging.warning("Remote policy action queue is null, use latest_action.")
-    #         timed_action = self.latest_action
-
-    #     timed_action = self.action_queue.pop(0)
-    #     self.latest_action = timed_action
-    #     self.latest_action_timestep = timed_action.get_timestep()
-    #     return self._tensor_to_action(timed_action.get_action())
-
-    # 2异步推理，无需等待
     def get_action(self, observation: dict, task: str | None, timestep: int) -> RobotAction:
         if self._ready_to_send_observation():
-            # This client sends an observation and then blocks on GetActions. Unlike the
-            # async RobotClient, there is no background thread to retry later, so we must
-            # always force inference here. Otherwise the server may filter a similar obs
-            # (must_go=False) and GetActions times out while the action queue still has
-            # steps left to execute.
-
-            def worker():
-                self.is_send = getattr(self, "is_send", None)
-                if self.is_send is None or self.is_send == False:
-                    self.is_send = True
-                    start_time = time.time()
-                    self._send_observation(
-                        observation=observation,
-                        timestep=timestep,
-                        task=task,
-                        must_go=True,
-                    )
-                    end_time = time.time()
-                    send_time = end_time - start_time
-                    # logging.info(f"发送执行时间: {send_time*1000} 毫秒")
-                    self._receive_actions() # 如果动作队列为空，则需要等待推理完成
-                    self.is_send = False
-                # else:
-                #     time.sleep(0.1)
-
-            if not self.action_queue or self.latest_action is None:
-                logging.warning("action queue is null or latest_action is None, wait for receive actions.")
-                worker()
+            with self._state_lock:
+                queue_is_empty = not self.action_queue
+            if queue_is_empty:
+                self._wait_for_actions(observation, task, timestep)
             else:
-                threading.Thread(target=worker, daemon=True).start()
+                self._start_background_request(observation, task, timestep)
 
-        if not self.action_queue:
-            # raise TimeoutError("Remote policy returned no actions.")
-            logging.warning("Remote policy action queue is null, use latest_action.")
-            timed_action = self.latest_action
-        else:
+        with self._state_lock:
             timed_action = self.action_queue.pop(0)
             self.latest_action = timed_action
-            
-        self.latest_action_timestep = timed_action.get_timestep()
+            self.latest_action_timestep = timed_action.get_timestep()
         return self._tensor_to_action(timed_action.get_action())
