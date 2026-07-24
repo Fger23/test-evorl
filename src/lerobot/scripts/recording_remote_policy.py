@@ -55,7 +55,7 @@ class RemotePolicyRecordConfig:
     client_device: str = "cpu"
     actions_per_chunk: int = 1
     chunk_size_threshold: float = 0.0
-    aggregate_fn_name: str = "latest_only"
+    aggregate_fn_name: str = "weighted_average"
     obs_queue_timeout_s: float = 2.0
     rename_map: dict[str, str] = field(default_factory=dict)
 
