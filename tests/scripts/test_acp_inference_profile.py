@@ -123,9 +123,11 @@ def test_named_run_resumes_without_overwriting_chunks(tmp_path: Path) -> None:
     first.record({"wall_ms": 10.0}, {"cfg": torch.tensor([1.0])})
 
     resumed = ACPInferenceProfiler(tmp_path, fps=30, cfg_beta=1.5, run_name="run")
+    assert resumed.next_index == 1
     record = resumed.record({"wall_ms": 20.0}, {"cfg": torch.tensor([2.0])})
 
     assert record["index"] == 1
+    assert resumed.next_index == 2
     assert (resumed.chunks_dir / "000000.pt").exists()
     assert (resumed.chunks_dir / "000001.pt").exists()
     assert _read_json(resumed.summary_path)["count"] == 2

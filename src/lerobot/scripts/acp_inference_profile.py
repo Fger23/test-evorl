@@ -163,6 +163,11 @@ class ACPInferenceProfiler:
             self.records_path.touch()
         self._write_summary_atomic()
 
+    @property
+    def next_index(self) -> int:
+        """Return the index that will be assigned to the next recorded chunk."""
+        return self._next_index
+
     def record(
         self,
         metrics: dict[str, Any],

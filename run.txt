@@ -200,7 +200,19 @@ CUDA_VISIBLE_DEVICES=5 lerobot-train \
 
 
 # 6.启动远程推理服务
-python -m lerobot.async_inference.policy_server  --host=0.0.0.0 --port=8099
+python -m lerobot.async_inference.policy_server \
+  --host=0.0.0.0 \
+  --port=8099 \
+  --fps=30 \
+  --acp_inference.enable=true \
+  --acp_inference.use_cfg=true \
+  --acp_inference.batched_cfg=true \
+  --acp_inference.cfg_beta=1.5 \
+  --acp_inference.profile=true \
+  --acp_inference.profile_output_dir=outputs/acp_inference_profile \
+  --acp_inference.profile_run_name=h200_trial_01 \
+  --acp_inference.profile_warmup_chunks=3 \
+  --acp_inference.profile_save_chunks=false
 
 # 7.真机端启动人在环采集
 lerobot-human-inloop-record \

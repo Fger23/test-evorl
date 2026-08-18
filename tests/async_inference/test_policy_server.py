@@ -118,6 +118,29 @@ def _make_obs(state: torch.Tensor, timestep: int = 0, must_go: bool = False):
 # -----------------------------------------------------------------------------
 
 
+def test_policy_server_acp_config_validation_and_round_trip():
+    from lerobot.async_inference.configs import ACPInferenceConfig, PolicyServerConfig
+
+    with pytest.raises(ValueError, match="requires.*use_cfg=true.*batched_cfg=true"):
+        PolicyServerConfig(acp_inference=ACPInferenceConfig(enable=True))
+
+    config = PolicyServerConfig(
+        acp_inference=ACPInferenceConfig(
+            enable=True,
+            use_cfg=True,
+            batched_cfg=True,
+            cfg_beta=1.5,
+            profile=True,
+            profile_save_chunks=False,
+        )
+    )
+    restored = PolicyServerConfig.from_dict(config.to_dict())
+
+    assert restored.acp_inference.cfg_beta == 1.5
+    assert restored.acp_inference.profile is True
+    assert restored.acp_inference.profile_save_chunks is False
+
+
 def test_time_action_chunk(policy_server):
     """Verify that `_time_action_chunk` assigns correct timestamps and timesteps."""
     start_ts = time.time()
@@ -228,3 +251,109 @@ def test_predict_action_chunk(monkeypatch, policy_server):
     for i, ta in enumerate(timed_actions):
         expected_ts = obs.get_timestamp() + i * policy_server.config.environment_dt
         assert abs(ta.get_timestamp() - expected_ts) < 1e-6
+
+
+def test_get_action_chunk_preserves_legacy_policy_signature(policy_server):
+    """The default server path must not pass the new explicit-noise argument."""
+    policy_server.policy_type = "pi05"
+    observation = {OBS_STATE: torch.zeros(1, 6)}
+
+    chunk = policy_server._get_action_chunk(observation)
+
+    assert chunk.shape == (1, 20, 6)
+
+
+def test_server_batched_cfg_shared_noise_raw_blend_and_profile(policy_server):
+    """Run the complete server-side Pi0.5 CFG path without a real model or GPU."""
+    from lerobot.async_inference.configs import ACPInferenceConfig
+
+    class _Config:
+        robot_type = "dummy_robot"
+        image_features = {}
+        chunk_size = 2
+        max_action_dim = 2
+        rtc_config = None
+
+    class _BatchedPolicy:
+        def __init__(self):
+            self.config = _Config()
+            self.calls = []
+
+        def predict_action_chunk(self, observation, noise=None):
+            self.calls.append((observation, noise.detach().clone()))
+            uncond = torch.tensor([[[1.0, 2.0], [3.0, 4.0]]], device=noise.device)
+            cond = uncond + 4.0
+            return torch.cat((uncond, cond), dim=0)
+
+    class _Preprocessor:
+        def __init__(self):
+            self.inputs = []
+
+        def __call__(self, observation):
+            self.inputs.append(observation)
+            return observation
+
+    class _Postprocessor:
+        def __init__(self):
+            self.inputs = []
+
+        def __call__(self, action):
+            self.inputs.append(action.detach().clone())
+            return action.square()
+
+    class _Profiler:
+        def __init__(self):
+            self.records = []
+
+        def record(self, metrics, chunks=None):
+            self.records.append((metrics, chunks))
+
+    policy_server.config.acp_inference = ACPInferenceConfig(
+        enable=True,
+        use_cfg=True,
+        batched_cfg=True,
+        cfg_beta=1.5,
+        profile=True,
+    )
+    policy_server.policy_type = "pi05"
+    policy_server.pretrained_name_or_path = "dummy/pi05"
+    policy_server.actions_per_chunk = 2
+    policy_server.policy = _BatchedPolicy()
+    policy_server.preprocessor = _Preprocessor()
+    policy_server.postprocessor = _Postprocessor()
+    policy_server.acp_profiler = _Profiler()
+
+    observation = _make_obs(torch.zeros(6), timestep=7)
+    observation.observation["task"] = "Pick and place"
+    timed_actions = policy_server._predict_action_chunk(observation)
+
+    assert len(policy_server.preprocessor.inputs) == 1
+    preprocessor_input = policy_server.preprocessor.inputs[0]
+    assert preprocessor_input[OBS_STATE].shape == (2, 6)
+    assert preprocessor_input["task"] == [
+        "Pick and place",
+        "Pick and place\nAdvantage: positive",
+    ]
+
+    assert len(policy_server.policy.calls) == 1
+    model_input, shared_noise = policy_server.policy.calls[0]
+    assert model_input[OBS_STATE].shape == (2, 6)
+    assert shared_noise.shape == (2, 2, 2)
+    assert torch.equal(shared_noise[0], shared_noise[1])
+
+    expected_raw_cfg = torch.tensor([[[7.0, 8.0], [9.0, 10.0]]])
+    assert len(policy_server.postprocessor.inputs) == 1
+    assert torch.equal(policy_server.postprocessor.inputs[0], expected_raw_cfg)
+    assert torch.equal(timed_actions[0].get_action(), torch.tensor([49.0, 64.0]))
+    assert torch.equal(timed_actions[1].get_action(), torch.tensor([81.0, 100.0]))
+
+    assert len(policy_server.acp_profiler.records) == 1
+    metrics, chunks = policy_server.acp_profiler.records[0]
+    assert metrics["batch_size"] == 2
+    assert metrics["cfg_beta"] == 1.5
+    assert metrics["shared_noise_max_abs_diff"] == 0.0
+    assert metrics["wall_latency_s"] >= 0.0
+    assert metrics["cuda_latency_ms"] is None
+    assert torch.equal(chunks["cfg_raw"], expected_raw_cfg)
+    assert torch.equal(chunks["cfg_processed"], expected_raw_cfg.square())
+    assert policy_server._acp_chunk_index == 1

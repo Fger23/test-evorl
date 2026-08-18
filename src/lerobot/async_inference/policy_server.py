@@ -43,6 +43,7 @@ from lerobot.processor import (
     PolicyAction,
     PolicyProcessorPipeline,
 )
+from lerobot.rl.acp_tags import build_acp_tagged_task
 from lerobot.transport import (
     services_pb2,  # type: ignore
     services_pb2_grpc,  # type: ignore
@@ -84,11 +85,14 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         # Attributes will be set by SendPolicyInstructions
         self.device = None
         self.policy_type = None
+        self.pretrained_name_or_path = None
         self.lerobot_features = None
         self.actions_per_chunk = None
         self.policy = None
         self.preprocessor: PolicyProcessorPipeline[dict[str, Any], dict[str, Any]] | None = None
         self.postprocessor: PolicyProcessorPipeline[PolicyAction, PolicyAction] | None = None
+        self.acp_profiler: Any | None = None
+        self._acp_chunk_index = 0
 
     @property
     def running(self):
@@ -97,6 +101,46 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
     @property
     def policy_image_features(self):
         return self.policy.config.image_features
+
+    @property
+    def batched_cfg_enabled(self) -> bool:
+        acp = self.config.acp_inference
+        return acp.enable and acp.use_cfg and acp.batched_cfg
+
+    def _configure_acp_profiler(self) -> None:
+        """Create a profiler for the currently loaded policy, if requested.
+
+        ``Ready`` calls only reset per-episode queue state, so this profiler and
+        its warm-up counter intentionally survive across episodes. A new policy
+        instruction reload starts a new in-process warm-up sequence.
+        """
+        self.acp_profiler = None
+        self._acp_chunk_index = 0
+        if not self.batched_cfg_enabled:
+            return
+
+        acp = self.config.acp_inference
+        if acp.profile:
+            from lerobot.scripts.acp_inference_profile import ACPInferenceProfiler
+
+            self.acp_profiler = ACPInferenceProfiler(
+                output_root=acp.profile_output_dir,
+                fps=self.config.fps,
+                cfg_beta=acp.cfg_beta,
+                save_chunks=acp.profile_save_chunks,
+                run_name=acp.profile_run_name,
+            )
+            # A named profiling run may be resumed after a server restart. Keep
+            # both the persisted index and warm-up classification continuous.
+            self._acp_chunk_index = self.acp_profiler.next_index
+
+        self.logger.info(
+            "Server-side batched Pi0.5 ACP-CFG enabled "
+            "(beta=%.3f, profiling=%s, output=%s).",
+            acp.cfg_beta,
+            acp.profile,
+            self.acp_profiler.output_dir if self.acp_profiler is not None else "disabled",
+        )
 
     def _reset_server(self) -> None:
         """Flushes server state when new client connects."""
@@ -134,6 +178,8 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
                 f"Policy type {policy_specs.policy_type} not supported. "
                 f"Supported policies: {SUPPORTED_POLICIES}"
             )
+        if self.batched_cfg_enabled and policy_specs.policy_type != "pi05":
+            raise ValueError("Server-side batched ACP-CFG inference is supported only for Pi0.5.")
 
         self.logger.info(
             f"Receiving policy instructions from {client_id} | "
@@ -145,6 +191,7 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
 
         self.device = policy_specs.device
         self.policy_type = policy_specs.policy_type  # act, pi0, etc.
+        self.pretrained_name_or_path = policy_specs.pretrained_name_or_path
         self.lerobot_features = policy_specs.lerobot_features
         self.actions_per_chunk = policy_specs.actions_per_chunk
 
@@ -161,6 +208,12 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         # Move policy to device (in case device wasn't set during initialization)
         self.policy.to(self.device)
 
+        if self.batched_cfg_enabled and getattr(self.policy.config, "rtc_config", None) is not None:
+            raise ValueError(
+                "Batched ACP-CFG profiling is a no-RTC baseline; "
+                "set the Pi0.5 `rtc_config` to null."
+            )
+
         # Load preprocessor and postprocessor, overriding device to match requested device
         device_override = {"device": self.device}
         self.preprocessor, self.postprocessor = make_pre_post_processors(
@@ -172,6 +225,8 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
             },
             postprocessor_overrides={"device_processor": device_override},
         )
+
+        self._configure_acp_profiler()
 
         end = time.perf_counter()
 
@@ -332,6 +387,133 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
             for i, action in enumerate(action_chunk)
         ]
 
+    def _prepare_batched_cfg_observation(self, observation: Observation) -> dict[str, Any]:
+        """Build and preprocess a fixed-order ``[unconditional, conditional]`` batch."""
+        if self.preprocessor is None:
+            raise RuntimeError("Policy preprocessor is not initialized.")
+
+        task_value = observation.get("task", "")
+        if task_value is None:
+            task = ""
+        elif isinstance(task_value, str):
+            task = task_value
+        elif (
+            isinstance(task_value, list)
+            and len(task_value) == 1
+            and isinstance(task_value[0], str)
+        ):
+            task = task_value[0]
+        else:
+            raise ValueError(
+                "Batched ACP-CFG expects one task string before preprocessing, "
+                f"got {type(task_value).__name__}."
+            )
+
+        batched_observation = dict(observation)
+        for key, value in list(batched_observation.items()):
+            if not isinstance(value, torch.Tensor):
+                continue
+            if value.ndim == 0 or value.shape[0] != 1:
+                raise ValueError(
+                    "Batched ACP-CFG expects a single observation before batching, "
+                    f"got {key} shape={tuple(value.shape)}."
+                )
+            repeats = (2,) + (1,) * (value.ndim - 1)
+            batched_observation[key] = value.repeat(repeats)
+
+        # Row 0 is U and row 1 is C throughout model inference and profiling.
+        batched_observation["task"] = [task, build_acp_tagged_task(task, is_positive=True)]
+        return self.preprocessor(batched_observation)
+
+    def _get_batched_cfg_action_chunk(
+        self, observation: dict[str, Any]
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor], float | None]:
+        """Run one Pi0.5 batch=2 call and blend U/C in normalized action space."""
+        if self.policy is None or self.actions_per_chunk is None or self.device is None:
+            raise RuntimeError("PolicyServer must receive policy instructions before inference.")
+
+        chunk_size = int(self.policy.config.chunk_size)
+        max_action_dim = int(self.policy.config.max_action_dim)
+        device = torch.device(self.device)
+
+        # Match Pi0.5's native sample_noise implementation exactly, then copy
+        # the same initial noise into the U and C rows.
+        base_noise = torch.normal(
+            mean=0.0,
+            std=1.0,
+            size=(1, chunk_size, max_action_dim),
+            dtype=torch.float32,
+            device=device,
+        )
+        shared_noise = base_noise.repeat(2, 1, 1)
+
+        cuda_start = cuda_end = None
+        if self.acp_profiler is not None and device.type == "cuda":
+            cuda_start = torch.cuda.Event(enable_timing=True)
+            cuda_end = torch.cuda.Event(enable_timing=True)
+            cuda_start.record(torch.cuda.current_stream(device))
+
+        raw_chunks = self.policy.predict_action_chunk(observation, noise=shared_noise)
+
+        if cuda_end is not None:
+            cuda_end.record(torch.cuda.current_stream(device))
+            torch.cuda.synchronize(device)
+            cuda_latency_ms = cuda_start.elapsed_time(cuda_end)
+        else:
+            cuda_latency_ms = None
+
+        if raw_chunks.ndim != 3 or raw_chunks.shape[0] != 2:
+            raise ValueError(
+                "Batched ACP-CFG requires Pi0.5 to return [2, T, A], "
+                f"got {tuple(raw_chunks.shape)}."
+            )
+
+        raw_uncond = raw_chunks[0:1]
+        raw_cond = raw_chunks[1:2]
+        raw_cfg = raw_uncond + self.config.acp_inference.cfg_beta * (raw_cond - raw_uncond)
+        if not bool(torch.isfinite(raw_cfg).all()):
+            raise FloatingPointError("Batched ACP-CFG produced a non-finite raw action chunk.")
+
+        execution_steps = min(int(self.actions_per_chunk), int(raw_cfg.shape[1]))
+        if execution_steps <= 0:
+            raise ValueError("`actions_per_chunk` must select at least one Pi0.5 action.")
+
+        raw_uncond = raw_uncond[:, :execution_steps]
+        raw_cond = raw_cond[:, :execution_steps]
+        raw_cfg = raw_cfg[:, :execution_steps]
+        artifacts = {
+            "noise": base_noise,
+            "uncond_raw": raw_uncond,
+            "cond_raw": raw_cond,
+            "cfg_raw": raw_cfg,
+            "shared_noise": shared_noise,
+        }
+        return raw_cfg, artifacts, cuda_latency_ms
+
+    def _postprocess_action_chunk(self, action_tensor: torch.Tensor) -> torch.Tensor:
+        """Postprocess a chunk while preserving the legacy path for non-CFG policies."""
+        if self.postprocessor is None:
+            raise RuntimeError("Policy postprocessor is not initialized.")
+
+        if self.batched_cfg_enabled:
+            processed = self.postprocessor(action_tensor)
+            if processed.ndim != 3 or processed.shape[0] != 1:
+                raise ValueError(
+                    "Batched ACP-CFG postprocessing must preserve [1, T, A], "
+                    f"got {tuple(processed.shape)}."
+                )
+            if not bool(torch.isfinite(processed).all()):
+                raise FloatingPointError("Batched ACP-CFG produced a non-finite processed action chunk.")
+            return processed
+
+        # Preserve the original server behavior for every policy when ACP-CFG
+        # is disabled: postprocess one timestep at a time.
+        _, chunk_size, _ = action_tensor.shape
+        processed_actions = []
+        for i in range(chunk_size):
+            processed_actions.append(self.postprocessor(action_tensor[:, i, :]))
+        return torch.stack(processed_actions, dim=1)
+
     def _get_action_chunk(self, observation: dict[str, torch.Tensor]) -> torch.Tensor:
         """Get an action chunk from the policy. The chunk contains only"""
         chunk = self.policy.predict_action_chunk(observation)
@@ -339,6 +521,78 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
             chunk = chunk.unsqueeze(0)  # adding batch dimension, now shape is (B, chunk_size, action_dim)
 
         return chunk[:, : self.actions_per_chunk, :]
+
+    def _record_acp_profile(
+        self,
+        *,
+        observation_t: TimedObservation,
+        artifacts: dict[str, torch.Tensor],
+        processed_cfg: torch.Tensor,
+        timings_s: dict[str, float],
+        wall_latency_s: float,
+        cuda_latency_ms: float | None,
+        memory_before: int | None,
+        peak_memory: int | None,
+    ) -> None:
+        if self.acp_profiler is None:
+            return
+
+        raw_uncond = artifacts["uncond_raw"]
+        raw_cond = artifacts["cond_raw"]
+        raw_cfg = artifacts["cfg_raw"]
+        shared_noise = artifacts["shared_noise"]
+        branch_delta = raw_cond - raw_uncond
+        acp = self.config.acp_inference
+
+        metrics = {
+            "chunk_index": self._acp_chunk_index,
+            "observation_timestep": observation_t.get_timestep(),
+            "policy_type": self.policy_type,
+            "policy_checkpoint": self.pretrained_name_or_path,
+            "device": str(self.device),
+            "dtype": str(raw_cfg.dtype),
+            "batch_size": 2,
+            "cfg_beta": acp.cfg_beta,
+            "fps": self.config.fps,
+            "model_chunk_size": int(self.policy.config.chunk_size),
+            "execution_steps": int(processed_cfg.shape[1]),
+            "action_dim": int(processed_cfg.shape[2]),
+            "wall_latency_s": wall_latency_s,
+            "prepare_latency_ms": timings_s["prepare"] * 1000,
+            "preprocess_latency_ms": timings_s["preprocess"] * 1000,
+            "model_and_cfg_latency_ms": timings_s["inference"] * 1000,
+            "postprocess_and_d2h_latency_ms": timings_s["postprocess"] * 1000,
+            "cuda_latency_ms": cuda_latency_ms,
+            "cuda_memory_allocated_before_bytes": memory_before,
+            "cuda_peak_memory_bytes": peak_memory,
+            "cuda_peak_memory_increment_bytes": (
+                max(peak_memory - memory_before, 0)
+                if peak_memory is not None and memory_before is not None
+                else None
+            ),
+            "shared_noise_max_abs_diff": (shared_noise[0] - shared_noise[1]).abs().max().item(),
+            "warmup": self._acp_chunk_index < acp.profile_warmup_chunks,
+            "raw_cfg_min": raw_cfg.min().item(),
+            "raw_cfg_max": raw_cfg.max().item(),
+            "raw_cfg_mean": raw_cfg.mean().item(),
+            "raw_cfg_std": raw_cfg.std(unbiased=False).item(),
+            "raw_cfg_out_of_range_ratio": (raw_cfg.abs() > 1.0).float().mean().item(),
+            "processed_cfg_min": processed_cfg.min().item(),
+            "processed_cfg_max": processed_cfg.max().item(),
+            "cond_uncond_delta_l2_mean": torch.linalg.vector_norm(
+                branch_delta, dim=-1
+            ).mean().item(),
+        }
+        self.acp_profiler.record(
+            metrics,
+            chunks={
+                "noise": artifacts["noise"],
+                "uncond_raw": raw_uncond,
+                "cond_raw": raw_cond,
+                "cfg_raw": raw_cfg,
+                "cfg_processed": processed_cfg,
+            },
+        )
 
     def _predict_action_chunk(self, observation_t: TimedObservation) -> list[TimedAction]:
         """Predict an action chunk based on an observation.
@@ -350,6 +604,15 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         4. Apply postprocessor (unnormalization, device movement)
         5. Convert to TimedAction list
         """
+        memory_before = peak_memory = None
+        profile_device = torch.device(self.device) if self.device is not None else None
+        if self.acp_profiler is not None and profile_device is not None and profile_device.type == "cuda":
+            torch.cuda.synchronize(profile_device)
+            torch.cuda.reset_peak_memory_stats(profile_device)
+            memory_before = torch.cuda.memory_allocated(profile_device)
+
+        pipeline_start = time.perf_counter()
+
         """1. Prepare observation"""
         start_prepare = time.perf_counter()
         observation: Observation = raw_observation_to_observation(
@@ -361,16 +624,26 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
 
         """2. Apply preprocessor"""
         start_preprocess = time.perf_counter()
-        observation = self.preprocessor(observation)
+        if self.batched_cfg_enabled:
+            observation = self._prepare_batched_cfg_observation(observation)
+        else:
+            observation = self.preprocessor(observation)
         self.last_processed_obs: TimedObservation = observation_t
         preprocessing_time = time.perf_counter() - start_preprocess
 
         """3. Get action chunk"""
         start_inference = time.perf_counter()
-        action_tensor = self._get_action_chunk(observation)
+        acp_artifacts = None
+        cuda_latency_ms = None
+        if self.batched_cfg_enabled:
+            action_tensor, acp_artifacts, cuda_latency_ms = self._get_batched_cfg_action_chunk(
+                observation
+            )
+        else:
+            action_tensor = self._get_action_chunk(observation)
         inference_time = time.perf_counter() - start_inference
         self.logger.info(
-            f"Preprocessing and inference took {inference_time:.4f}s, action shape: {action_tensor.shape}"
+            f"Policy inference took {inference_time:.4f}s, action shape: {action_tensor.shape}"
         )
 
         # ========== 调试信息开始 ==========
@@ -384,38 +657,51 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         # ========== 调试信息结束 ==========
 
         """4. Apply postprocessor"""
-        # Apply postprocessor (handles unnormalization and device movement)
-        # Postprocessor expects (B, action_dim) per action, but we have (B, chunk_size, action_dim)
-        # So we process each action in the chunk individually
         start_postprocess = time.perf_counter()
-        _, chunk_size, _ = action_tensor.shape
+        processed_action_tensor = self._postprocess_action_chunk(action_tensor)
+        if processed_action_tensor.ndim != 3 or processed_action_tensor.shape[0] != 1:
+            raise ValueError(
+                "PolicyServer expects one postprocessed action chunk [1, T, A], "
+                f"got {tuple(processed_action_tensor.shape)}."
+            )
 
-        # Process each action in the chunk
-        processed_actions = []
-        for i in range(chunk_size):
-            # Extract action at timestep i: (B, action_dim)
-            single_action = action_tensor[:, i, :]
-            # 再打印每个 single_action 的形状
-            # print(f"[DEBUG] single_action[{i}].shape = {single_action.shape}")  # 应该是 (B, action_dim)
-            processed_action = self.postprocessor(single_action)
-            processed_actions.append(processed_action)
-
-        # Stack back to (B, chunk_size, action_dim), then remove batch dim
-        action_tensor = torch.stack(processed_actions, dim=1).squeeze(0)
+        action_tensor = processed_action_tensor.squeeze(0).detach().cpu()
         self.logger.debug(f"Postprocessed action shape: {action_tensor.shape}")
+        postprocess_stops = time.perf_counter()
+        postprocessing_time = postprocess_stops - start_postprocess
 
-        action_tensor = action_tensor.detach().cpu()
+        if self.acp_profiler is not None and profile_device is not None and profile_device.type == "cuda":
+            peak_memory = torch.cuda.max_memory_allocated(profile_device)
 
         """5. Convert to TimedAction list"""
         action_chunk = self._time_action_chunk(
             observation_t.get_timestamp(), list(action_tensor), observation_t.get_timestep()
         )
-        postprocess_stops = time.perf_counter()
-        postprocessing_time = postprocess_stops - start_postprocess
+        wall_latency_s = postprocess_stops - pipeline_start
+
+        if self.batched_cfg_enabled:
+            if acp_artifacts is None:
+                raise RuntimeError("Missing ACP-CFG inference artifacts.")
+            self._record_acp_profile(
+                observation_t=observation_t,
+                artifacts=acp_artifacts,
+                processed_cfg=processed_action_tensor,
+                timings_s={
+                    "prepare": prepare_time,
+                    "preprocess": preprocessing_time,
+                    "inference": inference_time,
+                    "postprocess": postprocessing_time,
+                },
+                wall_latency_s=wall_latency_s,
+                cuda_latency_ms=cuda_latency_ms,
+                memory_before=memory_before,
+                peak_memory=peak_memory,
+            )
+            self._acp_chunk_index += 1
 
         self.logger.info(
             f"Observation {observation_t.get_timestep()} | "
-            f"Total time: {1000 * (postprocess_stops - start_prepare):.2f}ms"
+            f"Total time: {1000 * wall_latency_s:.2f}ms"
         )
 
         self.logger.debug(
@@ -424,7 +710,7 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
             f"Preprocessing time: {1000 * preprocessing_time:.2f}ms | "
             f"Inference time: {1000 * inference_time:.2f}ms | "
             f"Postprocessing time: {1000 * postprocessing_time:.2f}ms | "
-            f"Total time: {1000 * (postprocess_stops - start_prepare):.2f}ms"
+            f"Total time: {1000 * wall_latency_s:.2f}ms"
         )
 
         return action_chunk

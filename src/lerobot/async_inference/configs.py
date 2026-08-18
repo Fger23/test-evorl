@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
@@ -43,6 +44,43 @@ def get_aggregate_function(name: str) -> Callable[[torch.Tensor, torch.Tensor], 
 
 
 @dataclass
+class ACPInferenceConfig:
+    """Server-side ACP-CFG inference and profiling configuration.
+
+    The defaults preserve the original single-branch policy-server behavior.
+    All fields are nested under ``--acp_inference.*`` in the policy-server CLI.
+    """
+
+    enable: bool = False
+    use_cfg: bool = False
+    cfg_beta: float = 1.0
+    batched_cfg: bool = False
+    profile: bool = False
+    profile_output_dir: str = "outputs/acp_inference_profile"
+    profile_save_chunks: bool = False
+    profile_run_name: str | None = None
+    profile_warmup_chunks: int = 3
+
+    def __post_init__(self) -> None:
+        if self.use_cfg and not self.enable:
+            raise ValueError("`acp_inference.use_cfg=true` requires `acp_inference.enable=true`.")
+        if self.batched_cfg and not self.use_cfg:
+            raise ValueError("`acp_inference.batched_cfg=true` requires `acp_inference.use_cfg=true`.")
+        if self.profile and not self.batched_cfg:
+            raise ValueError("`acp_inference.profile=true` requires `acp_inference.batched_cfg=true`.")
+        if not math.isfinite(self.cfg_beta) or self.cfg_beta < 0:
+            raise ValueError("`acp_inference.cfg_beta` must be finite and >= 0.")
+        if self.profile and not self.profile_output_dir.strip():
+            raise ValueError("`acp_inference.profile_output_dir` must be non-empty.")
+        if (
+            not isinstance(self.profile_warmup_chunks, int)
+            or isinstance(self.profile_warmup_chunks, bool)
+            or self.profile_warmup_chunks < 0
+        ):
+            raise ValueError("`acp_inference.profile_warmup_chunks` must be a non-negative integer.")
+
+
+@dataclass
 class PolicyServerConfig:
     """Configuration for PolicyServer.
 
@@ -64,6 +102,10 @@ class PolicyServerConfig:
         default=DEFAULT_OBS_QUEUE_TIMEOUT, metadata={"help": "Timeout for observation queue in seconds"}
     )
 
+    # Optional Pi0.5 batch=2 ACP-CFG inference. This is configured on the H200
+    # policy server; the robot client continues to receive one action chunk.
+    acp_inference: ACPInferenceConfig = field(default_factory=ACPInferenceConfig)
+
     def __post_init__(self):
         """Validate configuration after initialization."""
         if self.port < 1 or self.port > 65535:
@@ -78,10 +120,23 @@ class PolicyServerConfig:
         if self.obs_queue_timeout < 0:
             raise ValueError(f"obs_queue_timeout must be non-negative, got {self.obs_queue_timeout}")
 
+        if self.acp_inference.enable and not (
+            self.acp_inference.use_cfg and self.acp_inference.batched_cfg
+        ):
+            raise ValueError(
+                "PolicyServer ACP inference currently requires "
+                "`enable=true`, `use_cfg=true`, and `batched_cfg=true`."
+            )
+
     @classmethod
     def from_dict(cls, config_dict: dict) -> "PolicyServerConfig":
         """Create a PolicyServerConfig from a dictionary."""
-        return cls(**config_dict)
+        values = dict(config_dict)
+        acp_inference = values.get("acp_inference")
+        if isinstance(acp_inference, dict):
+            values["acp_inference"] = ACPInferenceConfig(**acp_inference)
+        values.pop("environment_dt", None)
+        return cls(**values)
 
     @property
     def environment_dt(self) -> float:
@@ -96,6 +151,18 @@ class PolicyServerConfig:
             "fps": self.fps,
             "environment_dt": self.environment_dt,
             "inference_latency": self.inference_latency,
+            "obs_queue_timeout": self.obs_queue_timeout,
+            "acp_inference": {
+                "enable": self.acp_inference.enable,
+                "use_cfg": self.acp_inference.use_cfg,
+                "cfg_beta": self.acp_inference.cfg_beta,
+                "batched_cfg": self.acp_inference.batched_cfg,
+                "profile": self.acp_inference.profile,
+                "profile_output_dir": self.acp_inference.profile_output_dir,
+                "profile_save_chunks": self.acp_inference.profile_save_chunks,
+                "profile_run_name": self.acp_inference.profile_run_name,
+                "profile_warmup_chunks": self.acp_inference.profile_warmup_chunks,
+            },
         }
 
 
