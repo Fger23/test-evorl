@@ -870,6 +870,7 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
                     prev_chunk_left_over=prev_chunk_left_over,
                     inference_delay=inference_delay,
                     time=time,
+                    #denoise_step_partial_call就是计算RTC修正前的原始V_t.
                     original_denoise_step_partial=denoise_step_partial_call,
                     execution_horizon=execution_horizon,
                 )
