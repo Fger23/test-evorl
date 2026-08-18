@@ -1,36 +1,25 @@
 from lerobot.datasets.aggregate import aggregate_datasets
 
 
-inputs_dir = [
-    "/nfs/lerobot/s101/datasets/evo_0714_insert_card_1/",
-    "/nfs/lerobot/s101/datasets/evo_0714_insert_card_2/",
-    "/nfs/lerobot/s101/datasets/evo_0714_insert_card_3/",
-    "/nfs/lerobot/s101/datasets/evo_0715_insert_card_1/",
-
-    ]
-aggr_root = "/nfs/lerobot/s101/datasets/aggregation/evo-rl/insert_card_0714_15/"
-
 # inputs_dir = [
-#     "/nfs/lerobot/s101/datasets/0703_banknote_binding/",
-#     "/nfs/lerobot/s101/datasets/0703_banknote_binding_1/",
-#     "/nfs/lerobot/s101/datasets/0703_banknote_binding_2/",
-#     "/nfs/lerobot/s101/datasets/0707_banknote_binding_1/",
-#     "/nfs/lerobot/s101/datasets/0707_banknote_binding_2/",
-#     "/nfs/lerobot/s101/datasets/0707_banknote_binding_3/",
-#     "/nfs/lerobot/s101/datasets/0713_banknote_binding_1/",
-#     "/nfs/lerobot/s101/datasets/0713_banknote_binding_2/",
-#     "/nfs/lerobot/s101/datasets/0713_banknote_binding_3/",
-#     "/nfs/lerobot/s101/datasets/0713_banknote_binding_4/",
-#     "/nfs/lerobot/s101/datasets/0713_banknote_binding_5/",
-#     "/nfs/lerobot/s101/datasets/0713_banknote_binding_6/",
-#     "/nfs/lerobot/s101/datasets/0713_banknote_binding_7/",
-#     "/nfs/lerobot/s101/datasets/0713_banknote_binding_8/",
-#     "/nfs/lerobot/s101/datasets/0713_banknote_binding_9/",
-#     "/nfs/lerobot/s101/datasets/0713_banknote_binding_10/",
-#     "/nfs/lerobot/s101/datasets/0713_banknote_binding_11/",
+#     "/nfs/lerobot/s101/datasets/evo_0714_insert_card_1/",
+#     "/nfs/lerobot/s101/datasets/evo_0714_insert_card_2/",
+#     "/nfs/lerobot/s101/datasets/evo_0714_insert_card_3/",
+#     "/nfs/lerobot/s101/datasets/evo_0715_insert_card_1/",
 
 #     ]
-# # aggr_root = "/nfs/lerobot/s101/datasets/aggregation/evo-rl/banknote_binding_iteration_1/"
+# aggr_root = "/nfs/lerobot/s101/datasets/aggregation/evo-rl/insert_card_0714_15/"
+
+inputs_dir = [
+    "/nfs/lerobot/s101/datasets/evo_0805_banknote_binding_1/",
+    "/nfs/lerobot/s101/datasets/evo_0805_banknote_binding_2/",
+    "/nfs/lerobot/s101/datasets/evo_0805_banknote_binding_3/",
+    "/nfs/lerobot/s101/datasets/evo_0805_banknote_binding_4/",
+    "/nfs/lerobot/s101/datasets/evo_0806_banknote_binding_1/",
+    "/nfs/lerobot/s101/datasets/evo_0806_banknote_binding_2/",
+    
+    ]
+aggr_root = "/nfs/lerobot/s101/datasets/aggregation/evo-rl/banknote_binding_0805_06/"
 # aggr_root = "/nfs/lerobot/s101/datasets/aggregation/banknote_binding_iteration_0703_13/"
 
 repo_ids = [""]*len(inputs_dir)

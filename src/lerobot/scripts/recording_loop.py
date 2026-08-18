@@ -38,6 +38,7 @@ from lerobot.scripts.recording_hil import (
     INTERVENTION_STATE_ACTIVE,
     INTERVENTION_STATE_POLICY,
     INTERVENTION_STATE_RELEASE,
+    ACPBatchedCFGRuntime,
     ACPInferenceConfig,
     PolicySyncDualArmExecutor,
     _capture_policy_runtime_state,
@@ -117,6 +118,7 @@ def record_loop(
     collector_policy_id_policy: str = "policy",
     collector_policy_id_human: str = "human",
     acp_inference: ACPInferenceConfig | None = None,
+    batched_cfg_runtime: ACPBatchedCFGRuntime | None = None,
     communication_retry_timeout_s: float = 2.0,
     communication_retry_interval_s: float = 0.1,
 ):
@@ -193,12 +195,24 @@ def record_loop(
         policy.reset()
         preprocessor.reset()
         postprocessor.reset()
+        if acp_inference.batched_cfg:
+            if batched_cfg_runtime is None:
+                batched_cfg_runtime = ACPBatchedCFGRuntime(
+                    config=acp_inference,
+                    fps=fps,
+                )
+            batched_cfg_runtime.reset()
     if remote_policy_client is not None:
         remote_policy_client.reset()
 
     cond_policy_runtime_state: dict[str, Any] | None = None
     uncond_policy_runtime_state: dict[str, Any] | None = None
-    if policy is not None and acp_inference.enable and acp_inference.use_cfg:
+    if (
+        policy is not None
+        and acp_inference.enable
+        and acp_inference.use_cfg
+        and not acp_inference.batched_cfg
+    ):
         cond_policy_runtime_state = _capture_policy_runtime_state(policy)
         uncond_policy_runtime_state = _capture_policy_runtime_state(policy)
 
@@ -271,8 +285,13 @@ def record_loop(
                         preprocessor.reset()
                         postprocessor.reset()
                         if acp_inference.enable and acp_inference.use_cfg:
-                            cond_policy_runtime_state = _capture_policy_runtime_state(policy)
-                            uncond_policy_runtime_state = _capture_policy_runtime_state(policy)
+                            if acp_inference.batched_cfg:
+                                if batched_cfg_runtime is None:
+                                    raise RuntimeError("Batched CFG runtime was not initialized.")
+                                batched_cfg_runtime.reset()
+                            else:
+                                cond_policy_runtime_state = _capture_policy_runtime_state(policy)
+                                uncond_policy_runtime_state = _capture_policy_runtime_state(policy)
                     if remote_policy_client is not None:
                         remote_policy_client.reset()
                     if policy is not None and preprocessor is not None and postprocessor is not None:
@@ -317,6 +336,7 @@ def record_loop(
                     acp_inference=acp_inference,
                     cond_runtime_state=cond_policy_runtime_state,
                     uncond_runtime_state=uncond_policy_runtime_state,
+                    batched_cfg_runtime=batched_cfg_runtime,
                 )
                 act_processed_policy = make_robot_action(policy_action, dataset.features)
 

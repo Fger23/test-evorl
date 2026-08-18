@@ -1,81 +1,81 @@
 <h1 align="center">Evo-RL</h1>
 
 <p align="center">
-  <a href="https://MINT-SJTU.github.io/Evo-RL/"><img alt="project website" src="https://img.shields.io/badge/Project-Website-0ea5e9"/></a>
-  <a href="https://github.com/huggingface/lerobot"><img alt="lerobot version" src="https://img.shields.io/badge/LeRobot-0.4.4-f59e0b"/></a>
-  <a href="https://evorl.example.com/wechat-post"><img alt="wechat post" src="https://img.shields.io/badge/WeChat-Official%20Post-07c160"/></a>
-  <a href="#community-channels"><img alt="wechat group join us" src="https://img.shields.io/badge/WeChat%20Group-Join%20Us-a855f7?logo=wechat&logoColor=white"/></a>
-  <a href="#citation"><img alt="paper coming soon" src="https://img.shields.io/static/v1?label=Paper&message=Coming%20Soon&color=9ca3af"/></a>
-  <a href="#model--dataset"><img alt="hugging face model coming soon" src="https://img.shields.io/static/v1?label=%F0%9F%A4%97%20Model&message=Coming%20Soon&color=9ca3af"/></a>
-  <a href="#model--dataset"><img alt="hugging face dataset coming soon" src="https://img.shields.io/static/v1?label=%F0%9F%A4%97%20Dataset&message=Coming%20Soon&color=9ca3af"/></a>
-  <a href="./LICENSE"><img alt="license" src="https://img.shields.io/badge/License-Apache--2.0-ef4444"/></a>
+  <a href="https://MINT-SJTU.github.io/Evo-RL/"><img alt="项目网站" src="https://img.shields.io/badge/项目-网站-0ea5e9"/></a>
+  <a href="https://github.com/huggingface/lerobot"><img alt="lerobot 版本" src="https://img.shields.io/badge/LeRobot-0.4.4-f59e0b"/></a>
+  <a href="https://evorl.example.com/wechat-post"><img alt="微信推文" src="https://img.shields.io/badge/微信-官方推文-07c160"/></a>
+  <a href="#社区渠道"><img alt="微信群加入我们" src="https://img.shields.io/badge/微信群-加入我们-a855f7?logo=wechat&logoColor=white"/></a>
+  <a href="#引用"><img alt="论文即将发布" src="https://img.shields.io/static/v1?label=论文&message=即将发布&color=9ca3af"/></a>
+  <a href="#模型--数据集"><img alt="hugging face 模型即将发布" src="https://img.shields.io/static/v1?label=%F0%9F%A4%97%20模型&message=即将发布&color=9ca3af"/></a>
+  <a href="#模型--数据集"><img alt="hugging face 数据集即将发布" src="https://img.shields.io/static/v1?label=%F0%9F%A4%97%20数据集&message=即将发布&color=9ca3af"/></a>
+  <a href="./LICENSE"><img alt="许可证" src="https://img.shields.io/badge/许可证-Apache--2.0-ef4444"/></a>
 </p>
 
-<p align="center"><strong>SJTU &amp; Evo-Tech</strong></p>
+<p align="center"><strong>上海交通大学 (SJTU) &amp; Evo-Tech</strong></p>
 
-<p align="center"><strong>Architecture Overview</strong></p>
+<p align="center"><strong>架构总览</strong></p>
 
 <p align="center">
-  <img alt="Evo-RL Pipeline Overview" src="./website/assets/images/overview.png" width="96%"/>
+  <img alt="Evo-RL 流水线总览" src="./website/assets/images/overview.png" width="96%"/>
 </p>
 
-## 🎯 Evo-RL Focus
+## 🎯 Evo-RL 的定位
 
-- **Open real-world RL on two platforms**: we build and release full real-world RL pipelines on SO101 and AgileX (PiPER/PiPER-X).
-- **Open code, models, and datasets for reproducibility**: we continuously release runnable offline RL assets so more people can reproduce results and apply them to real-world tasks.
-- **Open algorithm and community co-evolution**: we reproduce existing real-world RL methods, propose new methods, and keep publishing data/benchmarks to grow a collaborative open-source community.
+- **在两个平台上开放真机 RL**：我们在 SO101 和 AgileX (PiPER/PiPER-X) 上构建并发布了完整的真机 RL 流水线。
+- **开放代码、模型和数据集以支持复现**：持续发布可运行的离线 RL 资产，让更多人能够复现结果并应用到真实任务中。
+- **开放算法与社区共同进化**：我们复现已有的真机 RL 方法、提出新方法，并持续发布数据/基准，推动协作型开源社区的发展。
 
-## 🚀 News
+## 🚀 最新动态
 
-- **[2026-03-07]** Added AgileX (PiPER/PiPER-X) support for real-world RL.
-- **[2026-02-26]** First SO101 real-world RL baseline and reproducible CLI workflow are released.
+- **[2026-03-07]** 真机 RL 新增 AgileX (PiPER/PiPER-X) 支持。
+- **[2026-02-26]** 首个 SO101 真机 RL 基线及可复现的 CLI 工作流发布。
 
-## 🧭 Table of Contents
+## 🧭 目录
 
-| Getting Started                        | Training Pipeline                                                            | Project Info                                |
-| -------------------------------------- | ---------------------------------------------------------------------------- | ------------------------------------------- |
-| [⚡ Quick Start](#quick-start)         | [4) Value Function Training](#value-function-training)                       | [Model & Dataset](#model--dataset)          |
-| [1) Installation](#installation)       | [5) Value Inference](#value-inference)                                       | [Community Channels](#community-channels)   |
-| [2) Hardware Setup](#hardware-setup)   | [6) Policy Training](#policy-training)                                       | [Affiliations](#affiliations)               |
-| [3) Data Collection](#data-collection) | [7) Closed-loop Rollout and Next Round](#closed-loop-rollout-and-next-round) | [Citation](#citation) / [License](#license) |
+| 入门                                   | 训练流水线                                                   | 项目信息                                     |
+| -------------------------------------- | ------------------------------------------------------------ | -------------------------------------------- |
+| [⚡ 快速开始](#快速开始)               | [4) 价值函数训练](#4-价值函数训练)                           | [模型 & 数据集](#模型--数据集)               |
+| [1) 安装](#1-安装)                     | [5) 价值推理](#5-价值推理)                                   | [社区渠道](#社区渠道)                        |
+| [2) 硬件配置](#2-硬件配置)             | [6) 策略训练](#6-策略训练)                                   | [隶属机构](#隶属机构)                        |
+| [3) 数据采集](#3-数据采集)             | [7) 闭环部署与下一轮迭代](#7-闭环部署与下一轮迭代)           | [引用](#引用) / [许可证](#许可证)            |
 
-<p align="center"><strong>Value Visual Results</strong></p>
+<p align="center"><strong>价值函数可视化结果</strong></p>
 
-<p align="center"><small><strong>Success Case</strong></small></p>
+<p align="center"><small><strong>成功案例</strong></small></p>
 
 <p align="center">
-  <img alt="Value Overlay Success Episode 0405" src="./website/assets/gifs/value_success.gif" width="96%"/>
+  <img alt="价值叠加 成功 episode 0405" src="./website/assets/gifs/value_success.gif" width="96%"/>
 </p>
 
-<p align="center"><small><strong>Failure Case</strong></small></p>
+<p align="center"><small><strong>失败案例</strong></small></p>
 
 <p align="center">
-  <img alt="Value Overlay Failure Episode 0697" src="./website/assets/gifs/value_failure.gif" width="96%"/>
+  <img alt="价值叠加 失败 episode 0697" src="./website/assets/gifs/value_failure.gif" width="96%"/>
 </p>
 
-<p align="center"><strong>Policy Rollout Visual Results</strong></p>
+<p align="center"><strong>策略部署可视化结果</strong></p>
 
 <p align="center">
-  <img alt="Policy Rollout Result 1" src="./website/assets/gifs/policy_rollout_1.gif" width="48%"/>
-  <img alt="Policy Rollout Result 2" src="./website/assets/gifs/policy_rollout_2.gif" width="48%"/>
+  <img alt="策略部署结果 1" src="./website/assets/gifs/policy_rollout_1.gif" width="48%"/>
+  <img alt="策略部署结果 2" src="./website/assets/gifs/policy_rollout_2.gif" width="48%"/>
 </p>
 
-<p align="center"><strong>Human-in-the-Loop Visual Results</strong></p>
+<p align="center"><strong>人机协同（Human-in-the-Loop）可视化结果</strong></p>
 
 <p align="center">
-  <img alt="Human-in-the-Loop Result 1" src="./website/assets/gifs/hitl_1.gif" width="48%"/>
-  <img alt="Human-in-the-Loop Result 2" src="./website/assets/gifs/hitl_2.gif" width="48%"/>
+  <img alt="人机协同结果 1" src="./website/assets/gifs/hitl_1.gif" width="48%"/>
+  <img alt="人机协同结果 2" src="./website/assets/gifs/hitl_2.gif" width="48%"/>
 </p>
 
-<a id="quick-start"></a>
+<a id="快速开始"></a>
 
-## ⚡ Quick Start
+## ⚡ 快速开始
 
-**LeRobot-aligned foundation:** we use LeRobot as the base of this codebase because its inference and data-collection logic are highly aligned with real-world RL workflows.
+**基于 LeRobot 的基座**：我们使用 LeRobot 作为本代码库的基础，因为它的推理和数据采集逻辑与真机 RL 的工作流程高度契合。
 
-<a id="installation"></a>
+<a id="1-安装"></a>
 
-### 1) Installation
+### 1) 安装
 
 ```bash
 git clone https://github.com/MINT-SJTU/Evo-RL.git
@@ -85,26 +85,26 @@ conda activate evo-rl
 pip install -e .
 ```
 
-For setup details and platform-specific dependencies, follow the official [LeRobot configuration guide](https://huggingface.co/docs/lerobot/installation).
+详细的安装步骤和平台特定依赖，请参考 [LeRobot 官方配置指南](https://huggingface.co/docs/lerobot/installation)。
 
-<a id="hardware-setup"></a>
+<a id="2-硬件配置"></a>
 
-### 2) Hardware Setup
+### 2) 硬件配置
 
-#### SO Series (SO100/SO101)
+#### SO 系列（SO100/SO101）
 
-For SO-series setup, please follow the [official tutorial](https://wiki.seeedstudio.com/cn/lerobot_so100m/) in detail and complete all installation and configuration steps there before continuing.
-The examples below use **SO101** as the reference configuration.
+SO 系列的配置请严格按照 [官方教程](https://wiki.seeedstudio.com/cn/lerobot_so100m/) 完成所有安装和设置步骤后再继续。
+以下示例以 **SO101** 作为参考配置。
 
-#### Device path recommendation
+#### 设备路径建议
 
-Recommended path strategy:
+推荐的路径策略：
 
-- **Robot serial:** use `/dev/serial/by-id/` (stable across reboots).
-- **Cameras:** prefer `/dev/v4l/by-id/`; if IDs are not unique, use `/dev/v4l/by-path/`.
-- In examples below: robot ports use `by-id`, camera paths use `by-path`.
+- **机器人串口**：使用 `/dev/serial/by-id/`（重启后路径稳定）。
+- **相机**：优先使用 `/dev/v4l/by-id/`；如果 ID 不唯一，则使用 `/dev/v4l/by-path/`。
+- 下方示例中：机器人端口使用 `by-id`，相机路径使用 `by-path`。
 
-You can inspect available stable paths with:
+可以用以下命令查看可用的稳定路径：
 
 ```bash
 ls -l /dev/serial/by-id/
@@ -112,7 +112,7 @@ ls -l /dev/v4l/by-id/
 ls -l /dev/v4l/by-path/
 ```
 
-For single-arm users, no major changes are required. After setup, run the command below to verify your system is ready for the next stage:
+**单臂用户**无需做大的改动。配置完成后，运行以下命令验证系统是否就绪：
 
 ```bash
 lerobot-teleoperate \
@@ -124,9 +124,9 @@ lerobot-teleoperate \
   --teleop.id=my_so101_leader
 ```
 
-For dual-arm users, we recommend mirroring the mechanical parts corresponding to servos 4/5/6 on the left leader and left follower arms, which usually provides a more natural bimanual operation feel.
+**双臂用户**，我们建议将左主控臂和左从动臂上对应 4/5/6 号舵机的机械部件做镜像处理，这样通常能获得更自然的双手操作手感。
 
-Before running the dual-arm command, make sure calibration files exist under `~/.cache/huggingface/lerobot/calibration/` like:
+运行双臂命令前，请确保 `~/.cache/huggingface/lerobot/calibration/` 下存在以下校准文件：
 
 ```text
 calibration/
@@ -140,9 +140,9 @@ calibration/
         └── bi_so101_leader_right.json
 ```
 
-This layout is slightly different from single-arm setup.
+该布局与单臂设置略有不同。
 
-Then run this command to verify dual-arm setup:
+然后运行以下命令验证双臂配置：
 
 ```bash
 lerobot-teleoperate \
@@ -156,17 +156,17 @@ lerobot-teleoperate \
   --teleop.id=bi_so101_leader
 ```
 
-#### Camera configuration
+#### 相机配置
 
-Before data collection, validate camera mapping first.
+在采集数据前，先验证相机映射。
 
-Check whether each camera supports your target setting (for example, `640x480 @ 30`):
+检查每个相机是否支持目标参数（例如 `640x480 @ 30`）：
 
 ```bash
 v4l2-ctl -d /dev/v4l/by-path/<CAM_PATH> --list-formats-ext
 ```
 
-Single-arm camera check (example):
+单臂相机检查（示例）：
 
 ```bash
 lerobot-teleoperate \
@@ -180,7 +180,7 @@ lerobot-teleoperate \
   --display_data=true
 ```
 
-Dual-arm camera check (example):
+双臂相机检查（示例）：
 
 ```bash
 lerobot-teleoperate \
@@ -197,31 +197,30 @@ lerobot-teleoperate \
   --display_data=true
 ```
 
-For dual-arm camera mapping, it is fine to attach `front` under either the left-arm or right-arm camera config. If you use more camera views, place them under either the left or right arm camera config as well.
+对于双臂相机映射，`front` 挂在左臂或右臂的相机配置下都可以。如果使用更多视角的相机，同样放在任意一侧臂的相机配置下即可。
 
-If needed, you can also use temporary device paths (for example `/dev/ttyACM*` and `/dev/video*`) during initial debugging.
+如有需要，初始调试时也可以使用临时设备路径（例如 `/dev/ttyACM*` 和 `/dev/video*`）。
 
 <a id="agilex-piper-setup"></a>
 
-#### AgileX (PiPER/PiPER-X)
+#### AgileX（PiPER/PiPER-X）
 
-PiPER arms in master/teaching mode cannot receive external control commands, so all arms must be configured to follower/motion-output mode (0xFC), and firmware must be version 1.8.5 or above.
+PiPER 机械臂在主控/示教模式下无法接收外部控制指令，因此所有机械臂必须配置为从动/运动输出模式（0xFC），固件版本需为 1.8.5 或以上。
 
-For PiPER-series robots, make sure Git LFS assets are pulled before running teleoperation:
+对于 PiPER 系列机器人，在运行遥操作前，请确保已拉取 Git LFS 资产：
 
 ```bash
 git lfs pull --include="src/lerobot/assets/piper_description/**,src/lerobot/assets/piper_x_description/**" --exclude="*"
 git lfs checkout src/lerobot/assets/piper_description src/lerobot/assets/piper_x_description
 ```
 
-For PiPER setup, PiPER uses CAN interfaces instead of serial ports.
-So first run `lerobot-setup-can` to confirm CAN interfaces are available:
+PiPER 使用 CAN 接口而非串口。先运行 `lerobot-setup-can` 确认 CAN 接口可用：
 
 ```bash
 lerobot-setup-can --mode=setup --interfaces=<LEFT_FOLLOWER_CAN_PORT>,<LEFT_LEADER_CAN_PORT>,<RIGHT_FOLLOWER_CAN_PORT>,<RIGHT_LEADER_CAN_PORT>
 ```
 
-For single-arm users, run the command below to verify the system is ready:
+**单臂用户**，运行以下命令验证系统就绪：
 
 ```bash
 lerobot-teleoperate \
@@ -235,7 +234,7 @@ lerobot-teleoperate \
   --teleop.require_calibration=false
 ```
 
-For bimanual users, run this command to verify dual-arm teleoperation:
+**双臂用户**，运行以下命令验证双臂遥操作：
 
 ```bash
 lerobot-teleoperate \
@@ -253,17 +252,17 @@ lerobot-teleoperate \
   --teleop.right_arm_config.require_calibration=false
 ```
 
-For PiPER (non-X), replace `bi_piperx_follower`/`bi_piperx_leader` with `bi_piper_follower`/`bi_piper_leader`.
+如果是 PiPER（非 X 版），将 `bi_piperx_follower`/`bi_piperx_leader` 替换为 `bi_piper_follower`/`bi_piper_leader`。
 
-<a id="data-collection"></a>
+<a id="3-数据采集"></a>
 
-### 3) Data Collection
+### 3) 数据采集
 
-Collect rollout data with `lerobot-human-inloop-record`.
+使用 `lerobot-human-inloop-record` 采集 rollout 数据。
 
-#### SO Series (SO100/SO101)
+#### SO 系列（SO100/SO101）
 
-Bimanual template:
+双臂模板：
 
 ```bash
 lerobot-human-inloop-record \
@@ -286,11 +285,11 @@ lerobot-human-inloop-record \
   --display_data=true
 ```
 
-Recommendation: use **`fourcc: "MJPG"`** for OpenCV and **`warmup_s`** for RealSense. In this example `front` uses RealSense, but you can switch it to OpenCV with the same structure.
+建议：OpenCV 相机使用 **`fourcc: "MJPG"`**，RealSense 相机使用 **`warmup_s`**。本例中 `front` 用的是 RealSense，你也可以用同样的结构换成 OpenCV。
 
-#### AgileX (PiPER/PiPER-X)
+#### AgileX（PiPER/PiPER-X）
 
-Bimanual template (left/right, PiPER-X example):
+双臂模板（左/右，以 PiPER-X 为例）：
 
 ```bash
 lerobot-human-inloop-record \
@@ -315,30 +314,30 @@ lerobot-human-inloop-record \
   --display_data=true
 ```
 
-Hotkeys:
+快捷键：
 
-- `i`: toggle intervention mode (policy <-> teleop takeover)
-- `s`: mark success and end current episode
-- `f`: mark failure and end current episode
-- `Right Arrow`: end the current loop early
-- `Left Arrow`: end early and re-record the current episode
-- `Esc`: stop the recording session
+- `i`：切换介入模式（策略 ↔ 遥操作接管）
+- `s`：标记成功并结束当前 episode
+- `f`：标记失败并结束当前 episode
+- `右箭头`：提前结束当前循环
+- `左箭头`：提前结束并重新录制当前 episode
+- `Esc`：停止录制会话
 
-Quick quality check:
+快速质量检查：
 
 ```bash
 lerobot-dataset-report --dataset <HF_USERNAME_OR_ORG>/<DATASET_NAME>
 ```
 
-This prints: dataset meta, totals, episode-length stats/histogram, success/intervention metrics, task list, and full feature schema.
+会输出：数据集元信息、总量统计、episode 长度统计/直方图、成功/介入指标、任务列表以及完整的特征 schema。
 
-<a id="value-function-training"></a>
+<a id="4-价值函数训练"></a>
 
-### 4) Value Function Training
+### 4) 价值函数训练
 
-Train the value function on the current dataset. Current default: [Pi\*0.6](https://www.pi.website/blog/pistar06) (`--value.type=pistar06`).
+在当前数据集上训练价值函数。当前默认：[Pi\*0.6](https://www.pi.website/blog/pistar06)（`--value.type=pistar06`）。
 
-Single-GPU template:
+**单 GPU 模板：**
 
 ```bash
 lerobot-value-train \
@@ -353,7 +352,7 @@ lerobot-value-train \
   --wandb.enable=true
 ```
 
-Multi-GPU template:
+**多 GPU 模板：**
 
 ```bash
 CUDA_VISIBLE_DEVICES=<GPU_ID_LIST> accelerate launch \
@@ -365,24 +364,24 @@ CUDA_VISIBLE_DEVICES=<GPU_ID_LIST> accelerate launch \
   <VALUE_TRAIN_ARGS>
 ```
 
-To plug in a different value function, minimal path in this repo:
+**接入自定义价值函数的最小步骤：**
 
-- Add `src/lerobot/values/<your_value>/configuration_<your_value>.py` with `@PreTrainedConfig.register_subclass("<your_value>")`.
-- Add `src/lerobot/values/<your_value>/modeling_<your_value>.py` with `<YourValue>Policy(PreTrainedPolicy)` (implement at least `forward`, `predict_value`, and `build_training_raw_batch_hook` for `lerobot-value-train`).
-- Add `src/lerobot/values/<your_value>/processor_<your_value>.py` with `make_<your_value>_pre_post_processors(...)`.
-- Remove/replace the current `pistar06`-only type checks in `src/lerobot/configs/value_train.py` and `src/lerobot/scripts/lerobot_value_infer.py`.
+- 在 `src/lerobot/values/<your_value>/configuration_<your_value>.py` 中添加 `@PreTrainedConfig.register_subclass("<your_value>")`。
+- 在 `src/lerobot/values/<your_value>/modeling_<your_value>.py` 中添加 `<YourValue>Policy(PreTrainedPolicy)`（至少实现 `forward`、`predict_value` 和供 `lerobot-value-train` 使用的 `build_training_raw_batch_hook`）。
+- 在 `src/lerobot/values/<your_value>/processor_<your_value>.py` 中添加 `make_<your_value>_pre_post_processors(...)`。
+- 在 `src/lerobot/configs/value_train.py` 和 `src/lerobot/scripts/lerobot_value_infer.py` 中移除/替换当前仅限 `pistar06` 的类型检查。
 
-<a id="value-inference"></a>
+<a id="5-价值推理"></a>
 
-### 5) Value Inference
+### 5) 价值推理
 
-Infer value signals and write value/advantage/indicator back to the dataset:
+推理价值信号并将 value/advantage/indicator 写回数据集：
 
-- `value`: estimated return-to-go of the current frame.
-- `advantage`: relative improvement signal (higher means better-than-baseline trajectory quality).
-- `indicator`: binarized training tag derived from advantage.
+- `value`：当前帧的估计 return-to-go（未来累计回报）。
+- `advantage`：相对改进信号（值越高表示轨迹质量优于基线）。
+- `indicator`：由 advantage 二值化得到的训练标签。
 
-Single-GPU template:
+**单 GPU 模板：**
 
 ```bash
 lerobot-value-infer \
@@ -400,7 +399,7 @@ lerobot-value-infer \
   --job_name=<RUN_NAME>.infer
 ```
 
-Multi-GPU template:
+**多 GPU 模板：**
 
 ```bash
 CUDA_VISIBLE_DEVICES=<GPU_ID_LIST> accelerate launch \
@@ -411,14 +410,14 @@ CUDA_VISIBLE_DEVICES=<GPU_ID_LIST> accelerate launch \
   <VALUE_INFER_ARGS>
 ```
 
-Parameter notes:
+参数说明：
 
 ```bash
---acp.n_step: n-step advantage horizon.
---acp.positive_ratio: positive label ratio after advantage binarization (e.g., 0.3 = top 30% per task).
+--acp.n_step：n-step advantage 的时间跨度。
+--acp.positive_ratio：advantage 二值化后正样本的比例（例如 0.3 = 每个任务取前 30%）。
 ```
 
-Expected new columns:
+预期新增列：
 
 ```bash
 complementary_info.value_<TAG>
@@ -426,16 +425,16 @@ complementary_info.advantage_<TAG>
 complementary_info.acp_indicator_<TAG>
 ```
 
-These columns are written back to the original dataset specified by `--dataset.repo_id`.
+这些列会写回到 `--dataset.repo_id` 指定的原始数据集中。
 
-<a id="policy-training"></a>
+<a id="6-策略训练"></a>
 
-### 6) Policy Training
+### 6) 策略训练
 
-Train the policy with advantage-conditioned tags.
-**Policy requirement:** it must support **text/task input**, because Advantage-Conditioned tags are injected into **task text**.
+使用 advantage 条件标签训练策略。
+**策略要求**：必须支持**文本/任务输入**，因为 Advantage-Conditioned 标签会注入到**任务文本**中。
 
-Single-GPU template:
+**单 GPU 模板：**
 
 ```bash
 lerobot-train \
@@ -456,13 +455,13 @@ lerobot-train \
   --policy.repo_id=<HF_USERNAME_OR_ORG>/<POLICY_REPO>
 ```
 
-`--acp.indicator_dropout_prob` controls tag drop rate in task text; `0.3` helps learn both tagged and untagged conditions.
+`--acp.indicator_dropout_prob` 控制任务文本中标签的丢弃率；`0.3` 有助于同时学习带标签和不带标签的条件。
 
-Important checks:
+**重要检查**：
 
-- `--acp.indicator_field` must exist in the dataset and be **binary (`0/1`)**.
+- `--acp.indicator_field` 必须存在于数据集中，且为**二值（`0/1`）**。
 
-Multi-GPU template:
+**多 GPU 模板：**
 
 ```bash
 CUDA_VISIBLE_DEVICES=<GPU_ID_LIST> accelerate launch \
@@ -474,11 +473,11 @@ CUDA_VISIBLE_DEVICES=<GPU_ID_LIST> accelerate launch \
   <POLICY_TRAIN_ARGS>
 ```
 
-<a id="closed-loop-rollout-and-next-round"></a>
+<a id="7-闭环部署与下一轮迭代"></a>
 
-### 7) Closed-loop Rollout and Next Round
+### 7) 闭环部署与下一轮迭代
 
-Deploy the trained policy in human-in-loop mode and collect the next dataset round:
+在人机协同模式下部署训练好的策略，采集下一轮数据集：
 
 ```bash
 lerobot-human-inloop-record \
@@ -503,10 +502,10 @@ lerobot-human-inloop-record \
   --resume=true
 ```
 
-Dataset continuation options:
+数据集续写选项：
 
-- **Append in place:** keep `--resume=true` and continue recording into the same dataset.
-- **Merge multiple rounds:** use the official dataset editor to merge separate datasets.
+- **原地追加**：保持 `--resume=true`，继续往同一个数据集录制。
+- **合并多轮**：使用官方数据集编辑器合并不同数据集。
 
 ```bash
 lerobot-edit-dataset \
@@ -515,69 +514,69 @@ lerobot-edit-dataset \
   --operation.repo_ids="['<HF_USERNAME_OR_ORG>/<DATASET_ROUND_1>','<HF_USERNAME_OR_ORG>/<DATASET_ROUND_2>']"
 ```
 
-Additional data attributes vs default `lerobot-record` behavior:
+相比默认 `lerobot-record` 行为，额外记录的数据属性：
 
-- `complementary_info.policy_action`: policy output action at each step.
-- `complementary_info.is_intervention`: whether current step is in intervention.
-- `complementary_info.state`: intervention state-machine state.
-- `complementary_info.collector_policy_id`: step-level action source ID (`human` or policy ID).
-- Episode metadata `episode_success`: success/failure label saved per episode.
+- `complementary_info.policy_action`：每一步策略输出的动作。
+- `complementary_info.is_intervention`：当前步是否处于人工介入。
+- `complementary_info.state`：介入状态机的状态。
+- `complementary_info.collector_policy_id`：逐步动作来源 ID（`human` 或策略 ID）。
+- Episode 元数据 `episode_success`：按 episode 保存的成功/失败标签。
 
-Iterative training loop (abstract):
+迭代训练循环（抽象表示）：
 
 ```text
-[Multi-task demonstration data pool]
+[多任务示教数据池]
         |
         v
-[Offline RL pretraining for a vision-language-action policy]
+[针对视觉-语言-动作策略的离线 RL 预训练]
         |
         v
-[Task-specific initialization / fine-tuning from demonstrations]
+[基于示教的任务特定初始化 / 微调]
         |
         v
-|---- Iteration k = 1..K -------------------------------------|
-| 1) Deploy current policy π_k and collect new rollout data   |
-| 2) Merge into data pool: D <- D U new_data                  |
-| 3) Train value function on D                                |
-| 4) Infer advantage and binarize into indicator tags         |
-| 5) Train advantage-conditioned policy to get π_{k+1}        |
-|-------------------------------------------------------------|
+|---- 迭代 k = 1..K -------------------------------------------|
+| 1) 部署当前策略 π_k 并采集新的 rollout 数据                  |
+| 2) 合并到数据池：D <- D ∪ new_data                           |
+| 3) 在 D 上训练价值函数                                       |
+| 4) 推理 advantage 并二值化为 indicator 标签                  |
+| 5) 训练 advantage 条件策略，得到 π_{k+1}                     |
+|--------------------------------------------------------------|
         |
         v
-[Stronger policy with improved success rate and throughput]
+[更强的策略，成功率与吞吐量均提升]
 ```
 
-## Model & Dataset
+## 模型 & 数据集
 
-- Hugging Face model release: coming soon
-- Hugging Face dataset release: coming soon
-- Once published, this section will pin canonical repos and exact version tags.
+- Hugging Face 模型发布：即将上线
+- Hugging Face 数据集发布：即将上线
+- 发布后，本节将固定标准仓库和确切版本标签。
 
-## Community Channels
+## 社区渠道
 
-- WeChat official post: [Coming Soon](https://evorl.example.com/wechat-post)
-- Documentation: [`docs/README.md`](./docs/README.md)
-- GitHub Issues: [Create an issue](https://github.com/MINT-SJTU/Evo-RL/issues)
-- Email: business@evomind-tech.com
-- WeChat group QR code:
+- 微信公众号文章：[即将上线](https://evorl.example.com/wechat-post)
+- 文档：[`docs/README.md`](./docs/README.md)
+- GitHub Issues：[提交 issue](https://github.com/MINT-SJTU/Evo-RL/issues)
+- 邮箱：business@evomind-tech.com
+- 微信群二维码：
 
 <p align="center">
-  <img alt="EvoMind WeChat QR" src="./website/assets/images/rlgroup.jpg" width="220"/>
+  <img alt="EvoMind 微信二维码" src="./website/assets/images/rlgroup.jpg" width="220"/>
 </p>
 
-- So101 Supplier WeChat Contact, So101 设备提供商:
+- SO101 设备提供商微信联系方式：
 <p align="center">
-  <img alt="So101 Supplier" src="./website/assets/images/so101provider.jpg" width="220"/>
+  <img alt="SO101 设备提供商" src="./website/assets/images/so101provider.jpg" width="220"/>
 </p>
 
-## Affiliations
+## 隶属机构
 
 <p align="center">
-  <img alt="SJTU community visual" src="./website/assets/images/sjtu.png" height="68"/>
+  <img alt="上海交通大学社区" src="./website/assets/images/sjtu.png" height="68"/>
   <img alt="EvoMind" src="./website/assets/images/evomind1.png" height="60"/>
 </p>
 
-## Citation
+## 引用
 
 ```bibtex
 @misc{evorl2026,
@@ -588,10 +587,10 @@ Iterative training loop (abstract):
 }
 ```
 
-## License
+## 许可证
 
-Apache-2.0. See [LICENSE](./LICENSE).
+Apache-2.0。详见 [LICENSE](./LICENSE)。
 
-## Star History
+## Star 历史
 
-[![Star History Chart](https://api.star-history.com/image?repos=MINT-SJTU/Evo-RL&type=date&legend=top-left)](https://www.star-history.com/?repos=MINT-SJTU%2FEvo-RL&type=date&legend=top-left)
+[![Star 历史图表](https://api.star-history.com/image?repos=MINT-SJTU/Evo-RL&type=date&legend=top-left)](https://www.star-history.com/?repos=MINT-SJTU%2FEvo-RL&type=date&legend=top-left)

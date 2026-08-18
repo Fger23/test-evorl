@@ -42,18 +42,19 @@ CUDA_VISIBLE_DEVICES=3 lerobot-value-train \
 
 
 # 扎钞
-CUDA_VISIBLE_DEVICES=3 lerobot-value-train \
-  --dataset.repo_id=banknote_binding_iteration_1 \
-  --dataset.root=/nfs/lerobot/s101/datasets/aggregation/evo-rl/banknote_binding_iteration_1/ \
-  --steps=50000 \
-  --save_freq=25000 \
+CUDA_VISIBLE_DEVICES=5 lerobot-value-train \
+  --dataset.repo_id=banknote_binding_0805_06 \
+  --dataset.root=/nfs/lerobot/s101/datasets/aggregation/evo-rl/banknote_binding_0805_06/ \
+  --steps=60000 \
+  --save_freq=30000 \
   --value.type=pistar06 \
   --value.push_to_hub=false \
   --value.repo_id=so101/banknote_binding_pistar06 \
   --batch_size=16 \
-  --output_dir=/nfs/lerobot/s101/models/evo/so101/value_train/banknote_binding_pistar06_iteration_1 \
+  --output_dir=/nfs/lerobot/s101/models/evo/so101/value_train/banknote_binding_0805_06 \
   --job_name=so101/banknote_binding_pistar06 \
-  --wandb.enable=false
+  --wandb.enable=true \
+  --wandb.mode=offline
 
 
 
@@ -93,9 +94,9 @@ CUDA_VISIBLE_DEVICES=3 lerobot-value-infer \
 
 # 扎钞
 CUDA_VISIBLE_DEVICES=5 lerobot-value-infer \
-  --dataset.repo_id=banknote_binding_iteration_1 \
-  --dataset.root=/nfs/lerobot/s101/datasets/aggregation/evo-rl/banknote_binding_iteration_1/ \
-  --inference.checkpoint_path=/nfs/lerobot/s101/models/evo/so101/value_train/banknote_binding_pistar06_iteration_1/checkpoints/last/pretrained_model/ \
+  --dataset.repo_id=banknote_binding_0805_06 \
+  --dataset.root=/nfs/lerobot/s101/datasets/aggregation/evo-rl/banknote_binding_0805_06/ \
+  --inference.checkpoint_path=/nfs/lerobot/s101/models/evo/so101/value_train/banknote_binding_0805_06/checkpoints/last/pretrained_model/ \
   --runtime.device=cuda \
   --runtime.batch_size=32 \
   --acp.enable=true \
@@ -104,8 +105,8 @@ CUDA_VISIBLE_DEVICES=5 lerobot-value-infer \
   --acp.value_field=complementary_info.value \
   --acp.advantage_field=complementary_info.advantage \
   --acp.indicator_field=complementary_info.acp_indicator \
-  --output_dir=/nfs/lerobot/s101/models/evo/so101/value_infer/banknote_binding_iteration_1_pistar06 \
-  --job_name=banknote_binding_iteration_1_pistar06.infer
+  --output_dir=/nfs/lerobot/s101/models/evo/so101/value_infer/banknote_binding_0805_06 \
+  --job_name=banknote_binding_0805_06.infer
 
 从数据集当中的info.json可以看见：
 complementary_info.value，complementary_info.advantage，complementary_info.acp_indicator 
@@ -156,25 +157,25 @@ CUDA_VISIBLE_DEVICES=3 lerobot-train \
   --policy.push_to_hub=false
 
 # 扎钞
-CUDA_VISIBLE_DEVICES=7 lerobot-train \
-  --dataset.repo_id=banknote_binding_iteration_1 \
-  --dataset.root=/nfs/lerobot/s101/datasets/aggregation/evo-rl/banknote_binding_iteration_1/ \
+CUDA_VISIBLE_DEVICES=5 lerobot-train \
+  --dataset.repo_id=banknote_binding_0805_06 \
+  --dataset.root=/nfs/lerobot/s101/datasets/aggregation/evo-rl/banknote_binding_0805_06/ \
   --policy.type=pi05 \
   --policy.pretrained_path=/nfs/zxlong10/models/lerobot/pi05_base/ \
   --policy.freeze_vision_encoder=false \
   --policy.train_expert_only=false \
   --policy.device=cuda \
   --batch_size=8 \
-  --steps=160000 \
-  --save_freq=40000 \
+  --steps=100000 \
+  --save_freq=50000 \
   --num_workers=4 \
   --acp.enable=true \
   --acp.indicator_field=complementary_info.acp_indicator \
   --acp.indicator_dropout_prob=0.3 \
-  --output_dir=/nfs/lerobot/s101/models/evo/so101/policy/banknote_binding_iteration_1_pi05 \
+  --output_dir=/nfs/lerobot/s101/models/evo/so101/policy/banknote_binding_0805_06_pi05 \
   --job_name=banknote_binding_pi05 \
-  --wandb.enable=false \
-  --policy.push_to_hub=false
+  --policy.push_to_hub=false \
+  --wandb.enable=false
 
 finetune
 CUDA_VISIBLE_DEVICES=5 lerobot-train \

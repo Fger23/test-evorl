@@ -32,8 +32,12 @@ from lerobot.scripts.lerobot_human_inloop_record import (
     _slow_reset_all_arms_to_pose,
     human_inloop_record,
 )
-from lerobot.scripts.lerobot_patch_hil_dataset_schema import PatchHilDatasetSchemaConfig, patch_hil_dataset_schema
+from lerobot.scripts.lerobot_patch_hil_dataset_schema import (
+    PatchHilDatasetSchemaConfig,
+    patch_hil_dataset_schema,
+)
 from lerobot.scripts.lerobot_record import (
+    ACPBatchedCFGRuntime,
     ACPInferenceConfig,
     DatasetRecordConfig,
     PolicySyncDualArmExecutor,
@@ -242,7 +246,10 @@ def test_patch_hil_dataset_schema_restores_legacy_dataset_mergeability(tmp_path)
         output_repo_id="dummy/repo_merged",
         output_dir=merged_root,
     )
-    assert merged_dataset.meta.total_episodes == current_dataset.meta.total_episodes + patched_dataset.meta.total_episodes
+    assert (
+        merged_dataset.meta.total_episodes
+        == current_dataset.meta.total_episodes + patched_dataset.meta.total_episodes
+    )
 
 
 def test_record_loop_sets_leader_manual_control_during_reset():
@@ -505,6 +512,67 @@ def test_record_config_rejects_negative_cfg_beta():
         )
 
 
+@pytest.mark.parametrize("cfg_beta", [float("nan"), float("inf"), float("-inf")])
+def test_record_config_rejects_non_finite_cfg_beta(cfg_beta):
+    dataset_cfg = DatasetRecordConfig(
+        repo_id=DUMMY_REPO_ID,
+        single_task="Dummy task",
+        num_episodes=1,
+        episode_time_s=0.1,
+        reset_time_s=0,
+        push_to_hub=False,
+    )
+
+    with pytest.raises(ValueError, match="cfg_beta"):
+        RecordConfig(
+            robot=MockRobotConfig(),
+            dataset=dataset_cfg,
+            teleop=MockTeleopConfig(),
+            play_sounds=False,
+            acp_inference=ACPInferenceConfig(enable=True, cfg_beta=cfg_beta),
+        )
+
+
+def test_record_config_rejects_batched_cfg_without_cfg():
+    dataset_cfg = DatasetRecordConfig(
+        repo_id=DUMMY_REPO_ID,
+        single_task="Dummy task",
+        num_episodes=1,
+        episode_time_s=0.1,
+        reset_time_s=0,
+        push_to_hub=False,
+    )
+
+    with pytest.raises(ValueError, match="batched_cfg=true"):
+        RecordConfig(
+            robot=MockRobotConfig(),
+            dataset=dataset_cfg,
+            teleop=MockTeleopConfig(),
+            play_sounds=False,
+            acp_inference=ACPInferenceConfig(enable=True, use_cfg=False, batched_cfg=True),
+        )
+
+
+def test_record_config_rejects_profile_without_batched_cfg():
+    dataset_cfg = DatasetRecordConfig(
+        repo_id=DUMMY_REPO_ID,
+        single_task="Dummy task",
+        num_episodes=1,
+        episode_time_s=0.1,
+        reset_time_s=0,
+        push_to_hub=False,
+    )
+
+    with pytest.raises(ValueError, match="profile=true"):
+        RecordConfig(
+            robot=MockRobotConfig(),
+            dataset=dataset_cfg,
+            teleop=MockTeleopConfig(),
+            play_sounds=False,
+            acp_inference=ACPInferenceConfig(enable=True, use_cfg=True, profile=True),
+        )
+
+
 def test_acp_inference_without_cfg_appends_positive_prompt():
     class _StaticPolicy:
         def __init__(self, value: float):
@@ -621,3 +689,147 @@ def test_acp_inference_with_cfg_uses_isolated_branch_queues():
 
     assert torch.allclose(action_1, torch.tensor([[6.0, 6.0, 6.0]], dtype=torch.float32))
     assert torch.allclose(action_2, torch.tensor([[7.0, 7.0, 7.0]], dtype=torch.float32))
+
+
+def test_batched_cfg_uses_shared_noise_raw_blending_and_chunk_cache():
+    class _Config:
+        chunk_size = 3
+        max_action_dim = 3
+        n_action_steps = 2
+        rtc_config = None
+
+    class _Model:
+        @staticmethod
+        def sample_noise(shape, device):
+            return torch.arange(np.prod(shape), dtype=torch.float32, device=device).reshape(shape)
+
+    class _BatchedPolicy:
+        def __init__(self):
+            self.config = _Config()
+            self.model = _Model()
+            self.calls = []
+
+        def predict_action_chunk(self, batch, noise=None):
+            self.calls.append((batch, noise.detach().clone()))
+            uncond = torch.tensor([[[1.0, 2.0, 3.0], [4.0, 5.0, 6.0], [7.0, 8.0, 9.0]]])
+            cond = uncond + 2.0
+            return torch.cat((uncond, cond), dim=0)
+
+    class _Postprocessor:
+        def __init__(self):
+            self.calls = 0
+
+        def __call__(self, action):
+            self.calls += 1
+            return action * 10.0
+
+    class _Profiler:
+        def __init__(self):
+            self.records = []
+
+        def record(self, metrics, chunks=None):
+            self.records.append((metrics, chunks))
+
+    policy = _BatchedPolicy()
+    postprocessor = _Postprocessor()
+    profiler = _Profiler()
+    config = ACPInferenceConfig(
+        enable=True,
+        use_cfg=True,
+        cfg_beta=0.5,
+        batched_cfg=True,
+    )
+    runtime = ACPBatchedCFGRuntime(config=config, fps=30, profiler=profiler)
+    observation_frame = {"observation.state": np.array([0.0, 0.5, 1.0], dtype=np.float32)}
+
+    first = _predict_policy_action_with_acp_inference(
+        observation_frame=observation_frame,
+        policy=policy,
+        device=torch.device("cpu"),
+        preprocessor=lambda batch: batch,
+        postprocessor=postprocessor,
+        use_amp=False,
+        task="Pick and place",
+        robot_type="mock_robot",
+        acp_inference=config,
+        batched_cfg_runtime=runtime,
+    )
+    second = _predict_policy_action_with_acp_inference(
+        observation_frame=observation_frame,
+        policy=policy,
+        device=torch.device("cpu"),
+        preprocessor=lambda batch: batch,
+        postprocessor=postprocessor,
+        use_amp=False,
+        task="Pick and place",
+        robot_type="mock_robot",
+        acp_inference=config,
+        batched_cfg_runtime=runtime,
+    )
+
+    assert torch.equal(first, torch.tensor([[20.0, 30.0, 40.0]]))
+    assert torch.equal(second, torch.tensor([[50.0, 60.0, 70.0]]))
+    assert len(policy.calls) == 1
+    assert postprocessor.calls == 1
+    assert runtime.queue_size == 0
+
+    batch, noise = policy.calls[0]
+    assert batch["observation.state"].shape == (2, 3)
+    assert batch["task"] == ["Pick and place", "Pick and place\nAdvantage: positive"]
+    assert batch["robot_type"] == ["mock_robot", "mock_robot"]
+    assert noise.shape == (2, 3, 3)
+    assert torch.equal(noise[0], noise[1])
+
+    metrics, chunks = profiler.records[0]
+    assert metrics["shared_noise_max_abs_diff"] == 0.0
+    assert metrics["execution_steps"] == 2
+    assert metrics["warmup"] is True
+    expected_cfg = torch.tensor([[[2.0, 3.0, 4.0], [5.0, 6.0, 7.0], [8.0, 9.0, 10.0]]])
+    assert torch.equal(chunks["cfg_raw"], expected_cfg)
+    assert torch.equal(chunks["cfg_processed"], expected_cfg * 10.0)
+
+
+def test_batched_cfg_runtime_reset_discards_cached_actions():
+    class _Config:
+        chunk_size = 2
+        max_action_dim = 1
+        n_action_steps = 2
+        rtc_config = None
+
+    class _Model:
+        @staticmethod
+        def sample_noise(shape, device):
+            return torch.zeros(shape, device=device)
+
+    class _Policy:
+        def __init__(self):
+            self.config = _Config()
+            self.model = _Model()
+            self.calls = 0
+
+        def predict_action_chunk(self, batch, noise=None):
+            self.calls += 1
+            uncond = torch.full((1, 2, 1), float(self.calls))
+            return torch.cat((uncond, uncond), dim=0)
+
+    config = ACPInferenceConfig(enable=True, use_cfg=True, batched_cfg=True)
+    runtime = ACPBatchedCFGRuntime(config=config, fps=30)
+    policy = _Policy()
+    kwargs = {
+        "observation_frame": {"observation.state": np.array([0.0], dtype=np.float32)},
+        "policy": policy,
+        "device": torch.device("cpu"),
+        "preprocessor": lambda batch: batch,
+        "postprocessor": lambda action: action,
+        "use_amp": False,
+        "task": "task",
+        "robot_type": "robot",
+        "acp_inference": config,
+        "batched_cfg_runtime": runtime,
+    }
+
+    assert torch.equal(_predict_policy_action_with_acp_inference(**kwargs), torch.tensor([[1.0]]))
+    assert runtime.queue_size == 1
+    runtime.reset()
+    assert torch.equal(_predict_policy_action_with_acp_inference(**kwargs), torch.tensor([[2.0]]))
+    assert policy.calls == 2

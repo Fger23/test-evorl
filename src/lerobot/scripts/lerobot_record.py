@@ -63,6 +63,7 @@ lerobot-record \
 """
 
 import logging
+import math
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from pprint import pformat
@@ -100,6 +101,7 @@ from lerobot.robots import (  # noqa: F401
     unitree_g1 as unitree_g1_robot,
 )
 from lerobot.scripts.recording_hil import (
+    ACPBatchedCFGRuntime,
     ACPInferenceConfig,
     PolicySyncDualArmExecutor,
     _capture_policy_runtime_state,  # noqa: F401
@@ -288,10 +290,30 @@ class RecordConfig:
             raise ValueError("`collector_policy_id_human` must be a non-empty string.")
         if self.acp_inference.use_cfg and not self.acp_inference.enable:
             raise ValueError("`acp_inference.use_cfg=true` requires `acp_inference.enable=true`.")
+        if self.acp_inference.batched_cfg and not self.acp_inference.use_cfg:
+            raise ValueError("`acp_inference.batched_cfg=true` requires `acp_inference.use_cfg=true`.")
+        if self.acp_inference.profile and not self.acp_inference.batched_cfg:
+            raise ValueError("`acp_inference.profile=true` requires `acp_inference.batched_cfg=true`.")
         if self.acp_inference.enable and self.remote_policy.enable:
             raise ValueError("`acp_inference` is only supported for local `policy`, not `remote_policy`.")
-        if self.acp_inference.cfg_beta < 0:
-            raise ValueError("`acp_inference.cfg_beta` must be >= 0.")
+        if self.acp_inference.batched_cfg and self.policy is not None and self.policy.type != "pi05":
+            raise ValueError("`acp_inference.batched_cfg` is currently supported only for Pi0.5 policies.")
+        if (
+            self.acp_inference.batched_cfg
+            and self.policy is not None
+            and getattr(self.policy, "rtc_config", None) is not None
+        ):
+            raise ValueError("Disable `policy.rtc_config` while collecting the batched CFG no-RTC baseline.")
+        if not math.isfinite(self.acp_inference.cfg_beta) or self.acp_inference.cfg_beta < 0:
+            raise ValueError("`acp_inference.cfg_beta` must be finite and >= 0.")
+        if self.acp_inference.profile and not self.acp_inference.profile_output_dir.strip():
+            raise ValueError("`acp_inference.profile_output_dir` must be non-empty.")
+        if (
+            not isinstance(self.acp_inference.profile_warmup_chunks, int)
+            or isinstance(self.acp_inference.profile_warmup_chunks, bool)
+            or self.acp_inference.profile_warmup_chunks < 0
+        ):
+            raise ValueError("`acp_inference.profile_warmup_chunks` must be a non-negative integer.")
         if self.communication_retry_timeout_s < 0:
             raise ValueError("`communication_retry_timeout_s` must be >= 0.")
         if self.communication_retry_interval_s <= 0:
@@ -376,6 +398,7 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
     listener = None
     policy_sync_executor = None
     remote_policy_client = None
+    batched_cfg_runtime = None
 
     try:
         cfg.remote_policy.rename_map = cfg.dataset.rename_map
@@ -424,6 +447,21 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                     "device_processor": {"device": cfg.policy.device},
                     "rename_observations_processor": {"rename_map": cfg.dataset.rename_map},
                 },
+            )
+        if cfg.acp_inference.batched_cfg:
+            batched_cfg_runtime = ACPBatchedCFGRuntime(
+                config=cfg.acp_inference,
+                fps=cfg.dataset.fps,
+            )
+            logging.info(
+                "Batched Pi0.5 CFG enabled (beta=%.3f, profiling=%s, output=%s).",
+                cfg.acp_inference.cfg_beta,
+                cfg.acp_inference.profile,
+                (
+                    batched_cfg_runtime.profiler.output_dir
+                    if batched_cfg_runtime.profiler is not None
+                    else "disabled"
+                ),
             )
         if cfg.remote_policy.enable:
             remote_policy_client = RemotePolicyActionClient(
@@ -498,6 +536,7 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                     collector_policy_id_policy=collector_policy_id_policy,
                     collector_policy_id_human=collector_policy_id_human,
                     acp_inference=cfg.acp_inference,
+                    batched_cfg_runtime=batched_cfg_runtime,
                     communication_retry_timeout_s=cfg.communication_retry_timeout_s,
                     communication_retry_interval_s=cfg.communication_retry_interval_s,
                 )

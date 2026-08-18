@@ -170,6 +170,7 @@ class RTCProcessor:
 
         x_t = x_t.clone().detach()
 
+##维度相关
         squeezed = False
         if len(x_t.shape) < 3:
             # Add batch dimension
@@ -179,10 +180,9 @@ class RTCProcessor:
         if len(prev_chunk_left_over.shape) < 3:
             # Add batch dimension
             prev_chunk_left_over = prev_chunk_left_over.unsqueeze(0)
-
+##
         if execution_horizon is None:
             execution_horizon = self.rtc_config.execution_horizon
-
         # If the previous action chunk is to short then it doesn't make sense to use long execution horizon
         # because there is nothing to merge
         if execution_horizon > prev_chunk_left_over.shape[1]:
