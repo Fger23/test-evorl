@@ -33,12 +33,16 @@ python src/lerobot/async_inference/robot_client.py \
 ```
 """
 
+import json
 import logging
+import math
+import os
 import pickle  # nosec
 import threading
 import time
 from collections.abc import Callable
 from dataclasses import asdict
+from datetime import datetime, timezone
 from pprint import pformat
 from queue import Queue
 from typing import Any
@@ -80,6 +84,102 @@ from .helpers import (
     map_robot_keys_to_lerobot_features,
     visualize_action_queue_size,
 )
+
+
+def _utc_string() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+def _percentile(values: list[float], quantile: float) -> float | None:
+    """Linearly interpolated percentile without requiring NumPy."""
+    if not values:
+        return None
+    ordered = sorted(values)
+    position = (len(ordered) - 1) * quantile
+    lower = math.floor(position)
+    upper = math.ceil(position)
+    if lower == upper:
+        return float(ordered[lower])
+    fraction = position - lower
+    return float(ordered[lower] + (ordered[upper] - ordered[lower]) * fraction)
+
+
+def _latency_stats(values: list[float]) -> dict[str, float | None]:
+    return {
+        "p50": _percentile(values, 0.50),
+        "p95": _percentile(values, 0.95),
+        "p99": _percentile(values, 0.99),
+        "max": float(max(values)) if values else None,
+        "mean": float(sum(values) / len(values)) if values else None,
+    }
+
+
+def save_client_metrics(
+    output_root: str,
+    run_name: str | None,
+    records: list[dict[str, Any]],
+    action_queue_size: list[int],
+    fps: float,
+    metadata: dict[str, Any] | None = None,
+) -> str:
+    """Persist client-side metrics (e2e latency, steps consumed, queue size) to disk.
+
+    Writes ``{output_root}/{run_name}/records.jsonl`` (one line per received
+    action chunk) and ``summary.json`` (aggregated statistics), mirroring the
+    layout of the server-side ACP profiler output.
+
+    Returns the run directory path.
+    """
+    if run_name is None:
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
+        run_name = f"{timestamp}_{os.getpid()}"
+    elif not run_name or run_name in {".", ".."} or "/" in run_name or "\\" in run_name:
+        raise ValueError("metrics_run_name must be a non-empty directory name, not a path")
+
+    output_dir = os.path.join(output_root, run_name)
+    os.makedirs(output_dir, exist_ok=True)
+
+    records_path = os.path.join(output_dir, "records.jsonl")
+    with open(records_path, "w", encoding="utf-8", newline="\n") as stream:
+        for record in records:
+            stream.write(json.dumps(record, ensure_ascii=False, allow_nan=False))
+            stream.write("\n")
+
+    e2e_values = [r["e2e_latency_ms"] for r in records if r.get("e2e_latency_ms") is not None]
+    steps_values = [
+        r["steps_consumed_during_inference"]
+        for r in records
+        if r.get("steps_consumed_during_inference") is not None
+    ]
+    queue_stats = {
+        "count": len(action_queue_size),
+        "min": int(min(action_queue_size)) if action_queue_size else None,
+        "max": int(max(action_queue_size)) if action_queue_size else None,
+        "mean": float(sum(action_queue_size) / len(action_queue_size)) if action_queue_size else None,
+    }
+    summary = {
+        "run_name": run_name,
+        "created_at_utc": _utc_string(),
+        "fps": fps,
+        "num_chunks": len(records),
+        "e2e_latency_ms": _latency_stats(e2e_values),
+        "steps_consumed_during_inference": {
+            **_latency_stats([float(v) for v in steps_values]),
+            "total": int(sum(steps_values)) if steps_values else 0,
+        },
+        "action_queue_size": queue_stats,
+        "action_queue_size_series": action_queue_size,
+        **(metadata or {}),
+    }
+    summary_path = os.path.join(output_dir, "summary.json")
+    with open(summary_path, "w", encoding="utf-8", newline="\n") as stream:
+        json.dump(summary, stream, indent=2, ensure_ascii=False, allow_nan=False)
+        stream.write("\n")
+
+    # `math` imported for symmetry with percentile helpers; keep reference alive
+    _ = math
+
+    return output_dir
 
 
 class RobotClient:
@@ -128,6 +228,11 @@ class RobotClient:
         self.action_queue_lock = threading.Lock()  # Protect queue operations
         self.action_queue_size = []
         self.start_barrier = threading.Barrier(2)  # 2 threads: action receiver, control loop
+
+        # Client-side metrics (persisted on stop)
+        self._metrics_lock = threading.Lock()
+        self.client_metrics_records: list[dict[str, Any]] = []
+        self._last_chunk_latest_action = -1
 
         # FPS measurement
         self.fps_tracker = FPSTracker(target_fps=self.config.fps)
@@ -181,6 +286,38 @@ class RobotClient:
 
         self.channel.close()
         self.logger.debug("Client stopped, channel closed")
+
+        self._save_metrics()
+
+    def _save_metrics(self) -> str | None:
+        """Persist client-side metrics (e2e latency, steps consumed, queue size).
+
+        Returns the run directory path, or None when there is nothing to save.
+        """
+        with self._metrics_lock:
+            records = list(self.client_metrics_records)
+        with self.action_queue_lock:
+            queue_sizes = list(self.action_queue_size)
+
+        if not records and not queue_sizes:
+            return None
+
+        output_dir = save_client_metrics(
+            output_root=self.config.metrics_output_dir,
+            run_name=self.config.metrics_run_name,
+            records=records,
+            action_queue_size=queue_sizes,
+            fps=self.config.fps,
+            metadata={
+                "server_address": self.server_address,
+                "policy_type": self.config.policy_type,
+                "pretrained_name_or_path": self.config.pretrained_name_or_path,
+                "actions_per_chunk": self.config.actions_per_chunk,
+                "chunk_size_threshold": self._chunk_size_threshold,
+            },
+        )
+        self.logger.info(f"Client metrics saved to {output_dir}")
+        return output_dir
 
     def send_observation(
         self,
@@ -304,6 +441,29 @@ class RobotClient:
                     self.logger.debug(f"Actions kept on device: {client_device}")
 
                 self.action_chunk_size = max(self.action_chunk_size, len(timed_actions))
+
+                # Record client-side metrics: end-to-end latency (observation sent ->
+                # full chunk received) and steps consumed while this inference ran
+                if len(timed_actions) > 0:
+                    with self.latest_action_lock:
+                        latest_action = self.latest_action
+                    with self.action_queue_lock:
+                        queue_size_on_arrival = self.action_queue.qsize()
+                    steps_consumed = max(latest_action - self._last_chunk_latest_action, 0)
+                    e2e_latency_ms = (receive_time - timed_actions[0].get_timestamp()) * 1000
+                    with self._metrics_lock:
+                        self.client_metrics_records.append(
+                            {
+                                "index": len(self.client_metrics_records),
+                                "e2e_latency_ms": e2e_latency_ms,
+                                "steps_consumed_during_inference": steps_consumed,
+                                "latest_action_timestep": latest_action,
+                                "chunk_size": len(timed_actions),
+                                "queue_size_on_arrival": queue_size_on_arrival,
+                                "received_at_utc": _utc_string(),
+                            }
+                        )
+                        self._last_chunk_latest_action = latest_action
 
                 # Calculate network latency if we have matching observations
                 if len(timed_actions) > 0 and verbose:

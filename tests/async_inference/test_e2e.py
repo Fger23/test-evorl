@@ -142,6 +142,8 @@ def test_async_inference_e2e(monkeypatch):
     )
 
     client = RobotClient(client_config)
+    # Keep persisted client-side metrics inside the pytest tmp dir
+    client_config.metrics_output_dir = str(tmp_path)
     assert client.start(), "Client failed initial handshake with the server"
 
     # Track action chunks received and verify device type
