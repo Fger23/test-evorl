@@ -231,3 +231,116 @@ def test_ready_to_send_observation_with_varying_threshold(robot_client, g_thresh
         robot_client.action_queue.put(act)
 
     assert robot_client._ready_to_send_observation() is expected
+
+
+# -----------------------------------------------------------------------------
+# Client-side metrics persistence
+# -----------------------------------------------------------------------------
+
+
+def test_save_client_metrics_writes_records_and_summary(tmp_path):
+    """`save_client_metrics` must persist per-chunk records and aggregate stats."""
+    import json
+    import os
+
+    from lerobot.async_inference.robot_client import save_client_metrics
+
+    records = [
+        {
+            "index": 0,
+            "e2e_latency_ms": 100.0,
+            "steps_consumed_during_inference": 0,
+            "latest_action_timestep": -1,
+            "chunk_size": 20,
+            "queue_size_on_arrival": 0,
+            "received_at_utc": "2026-01-01T00:00:00.000Z",
+        },
+        {
+            "index": 1,
+            "e2e_latency_ms": 300.0,
+            "steps_consumed_during_inference": 9,
+            "latest_action_timestep": 8,
+            "chunk_size": 20,
+            "queue_size_on_arrival": 11,
+            "received_at_utc": "2026-01-01T00:00:01.000Z",
+        },
+    ]
+    queue_sizes = [20, 19, 18, 17]
+
+    output_dir = save_client_metrics(
+        output_root=str(tmp_path),
+        run_name="unit_run",
+        records=records,
+        action_queue_size=queue_sizes,
+        fps=30,
+    )
+
+    assert output_dir == str(tmp_path / "unit_run")
+    assert os.path.isfile(os.path.join(output_dir, "records.jsonl"))
+    assert os.path.isfile(os.path.join(output_dir, "summary.json"))
+
+    with open(os.path.join(output_dir, "records.jsonl"), encoding="utf-8") as stream:
+        persisted = [json.loads(line) for line in stream if line.strip()]
+    assert len(persisted) == 2
+    assert persisted[0]["e2e_latency_ms"] == 100.0
+    assert persisted[1]["steps_consumed_during_inference"] == 9
+
+    with open(os.path.join(output_dir, "summary.json"), encoding="utf-8") as stream:
+        summary = json.load(stream)
+    assert summary["num_chunks"] == 2
+    assert summary["e2e_latency_ms"]["p50"] == 200.0
+    assert summary["e2e_latency_ms"]["max"] == 300.0
+    assert summary["steps_consumed_during_inference"]["total"] == 9
+    assert summary["action_queue_size"]["max"] == 20
+    assert summary["action_queue_size_series"] == queue_sizes
+    assert summary["fps"] == 30
+
+
+def test_save_client_metrics_rejects_path_like_run_name(tmp_path):
+    from lerobot.async_inference.robot_client import save_client_metrics
+
+    with pytest.raises(ValueError):
+        save_client_metrics(
+            output_root=str(tmp_path), run_name="../escape", records=[], action_queue_size=[], fps=30
+        )
+
+
+def test_robot_client_save_metrics(robot_client, tmp_path, monkeypatch):
+    """`_save_metrics` must dump collected records/queue sizes via config paths."""
+    import json
+    import os
+
+    monkeypatch.setattr(robot_client.config, "metrics_output_dir", str(tmp_path))
+    monkeypatch.setattr(robot_client.config, "metrics_run_name", "fixture_run")
+
+    robot_client.action_chunk_size = 20
+    robot_client.action_queue_size = [5, 4, 3]
+    with robot_client._metrics_lock:
+        robot_client.client_metrics_records.append(
+            {
+                "index": 0,
+                "e2e_latency_ms": 123.0,
+                "steps_consumed_during_inference": 3,
+                "latest_action_timestep": 2,
+                "chunk_size": 20,
+                "queue_size_on_arrival": 5,
+                "received_at_utc": "2026-01-01T00:00:00.000Z",
+            }
+        )
+
+    output_dir = robot_client._save_metrics()
+    assert output_dir == str(tmp_path / "fixture_run")
+
+    with open(os.path.join(output_dir, "summary.json"), encoding="utf-8") as stream:
+        summary = json.load(stream)
+    assert summary["num_chunks"] == 1
+    assert summary["e2e_latency_ms"]["max"] == 123.0
+    assert summary["action_queue_size_series"] == [5, 4, 3]
+    assert summary["server_address"] == "localhost:9999"
+
+
+def test_robot_client_save_metrics_skips_empty_state(robot_client, tmp_path, monkeypatch):
+    """Nothing recorded -> no files written, returns None."""
+    monkeypatch.setattr(robot_client.config, "metrics_output_dir", str(tmp_path))
+    assert robot_client._save_metrics() is None
+    assert not (tmp_path / "records.jsonl").exists()
