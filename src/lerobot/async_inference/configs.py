@@ -215,6 +215,16 @@ class RobotClientConfig:
         default=False, metadata={"help": "Visualize the action queue size"}
     )
 
+    # Metrics persistence configuration
+    metrics_output_dir: str = field(
+        default="outputs/client_metrics",
+        metadata={"help": "Root directory for persisted client-side metrics"},
+    )
+    metrics_run_name: str | None = field(
+        default=None,
+        metadata={"help": "Stable run directory name (default: UTC timestamp + PID)"},
+    )
+
     @property
     def environment_dt(self) -> float:
         """Environment time step, in seconds"""
