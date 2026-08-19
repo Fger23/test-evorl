@@ -21,6 +21,9 @@ import torch
 
 from lerobot.async_inference.helpers import (
     FPSTracker,
+    RemoteActionChunk,
+    RemotePolicyConfig,
+    RTCInferenceMetadata,
     TimedAction,
     TimedObservation,
     observations_similar,
@@ -122,6 +125,63 @@ def test_timed_observation_getters():
     assert math.isclose(to.get_timestamp(), ts, rel_tol=0, abs_tol=1e-6)
     assert to.get_observation() is obs_dict
     assert to.get_timestep() == 0
+
+
+def test_rtc_v2_helpers_pickle_round_trip():
+    raw = torch.arange(12, dtype=torch.float32).reshape(2, 6)
+    actions = [
+        TimedAction(timestamp=10.0 + index, timestep=7 + index, action=row.square())
+        for index, row in enumerate(raw)
+    ]
+    metadata = RTCInferenceMetadata(
+        request_id="request-7",
+        prev_chunk_left_over=raw.clone(),
+        inference_delay=20,
+        execution_horizon=25,
+    )
+    observation = TimedObservation(
+        timestamp=10.0,
+        timestep=7,
+        observation={OBS_STATE: torch.ones(6)},
+        rtc_metadata=metadata,
+    )
+    response = RemoteActionChunk(
+        request_id="request-7",
+        actions=actions,
+        raw_actions=raw,
+        observation_timestep=7,
+        rtc_enabled=True,
+        inference_delay=20,
+        execution_horizon=25,
+    )
+
+    restored_observation = pickle.loads(pickle.dumps(observation))  # nosec B301
+    restored_response = pickle.loads(pickle.dumps(response))  # nosec B301
+
+    assert restored_observation.rtc_metadata.request_id == "request-7"
+    torch.testing.assert_close(restored_observation.rtc_metadata.prev_chunk_left_over, raw)
+    assert restored_response.request_id == "request-7"
+    assert restored_response.rtc_enabled is True
+    assert [action.get_timestep() for action in restored_response.actions] == [7, 8]
+    torch.testing.assert_close(restored_response.raw_actions, raw)
+
+
+def test_remote_policy_config_defaults_to_legacy_protocol():
+    config = RemotePolicyConfig(
+        policy_type="pi05",
+        pretrained_name_or_path="dummy/pi05",
+        lerobot_features={},
+        actions_per_chunk=50,
+    )
+
+    assert config.protocol_version == 1
+    assert config.return_raw_actions is False
+    assert config.rtc_enabled is False
+    assert config.rtc_inference_delay is None
+    assert config.rtc_execution_horizon is None
+    assert config.rtc_max_guidance_weight is None
+    assert config.rtc_prefix_attention_schedule is None
+    assert config.rtc_cfg_beta is None
 
 
 def test_timed_data_deserialization_data_getters():

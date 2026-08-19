@@ -22,7 +22,7 @@ from typing import Any
 
 import torch
 
-from lerobot.configs.types import PolicyFeature
+from lerobot.configs.types import PolicyFeature, RTCAttentionSchedule
 from lerobot.datasets.utils import build_dataset_frame, hw_to_dataset_features
 
 # NOTE: Configs need to be loaded for the client to be able to instantiate the policy config
@@ -226,12 +226,47 @@ class TimedAction(TimedData):
 
 
 @dataclass
+class RTCInferenceMetadata:
+    """Optional per-request RTC inputs carried alongside a timed observation."""
+
+    request_id: str | None = None
+    prev_chunk_left_over: torch.Tensor | None = None
+    inference_delay: int | None = None
+    execution_horizon: int | None = None
+
+
+@dataclass
 class TimedObservation(TimedData):
     observation: RawObservation
     must_go: bool = False
+    rtc_metadata: RTCInferenceMetadata | None = None
 
     def get_observation(self):
         return self.observation
+
+
+@dataclass
+class RemoteActionChunk:
+    """Version-2 response carrying aligned raw and postprocessed action chunks."""
+
+    request_id: str | None
+    actions: list[TimedAction]
+    raw_actions: torch.Tensor
+    observation_timestep: int
+    rtc_enabled: bool = False
+    inference_delay: int | None = None
+    execution_horizon: int | None = None
+
+    def __post_init__(self) -> None:
+        if self.raw_actions.ndim != 2:
+            raise ValueError(
+                f"`raw_actions` must have shape [T, A], got {tuple(self.raw_actions.shape)}."
+            )
+        if len(self.actions) != self.raw_actions.shape[0]:
+            raise ValueError(
+                "`actions` and `raw_actions` must contain the same number of timesteps, "
+                f"got {len(self.actions)} and {self.raw_actions.shape[0]}."
+            )
 
 
 @dataclass
@@ -270,6 +305,16 @@ class RemotePolicyConfig:
     actions_per_chunk: int
     device: str = "cpu"
     rename_map: dict[str, str] = field(default_factory=dict)
+    # Version 1 is the legacy list[TimedAction] response. Version 2 clients can
+    # explicitly negotiate an aligned raw/processed RemoteActionChunk envelope.
+    protocol_version: int = 1
+    return_raw_actions: bool = False
+    rtc_enabled: bool = False
+    rtc_inference_delay: int | None = None
+    rtc_execution_horizon: int | None = None
+    rtc_max_guidance_weight: float | None = None
+    rtc_prefix_attention_schedule: RTCAttentionSchedule | None = None
+    rtc_cfg_beta: float | None = None
 
 
 def _compare_observation_states(obs1_state: torch.Tensor, obs2_state: torch.Tensor, atol: float) -> bool:

@@ -12,20 +12,33 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Remote policy client used by recording loops.
+"""Remote policy client used by the 30 Hz recording loop.
 
-This adapter talks to ``lerobot.async_inference.policy_server`` but leaves robot
-control and dataset writing inside ``recording_loop.py`` so human-in-loop
-takeover semantics stay in one place.
+For RTC-CFG, the main recording thread is the only queue consumer and the only
+thread allowed to install a completed chunk. A single persistent worker performs
+the RPC. This keeps the final raw CFG chunk and its postprocessed counterpart
+strictly aligned while robot control and dataset writing remain in
+``recording_loop.py``.
 """
-import threading
+
+from __future__ import annotations
+
+import copy
 import logging
+import math
 import pickle  # nosec
+import threading
 import time
+from contextlib import suppress
 from dataclasses import dataclass, field
+from queue import Empty, Full, Queue
 from typing import TYPE_CHECKING, Any
 
 import torch
+
+from lerobot.configs.types import RTCAttentionSchedule
+from lerobot.policies.rtc.action_queue import ActionQueue
+from lerobot.policies.rtc.configuration_rtc import RTCConfig
 
 if TYPE_CHECKING:
     from lerobot.async_inference.helpers import TimedAction
@@ -59,7 +72,27 @@ class RemotePolicyRecordConfig:
     obs_queue_timeout_s: float = 2.0
     rename_map: dict[str, str] = field(default_factory=dict)
 
+    # Estimated RTC values are used inside denoising. The response is still
+    # cropped with the number of actions actually sent while the RPC ran.
+    rtc_enable: bool = False
+    rtc_inference_delay: int = 20
+    rtc_execution_horizon: int = 25
+    rtc_max_guidance_weight: float = 10.0
+    rtc_prefix_attention_schedule: RTCAttentionSchedule = RTCAttentionSchedule.LINEAR
+    rtc_cfg_beta: float = 1.0
+
     def __post_init__(self) -> None:
+        if isinstance(self.rtc_prefix_attention_schedule, str):
+            try:
+                self.rtc_prefix_attention_schedule = RTCAttentionSchedule(
+                    self.rtc_prefix_attention_schedule.upper()
+                )
+            except ValueError as exc:
+                raise ValueError(
+                    "`remote_policy.rtc_prefix_attention_schedule` must be one of "
+                    f"{[schedule.value for schedule in RTCAttentionSchedule]}."
+                ) from exc
+
         if not self.enable:
             return
         if not self.server_address:
@@ -82,37 +115,121 @@ class RemotePolicyRecordConfig:
         if self.obs_queue_timeout_s < 0:
             raise ValueError("`remote_policy.obs_queue_timeout_s` must be non-negative.")
 
+        if (
+            not isinstance(self.rtc_inference_delay, int)
+            or isinstance(self.rtc_inference_delay, bool)
+            or self.rtc_inference_delay < 0
+        ):
+            raise ValueError("`remote_policy.rtc_inference_delay` must be a non-negative integer.")
+        if (
+            not isinstance(self.rtc_execution_horizon, int)
+            or isinstance(self.rtc_execution_horizon, bool)
+            or self.rtc_execution_horizon <= 0
+        ):
+            raise ValueError("`remote_policy.rtc_execution_horizon` must be a positive integer.")
+        if not math.isfinite(self.rtc_max_guidance_weight) or self.rtc_max_guidance_weight <= 0:
+            raise ValueError("`remote_policy.rtc_max_guidance_weight` must be finite and positive.")
+        if not math.isfinite(self.rtc_cfg_beta) or self.rtc_cfg_beta < 0:
+            raise ValueError("`remote_policy.rtc_cfg_beta` must be finite and non-negative.")
+        if self.rtc_enable:
+            if self.obs_queue_timeout_s == 0:
+                raise ValueError("Remote RTC requires `remote_policy.obs_queue_timeout_s` to be positive.")
+            if self.policy_type != "pi05":
+                raise ValueError("Remote RTC-CFG currently supports only `policy_type=pi05`.")
+            if self.rtc_inference_delay >= self.rtc_execution_horizon:
+                raise ValueError(
+                    "`remote_policy.rtc_inference_delay` must be smaller than "
+                    "`remote_policy.rtc_execution_horizon`."
+                )
+            if self.rtc_execution_horizon > self.actions_per_chunk:
+                raise ValueError(
+                    "`remote_policy.rtc_execution_horizon` cannot exceed `actions_per_chunk`."
+                )
+
+
+@dataclass(frozen=True)
+class _InferenceRequest:
+    request_id: str
+    episode_epoch: int
+    observation: dict[str, Any]
+    task: str | None
+    timestep: int
+    left_over: torch.Tensor | None
+    executed_steps_at_submit: int
+    queue_size_at_submit: int
+
 
 class RemotePolicyActionClient:
-    """Small synchronous client for remote policy actions during recording."""
+    """Remote action source with one background chunk worker.
 
-    def __init__(self, cfg: RemotePolicyRecordConfig, robot: "Robot", fps: int):
+    RTC mode owns one :class:`ActionQueue` containing aligned ``raw CFG`` and
+    ``processed CFG`` tensors. The worker never mutates it: responses enter a
+    single pending slot and the 30 Hz main thread applies them before its next
+    queue pop.
+    """
+
+    def __init__(self, cfg: RemotePolicyRecordConfig, robot: Robot, fps: int):
         if not cfg.enable:
             raise ValueError("RemotePolicyActionClient requires `cfg.enable=true`.")
+        if fps <= 0:
+            raise ValueError("RemotePolicyActionClient requires a positive fps.")
 
         self.cfg = cfg
         self.robot = robot
         self.environment_dt = 1 / fps
-        from lerobot.transport import services_pb2, services_pb2_grpc
-        from lerobot.transport.utils import grpc_channel_options
 
         import grpc
+
+        from lerobot.transport import services_pb2, services_pb2_grpc
+        from lerobot.transport.utils import grpc_channel_options
 
         self.services_pb2 = services_pb2
         self.channel = grpc.insecure_channel(
             cfg.server_address, grpc_channel_options(initial_backoff=f"{self.environment_dt:.4f}s")
         )
         self.stub = services_pb2_grpc.AsyncInferenceStub(self.channel)
-        self.action_queue: list["TimedAction"] = []
+
+        if cfg.rtc_enable:
+            rtc_config = RTCConfig(
+                enabled=True,
+                prefix_attention_schedule=cfg.rtc_prefix_attention_schedule,
+                max_guidance_weight=cfg.rtc_max_guidance_weight,
+                execution_horizon=cfg.rtc_execution_horizon,
+            )
+            self.action_queue: ActionQueue | list[TimedAction] = ActionQueue(rtc_config)
+        else:
+            # Preserve the legacy overlap-aggregation path when RTC is disabled.
+            self.action_queue = []
+
         self.latest_action_timestep = -1
-        self.latest_action = None
+        self.latest_action: TimedAction | None = None
         self.aggregate_fn = AGGREGATE_FUNCTIONS[cfg.aggregate_fn_name]
+
+        self._state_lock = threading.RLock()
+        self._request_queue: Queue[_InferenceRequest | None] = Queue(maxsize=1)
+        self._pending_event = threading.Event()
+        self._stop_event = threading.Event()
+        self._worker_thread: threading.Thread | None = None
+        self._pending_result: tuple[_InferenceRequest, Any] | None = None
+        self._worker_error: tuple[_InferenceRequest, BaseException] | None = None
+        self._in_flight_request_id: str | None = None
+        self._active_rpc_future: Any | None = None
+        self._active_rpc_request_id: str | None = None
+        self._episode_epoch = 0
+        self._request_sequence = 0
+        self._executed_steps = 0
+        self._awaiting_execution_confirmation = False
+        self._started = False
 
     @property
     def policy_id(self) -> str:
         return self.cfg.pretrained_name_or_path or self.cfg.policy_type or "remote_policy"
 
     def start(self) -> None:
+        """Negotiate the payload format and start the persistent RPC worker."""
+        if self._started:
+            return
+
         from lerobot.async_inference.helpers import RemotePolicyConfig, map_robot_keys_to_lerobot_features
 
         self.stub.Ready(self.services_pb2.Empty())
@@ -123,68 +240,401 @@ class RemotePolicyActionClient:
             actions_per_chunk=self.cfg.actions_per_chunk,
             device=self.cfg.policy_device,
             rename_map=self.cfg.rename_map,
+            protocol_version=2 if self.cfg.rtc_enable else 1,
+            return_raw_actions=self.cfg.rtc_enable,
+            rtc_enabled=self.cfg.rtc_enable,
+            rtc_inference_delay=self.cfg.rtc_inference_delay if self.cfg.rtc_enable else None,
+            rtc_execution_horizon=self.cfg.rtc_execution_horizon if self.cfg.rtc_enable else None,
+            rtc_max_guidance_weight=(
+                self.cfg.rtc_max_guidance_weight if self.cfg.rtc_enable else None
+            ),
+            rtc_prefix_attention_schedule=(
+                self.cfg.rtc_prefix_attention_schedule if self.cfg.rtc_enable else None
+            ),
+            rtc_cfg_beta=self.cfg.rtc_cfg_beta if self.cfg.rtc_enable else None,
         )
         self.stub.SendPolicyInstructions(self.services_pb2.PolicySetup(data=pickle.dumps(policy_config)))
-        logging.info("Remote policy recording client connected to %s.", self.cfg.server_address)
+
+        self._worker_thread = threading.Thread(
+            target=self._chunk_worker,
+            name="remote-policy-chunk-worker",
+            daemon=True,
+        )
+        self._worker_thread.start()
+        self._started = True
+        logging.info(
+            "Remote policy recording client connected to %s (RTC=%s, d=%d, H=%d).",
+            self.cfg.server_address,
+            self.cfg.rtc_enable,
+            self.cfg.rtc_inference_delay,
+            self.cfg.rtc_execution_horizon,
+        )
 
     def stop(self) -> None:
-        self.channel.close()
+        """Stop the worker and invalidate any response that is still in flight."""
+        if not self._started:
+            self.channel.close()
+            return
+
+        with self._state_lock:
+            self._episode_epoch += 1
+            self._in_flight_request_id = None
+            self._pending_result = None
+            self._worker_error = None
+            active_rpc = self._active_rpc_future
+            self._active_rpc_future = None
+            self._active_rpc_request_id = None
+        self._stop_event.set()
+        self._pending_event.set()
+        if active_rpc is not None:
+            active_rpc.cancel()
+        self.channel.close()  # Cancels a blocking gRPC call.
+        self._enqueue_worker_sentinel()
+        if self._worker_thread is not None:
+            self._worker_thread.join(timeout=max(self.cfg.obs_queue_timeout_s + 1.0, 1.0))
+            if self._worker_thread.is_alive():
+                logging.warning("Remote policy worker did not stop before the join timeout.")
+        self._started = False
 
     def reset(self) -> None:
-        self.action_queue.clear()
-        self.latest_action_timestep = -1
-        self.latest_action = None
-        # Sync server dedup / policy internal state when a new episode starts or
-        # control returns to the policy after human takeover.
-        self.stub.Ready(self.services_pb2.Empty())
+        """Start a new episode and make all older worker responses stale."""
+        with self._state_lock:
+            self._episode_epoch += 1
+            self._in_flight_request_id = None
+            self._pending_result = None
+            self._worker_error = None
+            active_rpc = self._active_rpc_future
+            self._active_rpc_future = None
+            self._active_rpc_request_id = None
+            self._executed_steps = 0
+            self._awaiting_execution_confirmation = False
+            self.latest_action_timestep = -1
+            self.latest_action = None
+            if self.cfg.rtc_enable:
+                assert isinstance(self.action_queue, ActionQueue)
+                self.action_queue.clear()
+            else:
+                assert isinstance(self.action_queue, list)
+                self.action_queue.clear()
+            self._drain_queued_requests()
+            self._pending_event.clear()
+
+        if active_rpc is not None:
+            active_rpc.cancel()
+
+        # Reset server deduplication and policy episode state. An older active
+        # RPC may still finish, but its epoch/request id prevents installation.
+        if self._started:
+            self.stub.Ready(self.services_pb2.Empty())
+
+    def mark_action_executed(self) -> None:
+        """Confirm that the action returned by ``get_action`` reached the robot.
+
+        ``recording_loop`` calls this immediately after ``robot.send_action``
+        succeeds. RTC's real delay is based on this counter, not queue pops or
+        wall-clock rounding.
+        """
+        if not self.cfg.rtc_enable:
+            return
+        with self._state_lock:
+            if not self._awaiting_execution_confirmation:
+                raise RuntimeError("No remote RTC action is awaiting execution confirmation.")
+            self._executed_steps += 1
+            self._awaiting_execution_confirmation = False
+
+    def _enqueue_worker_sentinel(self) -> None:
+        try:
+            self._request_queue.put_nowait(None)
+        except Full:
+            try:
+                self._request_queue.get_nowait()
+                self._request_queue.task_done()
+            except Empty:
+                pass
+            with suppress(Full):
+                self._request_queue.put_nowait(None)
+
+    def _drain_queued_requests(self) -> None:
+        while True:
+            try:
+                item = self._request_queue.get_nowait()
+            except Empty:
+                return
+            self._request_queue.task_done()
+            if item is None:
+                self._stop_event.set()
+
+    def _queue_size(self) -> int:
+        if self.cfg.rtc_enable:
+            assert isinstance(self.action_queue, ActionQueue)
+            return self.action_queue.qsize()
+        assert isinstance(self.action_queue, list)
+        return len(self.action_queue)
 
     def _ready_to_send_observation(self) -> bool:
-        if not self.action_queue:
+        queue_size = self._queue_size()
+        if queue_size == 0:
             return True
-        return len(self.action_queue) / self.cfg.actions_per_chunk <= self.cfg.chunk_size_threshold
+        return queue_size / self.cfg.actions_per_chunk <= self.cfg.chunk_size_threshold
 
-    def _send_observation(self, observation: dict, timestep: int, task: str | None, must_go: bool) -> None:
-        from lerobot.async_inference.helpers import TimedObservation
+    def _submit_if_needed(self, observation: dict, task: str | None, timestep: int) -> bool:
+        with self._state_lock:
+            if self._stop_event.is_set() or not self._ready_to_send_observation():
+                return False
+            if self._in_flight_request_id is not None or self._pending_result is not None:
+                return False
+
+            left_over = None
+            queue_size = self._queue_size()
+            if self.cfg.rtc_enable:
+                assert isinstance(self.action_queue, ActionQueue)
+                snapshot = self.action_queue.snapshot()
+                left_over = snapshot.left_over
+                queue_size = snapshot.queue_size
+
+            self._request_sequence += 1
+            request_id = f"{self._episode_epoch}:{self._request_sequence}"
+            request = _InferenceRequest(
+                request_id=request_id,
+                episode_epoch=self._episode_epoch,
+                observation=copy.deepcopy(observation),
+                task=task,
+                timestep=max(timestep, 0),
+                left_over=left_over,
+                executed_steps_at_submit=self._executed_steps,
+                queue_size_at_submit=queue_size,
+            )
+            self._in_flight_request_id = request_id
+            self._worker_error = None
+            self._pending_event.clear()
+            try:
+                self._request_queue.put_nowait(request)
+            except Full as exc:
+                self._in_flight_request_id = None
+                raise RuntimeError("Remote policy worker queue unexpectedly contains another request.") from exc
+            return True
+
+    def _run_cancellable_rpc(
+        self, request: _InferenceRequest, rpc, argument, *, timeout: float | None
+    ):
+        """Run one gRPC future that reset/stop can cancel without waiting for its deadline."""
+        rpc_future = rpc.future(argument, timeout=timeout)
+        with self._state_lock:
+            if (
+                self._stop_event.is_set()
+                or request.episode_epoch != self._episode_epoch
+                or request.request_id != self._in_flight_request_id
+            ):
+                rpc_future.cancel()
+                raise RuntimeError(f"Remote policy request {request.request_id} was invalidated.")
+            self._active_rpc_future = rpc_future
+            self._active_rpc_request_id = request.request_id
+        try:
+            return rpc_future.result()
+        finally:
+            with self._state_lock:
+                if self._active_rpc_future is rpc_future:
+                    self._active_rpc_future = None
+                    self._active_rpc_request_id = None
+
+    def _send_observation(self, request: _InferenceRequest) -> None:
+        from lerobot.async_inference.helpers import RTCInferenceMetadata, TimedObservation
         from lerobot.transport.utils import send_bytes_in_chunks
 
-        raw_observation = dict(observation)
-        if task is not None:
-            raw_observation["task"] = task
+        raw_observation = dict(request.observation)
+        if request.task is not None:
+            raw_observation["task"] = request.task
 
         timed_observation = TimedObservation(
             timestamp=time.time(),
-            timestep=max(timestep, 0),
+            timestep=request.timestep,
             observation=raw_observation,
-            must_go=must_go,
+            must_go=True,
+            rtc_metadata=(
+                RTCInferenceMetadata(
+                    request_id=request.request_id,
+                    prev_chunk_left_over=request.left_over,
+                    inference_delay=self.cfg.rtc_inference_delay,
+                    execution_horizon=self.cfg.rtc_execution_horizon,
+                )
+                if self.cfg.rtc_enable
+                else None
+            ),
         )
-        observation_bytes = pickle.dumps(timed_observation)
         observation_iterator = send_bytes_in_chunks(
-            observation_bytes,
+            pickle.dumps(timed_observation),
             self.services_pb2.Observation,
             log_prefix="[RECORD_REMOTE_POLICY] Observation",
             silent=True,
         )
-        start_time = time.time()
-        self.stub.SendObservations(observation_iterator)
-        end_time = time.time()
-        send_time = end_time - start_time
-        # logging.info(f"SendObservations时间: {send_time*1000} 毫秒")
+        self._run_cancellable_rpc(
+            request,
+            self.stub.SendObservations,
+            observation_iterator,
+            timeout=self.cfg.obs_queue_timeout_s if self.cfg.obs_queue_timeout_s > 0 else None,
+        )
 
-    def _receive_actions(self) -> None:
+    def _receive_actions(self, request: _InferenceRequest) -> Any:
         deadline_t = time.perf_counter() + self.cfg.obs_queue_timeout_s
-        while True:
-            actions_chunk = self.stub.GetActions(self.services_pb2.Empty())
+        while not self._stop_event.is_set():
+            remaining = deadline_t - time.perf_counter()
+            if self.cfg.obs_queue_timeout_s > 0 and remaining <= 0:
+                raise TimeoutError("Timed out waiting for remote policy actions.")
+            actions_chunk = self._run_cancellable_rpc(
+                request,
+                self.stub.GetActions,
+                self.services_pb2.Empty(),
+                timeout=remaining if self.cfg.obs_queue_timeout_s > 0 else None,
+            )
             if actions_chunk.data:
-                timed_actions = pickle.loads(actions_chunk.data)  # nosec
-                self._merge_actions(timed_actions)
-                return
+                return pickle.loads(actions_chunk.data)  # nosec
 
             if self.cfg.obs_queue_timeout_s == 0 or time.perf_counter() >= deadline_t:
                 raise TimeoutError("Timed out waiting for remote policy actions.")
+        raise RuntimeError("Remote policy client stopped while waiting for actions.")
 
-    def _merge_actions(self, incoming_actions: list["TimedAction"]) -> None:
+    def _chunk_worker(self) -> None:
+        while not self._stop_event.is_set():
+            try:
+                request = self._request_queue.get(timeout=0.1)
+            except Empty:
+                continue
+            try:
+                if request is None:
+                    return
+                self._send_observation(request)
+                response = self._receive_actions(request)
+                with self._state_lock:
+                    if (
+                        not self._stop_event.is_set()
+                        and request.episode_epoch == self._episode_epoch
+                        and request.request_id == self._in_flight_request_id
+                    ):
+                        self._pending_result = (request, response)
+                        self._in_flight_request_id = None
+                        self._pending_event.set()
+            except Exception as exc:
+                if request is not None:
+                    with self._state_lock:
+                        if (
+                            request.episode_epoch == self._episode_epoch
+                            and request.request_id == self._in_flight_request_id
+                        ):
+                            self._worker_error = (request, exc)
+                            self._in_flight_request_id = None
+                            self._pending_event.set()
+            finally:
+                self._request_queue.task_done()
+
+    def _apply_pending_result(self) -> bool:
+        with self._state_lock:
+            pending = self._pending_result
+            self._pending_result = None
+            if self._worker_error is None:
+                self._pending_event.clear()
+        if pending is None:
+            return False
+
+        request, payload = pending
+        if request.episode_epoch != self._episode_epoch:
+            return False
+
+        if not self.cfg.rtc_enable:
+            if not isinstance(payload, list):
+                # A v2 server response is also accepted by the new client, but
+                # legacy mode consumes only its processed TimedActions.
+                payload = getattr(payload, "actions", None)
+            if not isinstance(payload, list):
+                raise TypeError(f"Expected a list of TimedAction, got {type(payload).__name__}.")
+            with self._state_lock:
+                self._merge_legacy_actions(payload)
+            return True
+
+        from lerobot.async_inference.helpers import RemoteActionChunk
+
+        if not isinstance(payload, RemoteActionChunk):
+            raise RuntimeError(
+                "RTC recording requires a v2 RemoteActionChunk response. "
+                "Start the policy server with `acp_inference.rtc.enabled=true`."
+            )
+        if payload.request_id != request.request_id:
+            raise RuntimeError(
+                f"RTC response request_id mismatch: expected {request.request_id}, got {payload.request_id}."
+            )
+        if not payload.rtc_enabled:
+            raise RuntimeError("The policy server returned a chunk without RTC enabled.")
+
+        raw_actions = payload.raw_actions
+        if not isinstance(raw_actions, torch.Tensor) or raw_actions.ndim != 2:
+            raise ValueError("RTC response raw_actions must be a [T, A] tensor.")
+        if not isinstance(payload.actions, list) or not payload.actions:
+            raise ValueError("RTC response must contain at least one processed TimedAction.")
+        processed_actions = torch.stack([action.get_action() for action in payload.actions]).detach().cpu()
+        raw_actions = raw_actions.detach().cpu()
+        if raw_actions.shape != processed_actions.shape:
+            raise ValueError(
+                "RTC raw and processed response chunks are not aligned: "
+                f"{tuple(raw_actions.shape)} != {tuple(processed_actions.shape)}."
+            )
+        if not bool(torch.isfinite(raw_actions).all()) or not bool(torch.isfinite(processed_actions).all()):
+            raise FloatingPointError("RTC response contains non-finite raw or processed actions.")
+
+        with self._state_lock:
+            if request.episode_epoch != self._episode_epoch:
+                return False
+            actual_delay = self._executed_steps - request.executed_steps_at_submit
+            if actual_delay < 0:
+                raise RuntimeError("RTC executed-step counter moved backwards.")
+            if actual_delay >= raw_actions.shape[0]:
+                logging.error(
+                    "Discarding fully stale RTC chunk %s: %d actions executed during a %d-step response.",
+                    request.request_id,
+                    actual_delay,
+                    raw_actions.shape[0],
+                )
+                return False
+
+            assert isinstance(self.action_queue, ActionQueue)
+            self.action_queue.merge(
+                original_actions=raw_actions,
+                processed_actions=processed_actions,
+                real_delay=actual_delay,
+                action_index_before_inference=None,
+            )
+            logging.debug(
+                "Installed RTC chunk %s: submit_queue=%d, actual_delay=%d, remaining=%d.",
+                request.request_id,
+                request.queue_size_at_submit,
+                actual_delay,
+                self.action_queue.qsize(),
+            )
+        return True
+
+    def _raise_or_log_worker_error(self) -> None:
+        with self._state_lock:
+            worker_error = self._worker_error
+            self._worker_error = None
+            if self._pending_result is None:
+                self._pending_event.clear()
+            queue_empty = self._queue_size() == 0
+        if worker_error is None:
+            return
+        request, error = worker_error
+        if request.episode_epoch != self._episode_epoch:
+            return
+        if queue_empty:
+            raise RuntimeError(f"Remote policy request {request.request_id} failed.") from error
+        logging.warning(
+            "Remote policy request %s failed while %d queued actions remain; retrying at low water mark: %s",
+            request.request_id,
+            self._queue_size(),
+            error,
+        )
+
+    def _merge_legacy_actions(self, incoming_actions: list[TimedAction]) -> None:
+        assert isinstance(self.action_queue, list)
         current_actions = {action.get_timestep(): action for action in self.action_queue}
-        merged = {}
+        merged: dict[int, TimedAction] = {}
 
         for action in self.action_queue:
             if action.get_timestep() > self.latest_action_timestep:
@@ -203,123 +653,66 @@ class RemotePolicyActionClient:
                     action=self.aggregate_fn(current_actions[timestep].get_action(), action.get_action()),
                 )
             merged[timestep] = action
-
-        if incoming_actions and not merged:
-            logging.warning(
-                "Remote policy returned %d actions but all were discarded because their timesteps "
-                "<= latest_action_timestep=%d. Incoming range: %d..%d.",
-                len(incoming_actions),
-                self.latest_action_timestep,
-                incoming_actions[0].get_timestep(),
-                incoming_actions[-1].get_timestep(),
-            )
-
         self.action_queue = [merged[timestep] for timestep in sorted(merged)]
+
+    def _pop_action(self) -> torch.Tensor | None:
+        with self._state_lock:
+            if self.cfg.rtc_enable:
+                assert isinstance(self.action_queue, ActionQueue)
+                action = self.action_queue.get()
+                if action is not None:
+                    self._awaiting_execution_confirmation = True
+                return action
+
+            assert isinstance(self.action_queue, list)
+            if not self.action_queue:
+                return None
+            timed_action = self.action_queue.pop(0)
+            self.latest_action = timed_action
+            self.latest_action_timestep = timed_action.get_timestep()
+            return timed_action.get_action()
 
     def _tensor_to_action(self, action_tensor: torch.Tensor) -> RobotAction:
         if self.cfg.client_device != "cpu" and action_tensor.device.type != self.cfg.client_device:
             action_tensor = action_tensor.to(self.cfg.client_device)
         else:
             action_tensor = action_tensor.cpu()
+        if action_tensor.numel() != len(self.robot.action_features):
+            raise ValueError(
+                "Remote action dimension does not match robot action features: "
+                f"{action_tensor.numel()} != {len(self.robot.action_features)}."
+            )
         return {key: action_tensor[i].item() for i, key in enumerate(self.robot.action_features)}
 
-    # def get_action(self, observation: dict, task: str | None, timestep: int) -> RobotAction:
-    #     if self._ready_to_send_observation():
-    #         # This client sends an observation and then blocks on GetActions. Unlike the
-    #         # async RobotClient, there is no background thread to retry later, so we must
-    #         # always force inference here. Otherwise the server may filter a similar obs
-    #         # (must_go=False) and GetActions times out while the action queue still has
-    #         # steps left to execute.
-    #         self._send_observation(
-    #             observation=observation,
-    #             timestep=timestep,
-    #             task=task,
-    #             must_go=True,
-    #         )
-    #         self._receive_actions()
-
-    #     if not self.action_queue:
-    #         raise TimeoutError("Remote policy returned no actions.")
-
-    #     timed_action = self.action_queue.pop(0)
-    #     self.latest_action_timestep = timed_action.get_timestep()
-    #     return self._tensor_to_action(timed_action.get_action())
-
-    # #异步推理，无需等待
-    # def get_action(self, observation: dict, task: str | None, timestep: int) -> RobotAction:
-    #     if self._ready_to_send_observation():
-    #         # This client sends an observation and then blocks on GetActions. Unlike the
-    #         # async RobotClient, there is no background thread to retry later, so we must
-    #         # always force inference here. Otherwise the server may filter a similar obs
-    #         # (must_go=False) and GetActions times out while the action queue still has
-    #         # steps left to execute.
-    #         start_time = time.time()
-    #         self._send_observation(
-    #             observation=observation,
-    #             timestep=timestep,
-    #             task=task,
-    #             must_go=True,
-    #         )
-    #         end_time = time.time()
-    #         send_time = end_time - start_time
-    #         logging.info(f"发送执行时间: {send_time*1000} 毫秒")
-    #         if not self.action_queue or self.latest_action is None:
-    #             logging.warning("action queue is null or latest_action is None, wait for receive actions.")
-    #             self._receive_actions() # 如果动作队列为空，则需要等待推理完成
-    #         else:
-    #             threading.Thread(target=self._receive_actions, daemon=True).start()
-
-    #     if not self.action_queue:
-    #         # raise TimeoutError("Remote policy returned no actions.")
-    #         logging.warning("Remote policy action queue is null, use latest_action.")
-    #         timed_action = self.latest_action
-
-    #     timed_action = self.action_queue.pop(0)
-    #     self.latest_action = timed_action
-    #     self.latest_action_timestep = timed_action.get_timestep()
-    #     return self._tensor_to_action(timed_action.get_action())
-
-    # 2异步推理，无需等待
     def get_action(self, observation: dict, task: str | None, timestep: int) -> RobotAction:
-        if self._ready_to_send_observation():
-            # This client sends an observation and then blocks on GetActions. Unlike the
-            # async RobotClient, there is no background thread to retry later, so we must
-            # always force inference here. Otherwise the server may filter a similar obs
-            # (must_go=False) and GetActions times out while the action queue still has
-            # steps left to execute.
+        """Return one processed action and refill asynchronously at low water mark.
 
-            def worker():
-                self.is_send = getattr(self, "is_send", None)
-                if self.is_send is None or self.is_send == False:
-                    self.is_send = True
-                    start_time = time.time()
-                    self._send_observation(
-                        observation=observation,
-                        timestep=timestep,
-                        task=task,
-                        must_go=True,
-                    )
-                    end_time = time.time()
-                    send_time = end_time - start_time
-                    # logging.info(f"发送执行时间: {send_time*1000} 毫秒")
-                    self._receive_actions() # 如果动作队列为空，则需要等待推理完成
-                    self.is_send = False
-                # else:
-                #     time.sleep(0.1)
+        The first chunk is a synchronous bootstrap because there is no safe
+        action to execute yet. Once primed, this method only blocks if the queue
+        genuinely underruns.
+        """
+        if not self._started:
+            raise RuntimeError("RemotePolicyActionClient.start() must be called before get_action().")
+        if self.cfg.rtc_enable and self._awaiting_execution_confirmation:
+            raise RuntimeError(
+                "The previous remote action was not confirmed. Call mark_action_executed() "
+                "after robot.send_action succeeds."
+            )
 
-            if not self.action_queue or self.latest_action is None:
-                logging.warning("action queue is null or latest_action is None, wait for receive actions.")
-                worker()
-            else:
-                threading.Thread(target=worker, daemon=True).start()
+        wait_timeout = max(self.cfg.obs_queue_timeout_s + 1.0, 1.0)
+        deadline = time.perf_counter() + wait_timeout
+        while True:
+            self._apply_pending_result()
+            self._raise_or_log_worker_error()
+            self._submit_if_needed(observation=observation, task=task, timestep=timestep)
 
-        if not self.action_queue:
-            # raise TimeoutError("Remote policy returned no actions.")
-            logging.warning("Remote policy action queue is null, use latest_action.")
-            timed_action = self.latest_action
-        else:
-            timed_action = self.action_queue.pop(0)
-            self.latest_action = timed_action
-            
-        self.latest_action_timestep = timed_action.get_timestep()
-        return self._tensor_to_action(timed_action.get_action())
+            action_tensor = self._pop_action()
+            if action_tensor is not None:
+                return self._tensor_to_action(action_tensor)
+
+            remaining = deadline - time.perf_counter()
+            if remaining <= 0:
+                raise TimeoutError(
+                    "Remote RTC action queue underrun: no fresh action arrived before the safety timeout."
+                )
+            self._pending_event.wait(timeout=min(remaining, 0.05))

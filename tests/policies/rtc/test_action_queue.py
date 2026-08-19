@@ -732,6 +732,50 @@ def test_queue_clones_input_tensors(action_queue_rtc_enabled, sample_actions):
     assert torch.equal(leftover, original_copy[1:])
 
 
+def test_snapshot_clones_unconsumed_raw_actions(action_queue_rtc_enabled):
+    """A worker snapshot must be raw CFG data frozen at one queue position."""
+    raw_actions = torch.arange(30, dtype=torch.float32).reshape(5, 6)
+    processed_actions = raw_actions + 1_000
+    action_queue_rtc_enabled.merge(raw_actions, processed_actions, real_delay=0)
+
+    assert torch.equal(action_queue_rtc_enabled.get(), processed_actions[0])
+    assert torch.equal(action_queue_rtc_enabled.get(), processed_actions[1])
+
+    snapshot = action_queue_rtc_enabled.snapshot()
+
+    assert snapshot.action_index == 2
+    assert snapshot.queue_size == 3
+    assert torch.equal(snapshot.left_over, raw_actions[2:])
+    assert not torch.equal(snapshot.left_over, processed_actions[2:])
+
+    # Prove the asynchronous inference input is not a view into mutable queue state.
+    with action_queue_rtc_enabled.lock:
+        action_queue_rtc_enabled.original_queue[2:].fill_(-123)
+    assert torch.equal(snapshot.left_over, raw_actions[2:])
+
+
+@pytest.mark.parametrize(
+    ("raw_shape", "processed_shape"),
+    [
+        ((5, 6), (4, 6)),
+        ((5, 6), (5, 4)),
+        ((1, 5, 6), (5, 6)),
+    ],
+)
+def test_merge_rejects_misaligned_raw_and_processed_actions(
+    action_queue_rtc_enabled, raw_shape, processed_shape
+):
+    """Raw CFG and executable actions must always describe the same chunk."""
+    raw_actions = torch.zeros(raw_shape)
+    processed_actions = torch.zeros(processed_shape)
+
+    with pytest.raises(ValueError, match=r"expects.*\[T, A\]|must be aligned"):
+        action_queue_rtc_enabled.merge(raw_actions, processed_actions, real_delay=0)
+
+    assert action_queue_rtc_enabled.empty()
+    assert action_queue_rtc_enabled.get_left_over() is None
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 def test_queue_handles_gpu_tensors():
     """Test queue correctly handles GPU tensors."""

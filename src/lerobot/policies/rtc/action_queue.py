@@ -22,7 +22,8 @@ handling action merging and leftover tracking.
 """
 
 import logging
-from threading import Lock
+from dataclasses import dataclass
+from threading import RLock
 
 import torch
 from torch import Tensor
@@ -30,6 +31,15 @@ from torch import Tensor
 from lerobot.policies.rtc.configuration_rtc import RTCConfig
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class ActionQueueSnapshot:
+    """Immutable view of the queue at inference submission time."""
+
+    left_over: Tensor | None
+    action_index: int
+    queue_size: int
 
 
 class ActionQueue:
@@ -60,7 +70,9 @@ class ActionQueue:
         """
         self.queue = None  # Processed actions for robot rollout
         self.original_queue = None  # Original actions for RTC
-        self.lock = Lock()
+        # An RLock keeps the public inspection helpers composable while all
+        # queue state continues to be guarded by one lock.
+        self.lock = RLock()
         self.last_index = 0
         self.cfg = cfg
 
@@ -85,10 +97,11 @@ class ActionQueue:
         Returns:
             int: Number of unconsumed actions.
         """
-        if self.queue is None:
-            return 0
-        length = len(self.queue)
-        return length - self.last_index
+        with self.lock:
+            if self.queue is None:
+                return 0
+            length = len(self.queue)
+            return max(length - self.last_index, 0)
 
     def empty(self) -> bool:
         """Check if the queue is empty.
@@ -96,11 +109,12 @@ class ActionQueue:
         Returns:
             bool: True if no actions remain, False otherwise.
         """
-        if self.queue is None:
-            return True
+        with self.lock:
+            if self.queue is None:
+                return True
 
-        length = len(self.queue)
-        return length - self.last_index <= 0
+            length = len(self.queue)
+            return length - self.last_index <= 0
 
     def get_action_index(self) -> int:
         """Get the current action consumption index.
@@ -108,7 +122,8 @@ class ActionQueue:
         Returns:
             int: Index of the next action to be consumed.
         """
-        return self.last_index
+        with self.lock:
+            return self.last_index
 
     def get_left_over(self) -> Tensor | None:
         """Get leftover original actions for RTC prev_chunk_left_over.
@@ -123,7 +138,33 @@ class ActionQueue:
         with self.lock:
             if self.original_queue is None:
                 return None
-            return self.original_queue[self.last_index :]
+            return self.original_queue[self.last_index :].clone()
+
+    def snapshot(self) -> ActionQueueSnapshot:
+        """Atomically snapshot the raw leftover and its aligned queue position.
+
+        ``left_over`` is cloned because inference runs asynchronously; a view
+        would otherwise change when the main control thread replaces the queue.
+        An exhausted queue is represented as ``None`` for RTC's first/no-prefix
+        path instead of a zero-length tensor.
+        """
+        with self.lock:
+            queue_size = 0 if self.queue is None else max(len(self.queue) - self.last_index, 0)
+            left_over = None
+            if self.original_queue is not None and self.last_index < len(self.original_queue):
+                left_over = self.original_queue[self.last_index :].clone()
+            return ActionQueueSnapshot(
+                left_over=left_over,
+                action_index=self.last_index,
+                queue_size=queue_size,
+            )
+
+    def clear(self) -> None:
+        """Atomically discard both raw and processed actions."""
+        with self.lock:
+            self.queue = None
+            self.original_queue = None
+            self.last_index = 0
 
     def merge(
         self,
@@ -145,6 +186,15 @@ class ActionQueue:
             action_index_before_inference: Index before inference started, for validation.
         """
         with self.lock:
+            if original_actions.ndim != 2 or processed_actions.ndim != 2:
+                raise ValueError("ActionQueue expects raw and processed actions shaped [T, A].")
+            if original_actions.shape != processed_actions.shape:
+                raise ValueError(
+                    "Raw and processed action chunks must be aligned, "
+                    f"got {tuple(original_actions.shape)} and {tuple(processed_actions.shape)}."
+                )
+            if not isinstance(real_delay, int) or isinstance(real_delay, bool) or real_delay < 0:
+                raise ValueError(f"real_delay must be a non-negative integer, got {real_delay!r}.")
             self._check_delays(real_delay, action_index_before_inference)
 
             if self.cfg.enabled:

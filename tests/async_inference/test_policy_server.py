@@ -17,7 +17,9 @@ Monkey-patch the `policy` attribute with a stub so that no real model inference 
 
 from __future__ import annotations
 
+import threading
 import time
+from dataclasses import replace
 
 import pytest
 import torch
@@ -119,7 +121,8 @@ def _make_obs(state: torch.Tensor, timestep: int = 0, must_go: bool = False):
 
 
 def test_policy_server_acp_config_validation_and_round_trip():
-    from lerobot.async_inference.configs import ACPInferenceConfig, PolicyServerConfig
+    from lerobot.async_inference.configs import ACPInferenceConfig, ACPRTCConfig, PolicyServerConfig
+    from lerobot.configs.types import RTCAttentionSchedule
 
     with pytest.raises(ValueError, match="requires.*use_cfg=true.*batched_cfg=true"):
         PolicyServerConfig(acp_inference=ACPInferenceConfig(enable=True))
@@ -139,6 +142,58 @@ def test_policy_server_acp_config_validation_and_round_trip():
     assert restored.acp_inference.cfg_beta == 1.5
     assert restored.acp_inference.profile is True
     assert restored.acp_inference.profile_save_chunks is False
+    assert restored.acp_inference.rtc.inference_delay == 20
+    assert restored.acp_inference.rtc.execution_horizon == 25
+    assert restored.acp_inference.rtc.max_guidance_weight == 10.0
+    assert restored.acp_inference.rtc.prefix_attention_schedule is RTCAttentionSchedule.LINEAR
+
+    with pytest.raises(ValueError, match="greater than"):
+        ACPRTCConfig(enabled=True, inference_delay=20, execution_horizon=20)
+
+    rtc_config = PolicyServerConfig(
+        acp_inference=ACPInferenceConfig(
+            enable=True,
+            use_cfg=True,
+            batched_cfg=True,
+            rtc=ACPRTCConfig(enabled=True),
+        )
+    )
+    rtc_restored = PolicyServerConfig.from_dict(rtc_config.to_dict())
+    assert rtc_restored.acp_inference.rtc.enabled is True
+
+
+def test_server_rejects_mismatched_rtc_client_contract(policy_server):
+    from lerobot.async_inference.configs import ACPInferenceConfig, ACPRTCConfig
+    from lerobot.async_inference.helpers import RemotePolicyConfig
+    from lerobot.configs.types import RTCAttentionSchedule
+
+    policy_server.config.acp_inference = ACPInferenceConfig(
+        enable=True,
+        use_cfg=True,
+        batched_cfg=True,
+        cfg_beta=1.5,
+        rtc=ACPRTCConfig(enabled=True),
+    )
+    policy_server._client_rtc_enabled = True
+    matching = RemotePolicyConfig(
+        policy_type="pi05",
+        pretrained_name_or_path="dummy/pi05",
+        lerobot_features={},
+        actions_per_chunk=50,
+        protocol_version=2,
+        return_raw_actions=True,
+        rtc_enabled=True,
+        rtc_inference_delay=20,
+        rtc_execution_horizon=25,
+        rtc_max_guidance_weight=10.0,
+        rtc_prefix_attention_schedule=RTCAttentionSchedule.LINEAR,
+        rtc_cfg_beta=1.5,
+    )
+    policy_server._validate_client_rtc_contract(matching)
+
+    mismatched = replace(matching, rtc_execution_horizon=30)
+    with pytest.raises(ValueError, match="parameter mismatch.*rtc_execution_horizon"):
+        policy_server._validate_client_rtc_contract(mismatched)
 
 
 def test_time_action_chunk(policy_server):
@@ -161,6 +216,43 @@ def test_time_action_chunk(policy_server):
     ]
     for ta, expected_ts in zip(timed_actions, expected_timestamps, strict=True):
         assert abs(ta.get_timestamp() - expected_ts) < 1e-6
+
+
+def test_server_serializes_model_inference_across_rpc_threads(monkeypatch, policy_server):
+    active_calls = 0
+    max_active_calls = 0
+    counter_lock = threading.Lock()
+    start_barrier = threading.Barrier(3)
+
+    def fake_predict(_observation):
+        nonlocal active_calls, max_active_calls
+        with counter_lock:
+            active_calls += 1
+            max_active_calls = max(max_active_calls, active_calls)
+        time.sleep(0.03)
+        with counter_lock:
+            active_calls -= 1
+        return []
+
+    monkeypatch.setattr(policy_server, "_predict_action_chunk", fake_predict)
+    context = type("Context", (), {"is_active": lambda self: True})()
+    generation = policy_server._server_generation
+
+    def run_inference(timestep):
+        start_barrier.wait()
+        policy_server._run_serialized_inference(
+            _make_obs(torch.zeros(6), timestep=timestep), generation, context
+        )
+
+    threads = [threading.Thread(target=run_inference, args=(index,)) for index in (1, 2)]
+    for thread in threads:
+        thread.start()
+    start_barrier.wait()
+    for thread in threads:
+        thread.join(timeout=2)
+
+    assert all(not thread.is_alive() for thread in threads)
+    assert max_active_calls == 1
 
 
 def test_maybe_enqueue_observation_must_go(policy_server):
@@ -357,3 +449,115 @@ def test_server_batched_cfg_shared_noise_raw_blend_and_profile(policy_server):
     assert torch.equal(chunks["cfg_raw"], expected_raw_cfg)
     assert torch.equal(chunks["cfg_processed"], expected_raw_cfg.square())
     assert policy_server._acp_chunk_index == 1
+
+
+def test_server_rtc_cfg_v2_envelope_shares_leftover_and_runtime_inputs(policy_server):
+    from lerobot.async_inference.configs import ACPInferenceConfig, ACPRTCConfig
+    from lerobot.async_inference.helpers import (
+        RemoteActionChunk,
+        RTCInferenceMetadata,
+    )
+    from lerobot.configs.types import RTCAttentionSchedule
+
+    class _CoreModel:
+        rtc_processor = None
+
+    class _Config:
+        robot_type = "dummy_robot"
+        image_features = {}
+        chunk_size = 4
+        max_action_dim = 2
+        rtc_config = None
+
+    class _BatchedRTCPolicy:
+        def __init__(self):
+            self.config = _Config()
+            self.model = _CoreModel()
+            self.rtc_processor = None
+            self.calls = []
+
+        def init_rtc_processor(self):
+            from lerobot.policies.rtc.modeling_rtc import RTCProcessor
+
+            self.rtc_processor = RTCProcessor(self.config.rtc_config)
+            self.model.rtc_processor = self.rtc_processor
+
+        def predict_action_chunk(self, observation, noise=None, **kwargs):
+            self.calls.append((observation, noise.detach().clone(), kwargs))
+            uncond = torch.arange(1, 9, dtype=torch.float32).reshape(1, 4, 2)
+            cond = uncond + 4.0
+            return torch.cat((uncond, cond), dim=0)
+
+    class _Preprocessor:
+        def __call__(self, observation):
+            return observation
+
+    class _Postprocessor:
+        def __init__(self):
+            self.inputs = []
+
+        def __call__(self, action):
+            self.inputs.append(action.detach().clone())
+            return action.square()
+
+    policy_server.config.acp_inference = ACPInferenceConfig(
+        enable=True,
+        use_cfg=True,
+        batched_cfg=True,
+        cfg_beta=1.5,
+        rtc=ACPRTCConfig(
+            enabled=True,
+            inference_delay=1,
+            execution_horizon=3,
+            max_guidance_weight=10.0,
+            prefix_attention_schedule=RTCAttentionSchedule.LINEAR,
+        ),
+    )
+    policy_server.policy_type = "pi05"
+    policy_server.actions_per_chunk = 4
+    policy_server.policy = _BatchedRTCPolicy()
+    policy_server.preprocessor = _Preprocessor()
+    policy_server.postprocessor = _Postprocessor()
+    policy_server._client_protocol_version = 2
+    policy_server._client_return_raw_actions = True
+    policy_server._client_rtc_enabled = True
+    policy_server._configure_policy_rtc()
+
+    assert policy_server.policy.config.rtc_config.enabled is True
+    assert policy_server.policy.rtc_processor is policy_server.policy.model.rtc_processor
+
+    leftover = torch.tensor([[0.1, 0.2], [0.3, 0.4], [0.5, 0.6]])
+    observation = _make_obs(torch.zeros(6), timestep=12)
+    observation.observation["task"] = "Pick and place"
+    observation.rtc_metadata = RTCInferenceMetadata(
+        request_id="request-12",
+        prev_chunk_left_over=leftover,
+    )
+
+    response = policy_server._predict_action_chunk(observation)
+
+    assert isinstance(response, RemoteActionChunk)
+    assert response.request_id == "request-12"
+    assert response.observation_timestep == 12
+    assert response.rtc_enabled is True
+    assert response.inference_delay == 1
+    assert response.execution_horizon == 3
+
+    assert len(policy_server.policy.calls) == 1
+    model_input, shared_noise, rtc_kwargs = policy_server.policy.calls[0]
+    assert model_input[OBS_STATE].shape == (2, 6)
+    assert shared_noise.shape == (2, 4, 2)
+    assert torch.equal(shared_noise[0], shared_noise[1])
+    assert rtc_kwargs["prev_chunk_left_over"].shape == (2, 3, 2)
+    assert torch.equal(rtc_kwargs["prev_chunk_left_over"][0], leftover)
+    assert torch.equal(
+        rtc_kwargs["prev_chunk_left_over"][0], rtc_kwargs["prev_chunk_left_over"][1]
+    )
+    assert rtc_kwargs["inference_delay"] == 1
+    assert rtc_kwargs["execution_horizon"] == 3
+
+    expected_raw = torch.arange(7, 15, dtype=torch.float32).reshape(4, 2)
+    torch.testing.assert_close(response.raw_actions, expected_raw)
+    assert len(policy_server.postprocessor.inputs) == 1
+    torch.testing.assert_close(policy_server.postprocessor.inputs[0], expected_raw.unsqueeze(0))
+    torch.testing.assert_close(response.actions[0].get_action(), expected_raw[0].square())

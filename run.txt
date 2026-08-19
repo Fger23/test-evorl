@@ -208,11 +208,12 @@ python -m lerobot.async_inference.policy_server \
   --acp_inference.use_cfg=true \
   --acp_inference.batched_cfg=true \
   --acp_inference.cfg_beta=1.5 \
-  --acp_inference.profile=true \
-  --acp_inference.profile_output_dir=outputs/acp_inference_profile \
-  --acp_inference.profile_run_name=h200_trial_01 \
-  --acp_inference.profile_warmup_chunks=3 \
-  --acp_inference.profile_save_chunks=false
+  --acp_inference.rtc.enabled=true \
+  --acp_inference.rtc.inference_delay=20 \
+  --acp_inference.rtc.execution_horizon=25 \
+  --acp_inference.rtc.max_guidance_weight=10 \
+  --acp_inference.rtc.prefix_attention_schedule=LINEAR \
+  --acp_inference.profile=false
 
 # 7.真机端启动人在环采集
 lerobot-human-inloop-record \
@@ -230,4 +231,12 @@ lerobot-human-inloop-record \
 --remote_policy.policy_device=cuda:0 \
 --remote_policy.client_device=cpu \
 --remote_policy.actions_per_chunk=50 \
---remote_policy.chunk_size_threshold=0.5
+--remote_policy.chunk_size_threshold=0.5 \
+--remote_policy.obs_queue_timeout_s=5 \
+--remote_policy.aggregate_fn_name=latest_only \
+--remote_policy.rtc_enable=true \
+--remote_policy.rtc_inference_delay=20 \
+--remote_policy.rtc_execution_horizon=25 \
+--remote_policy.rtc_max_guidance_weight=10 \
+--remote_policy.rtc_prefix_attention_schedule=LINEAR \
+--remote_policy.rtc_cfg_beta=1.5

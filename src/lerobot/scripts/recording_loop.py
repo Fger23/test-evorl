@@ -420,6 +420,12 @@ def record_loop(
                 lambda robot_action_to_send=robot_action_to_send: robot.send_action(robot_action_to_send),
             )
 
+        # RTC's real inference delay is the number of policy actions that were
+        # successfully sent while a chunk request was running. Confirm only
+        # after send_action returns; a queue pop alone is not robot execution.
+        if remote_policy_client is not None and selected_from_policy:
+            remote_policy_client.mark_action_executed()
+
         # Write to dataset
         if dataset is not None:
             action_frame = build_dataset_frame(dataset.features, action_values, prefix=ACTION)

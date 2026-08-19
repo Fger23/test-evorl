@@ -18,6 +18,7 @@ from dataclasses import dataclass, field
 
 import torch
 
+from lerobot.configs.types import RTCAttentionSchedule
 from lerobot.robots.config import RobotConfig
 
 from .constants import (
@@ -44,6 +45,47 @@ def get_aggregate_function(name: str) -> Callable[[torch.Tensor, torch.Tensor], 
 
 
 @dataclass
+class ACPRTCConfig:
+    """Runtime RTC settings for server-side Pi0.5 ACP-CFG inference."""
+
+    enabled: bool = False
+    inference_delay: int = 20
+    execution_horizon: int = 25
+    max_guidance_weight: float = 10.0
+    prefix_attention_schedule: RTCAttentionSchedule = RTCAttentionSchedule.LINEAR
+
+    def __post_init__(self) -> None:
+        if isinstance(self.prefix_attention_schedule, str):
+            try:
+                self.prefix_attention_schedule = RTCAttentionSchedule(
+                    self.prefix_attention_schedule.upper()
+                )
+            except ValueError as exc:
+                choices = ", ".join(schedule.value for schedule in RTCAttentionSchedule)
+                raise ValueError(
+                    f"`acp_inference.rtc.prefix_attention_schedule` must be one of: {choices}."
+                ) from exc
+
+        if (
+            not isinstance(self.inference_delay, int)
+            or isinstance(self.inference_delay, bool)
+            or self.inference_delay < 0
+        ):
+            raise ValueError("`acp_inference.rtc.inference_delay` must be a non-negative integer.")
+        if (
+            not isinstance(self.execution_horizon, int)
+            or isinstance(self.execution_horizon, bool)
+            or self.execution_horizon <= self.inference_delay
+        ):
+            raise ValueError(
+                "`acp_inference.rtc.execution_horizon` must be an integer greater than "
+                "`acp_inference.rtc.inference_delay`."
+            )
+        if not math.isfinite(self.max_guidance_weight) or self.max_guidance_weight <= 0:
+            raise ValueError("`acp_inference.rtc.max_guidance_weight` must be finite and > 0.")
+
+
+@dataclass
 class ACPInferenceConfig:
     """Server-side ACP-CFG inference and profiling configuration.
 
@@ -55,6 +97,7 @@ class ACPInferenceConfig:
     use_cfg: bool = False
     cfg_beta: float = 1.0
     batched_cfg: bool = False
+    rtc: ACPRTCConfig = field(default_factory=ACPRTCConfig)
     profile: bool = False
     profile_output_dir: str = "outputs/acp_inference_profile"
     profile_save_chunks: bool = False
@@ -62,12 +105,19 @@ class ACPInferenceConfig:
     profile_warmup_chunks: int = 3
 
     def __post_init__(self) -> None:
+        if isinstance(self.rtc, dict):
+            self.rtc = ACPRTCConfig(**self.rtc)
         if self.use_cfg and not self.enable:
             raise ValueError("`acp_inference.use_cfg=true` requires `acp_inference.enable=true`.")
         if self.batched_cfg and not self.use_cfg:
             raise ValueError("`acp_inference.batched_cfg=true` requires `acp_inference.use_cfg=true`.")
         if self.profile and not self.batched_cfg:
             raise ValueError("`acp_inference.profile=true` requires `acp_inference.batched_cfg=true`.")
+        if self.rtc.enabled and not (self.enable and self.use_cfg and self.batched_cfg):
+            raise ValueError(
+                "`acp_inference.rtc.enabled=true` requires ACP `enable=true`, "
+                "`use_cfg=true`, and `batched_cfg=true`."
+            )
         if not math.isfinite(self.cfg_beta) or self.cfg_beta < 0:
             raise ValueError("`acp_inference.cfg_beta` must be finite and >= 0.")
         if self.profile and not self.profile_output_dir.strip():
@@ -134,7 +184,11 @@ class PolicyServerConfig:
         values = dict(config_dict)
         acp_inference = values.get("acp_inference")
         if isinstance(acp_inference, dict):
-            values["acp_inference"] = ACPInferenceConfig(**acp_inference)
+            acp_values = dict(acp_inference)
+            rtc = acp_values.get("rtc")
+            if isinstance(rtc, dict):
+                acp_values["rtc"] = ACPRTCConfig(**rtc)
+            values["acp_inference"] = ACPInferenceConfig(**acp_values)
         values.pop("environment_dt", None)
         return cls(**values)
 
@@ -157,6 +211,15 @@ class PolicyServerConfig:
                 "use_cfg": self.acp_inference.use_cfg,
                 "cfg_beta": self.acp_inference.cfg_beta,
                 "batched_cfg": self.acp_inference.batched_cfg,
+                "rtc": {
+                    "enabled": self.acp_inference.rtc.enabled,
+                    "inference_delay": self.acp_inference.rtc.inference_delay,
+                    "execution_horizon": self.acp_inference.rtc.execution_horizon,
+                    "max_guidance_weight": self.acp_inference.rtc.max_guidance_weight,
+                    "prefix_attention_schedule": (
+                        self.acp_inference.rtc.prefix_attention_schedule.value
+                    ),
+                },
                 "profile": self.acp_inference.profile,
                 "profile_output_dir": self.acp_inference.profile_output_dir,
                 "profile_save_chunks": self.acp_inference.profile_save_chunks,
