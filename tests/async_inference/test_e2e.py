@@ -43,7 +43,7 @@ pytest.importorskip("grpc")
 # -----------------------------------------------------------------------------
 
 
-def test_async_inference_e2e(monkeypatch):
+def test_async_inference_e2e(monkeypatch, tmp_path):
     """Tests the full asynchronous inference pipeline."""
     # Import grpc-dependent modules inside the test function
     import grpc

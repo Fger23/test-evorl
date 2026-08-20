@@ -199,3 +199,27 @@ def test_trace_write_failure_does_not_escape_into_control_path(tmp_path, caplog)
     trace.close()
 
     assert "robot control will continue" in caplog.text
+
+
+def test_trace_serialization_failure_drops_only_bad_event(tmp_path, monkeypatch, caplog):
+    trace = RTCTraceLogger(role="client", output_dir=tmp_path)
+    original_serialize = trace._serialize_record
+    calls = 0
+
+    def fail_once(event, fields):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise TypeError("bad diagnostics field")
+        return original_serialize(event, fields)
+
+    monkeypatch.setattr(trace, "_serialize_record", fail_once)
+    trace.record("bad")
+    trace.record("good", request_id="still-recorded")
+    status = trace.close()
+
+    records = _read_records(trace.path)
+    assert [record["event"] for record in records] == ["good"]
+    assert status["serialization_errors"] == 1
+    assert status["disabled"] is False
+    assert "later events will still be recorded" in caplog.text

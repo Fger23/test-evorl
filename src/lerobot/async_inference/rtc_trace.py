@@ -107,7 +107,11 @@ class RTCTraceLogger:
         self._closed = False
         self._disabled = False
         self._failure_reported = False
+        self._serialization_failure_reported = False
         self._dropped_events = 0
+        self._total_dropped_events = 0
+        self._serialization_errors = 0
+        self._lost_events_after_writer_failure = 0
         self._queue: Queue[str] = Queue(maxsize=queue_capacity)
         self._close_complete = threading.Event()
 
@@ -148,19 +152,35 @@ class RTCTraceLogger:
 
     def record(self, event: str, **fields: Any) -> None:
         """Enqueue one event without waiting for filesystem I/O."""
+        with self._state_lock:
+            if self._closed or self._disabled:
+                return
         try:
             line = self._serialize_record(event, fields)
-            with self._state_lock:
-                if self._closed or self._disabled:
-                    return
-                try:
-                    self._queue.put_nowait(line)
-                except Full:
-                    # Never block robot control on diagnostics. The writer emits
-                    # a marker with this count after it catches up.
-                    self._dropped_events += 1
         except Exception:
-            self._report_failure()
+            # A malformed diagnostic field must not permanently disable all
+            # later traces. Only writer/filesystem failures disable persistence.
+            with self._state_lock:
+                self._serialization_errors += 1
+                report_failure = not self._serialization_failure_reported
+                self._serialization_failure_reported = True
+            if report_failure:
+                logging.getLogger(__name__).warning(
+                    "Could not serialize one RTC trace event; later events will still be recorded.",
+                    exc_info=True,
+                )
+            return
+
+        with self._state_lock:
+            if self._closed or self._disabled:
+                return
+            try:
+                self._queue.put_nowait(line)
+            except Full:
+                # Never block robot control on diagnostics. The writer emits
+                # a marker with this count after it catches up.
+                self._dropped_events += 1
+                self._total_dropped_events += 1
 
     def _take_dropped_events(self) -> int:
         with self._state_lock:
@@ -211,6 +231,8 @@ class RTCTraceLogger:
                 finally:
                     self._queue.task_done()
         except Exception:
+            with self._state_lock:
+                self._lost_events_after_writer_failure += self._queue.qsize()
             self._report_failure()
         finally:
             try:
@@ -232,7 +254,22 @@ class RTCTraceLogger:
             exc_info=True,
         )
 
-    def close(self, timeout_s: float = 2.0) -> None:
+    @property
+    def status(self) -> dict[str, Any]:
+        """Return a best-effort diagnostics snapshot without touching disk."""
+        with self._state_lock:
+            return {
+                "closed": self._closed,
+                "disabled": self._disabled,
+                "pending_events": self._queue.qsize(),
+                "unreported_dropped_events": self._dropped_events,
+                "dropped_events": self._total_dropped_events,
+                "serialization_errors": self._serialization_errors,
+                "lost_events_after_writer_failure": self._lost_events_after_writer_failure,
+                "writer_alive": self._writer_thread.is_alive(),
+            }
+
+    def close(self, timeout_s: float = 2.0) -> dict[str, Any]:
         """Request a drain and wait briefly without risking an unbounded stop."""
         with self._state_lock:
             self._closed = True
@@ -241,6 +278,9 @@ class RTCTraceLogger:
             logging.getLogger(__name__).warning(
                 "RTC trace writer did not drain within %.2fs; shutdown will continue.", timeout_s
             )
+        else:
+            self._writer_thread.join(timeout=0)
+        return self.status
 
 
 def create_rtc_trace(role: str, output_dir: str | Path) -> RTCTraceLogger | None:

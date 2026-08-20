@@ -163,6 +163,29 @@ class _InferenceRequest:
     queue_size_at_submit: int
     submitted_at_wall_s: float
     submitted_at_monotonic_s: float
+    observation_snapshot_ms: float
+
+
+@dataclass(frozen=True)
+class _SendObservationMetrics:
+    """Client-side request serialization and upload timings."""
+
+    serialize_ms: float
+    payload_bytes: int
+    chunk_count: int
+    rpc_ms: float
+    total_ms: float
+
+
+@dataclass(frozen=True)
+class _ReceiveActionsMetrics:
+    """Client-side response download and deserialization timings."""
+
+    rpc_ms: float
+    deserialize_ms: float
+    payload_bytes: int
+    poll_count: int
+    total_ms: float
 
 
 class RemotePolicyActionClient:
@@ -227,6 +250,7 @@ class RemotePolicyActionClient:
         self._session_id = uuid.uuid4().hex
         self._executed_steps = 0
         self._awaiting_execution_confirmation = False
+        self._last_get_action_metrics: dict[str, Any] | None = None
         self._started = False
         self._rtc_trace = (
             create_rtc_trace(role="client", output_dir=cfg.rtc_trace_output_dir)
@@ -249,6 +273,43 @@ class RemotePolicyActionClient:
         trace = getattr(self, "_rtc_trace", None)
         if trace is not None:
             trace.record(event, **fields)
+
+    def record_control_loop_metrics(self, *, timestep: int, **metrics: Any) -> None:
+        """Append one low-overhead control-loop sample to the async RTC trace.
+
+        This method deliberately performs no filesystem I/O. The trace's
+        bounded writer queue keeps a slow or unavailable disk out of the 30 Hz
+        robot-control path.
+        """
+        with self._state_lock:
+            queue_size = self._safe_queue_size()
+            executed_steps = self._executed_steps
+            episode_epoch = self._episode_epoch
+            active_request_id = self._active_rpc_request_id or self._in_flight_request_id
+            active_rpc_stage = self._active_rpc_stage
+            has_pending_result = self._pending_result is not None
+            last_get_action_metrics = self._last_get_action_metrics
+
+        remote_get_action_fields: dict[str, Any] = {}
+        if last_get_action_metrics is not None and last_get_action_metrics.get("timestep") == timestep:
+            remote_get_action_fields = {
+                "remote_get_action_ms": last_get_action_metrics.get("total_ms"),
+                "remote_queue_wait_ms": last_get_action_metrics.get("queue_wait_ms"),
+                "queue_size_after_pop": last_get_action_metrics.get("queue_size_after_pop"),
+            }
+        self._trace_event(
+            "control_loop_step",
+            session_id=self._session_id,
+            episode_epoch=episode_epoch,
+            observation_timestep=timestep,
+            queue_size=queue_size,
+            executed_steps=executed_steps,
+            active_request_id=active_request_id,
+            active_rpc_stage=active_rpc_stage,
+            has_pending_result=has_pending_result,
+            **remote_get_action_fields,
+            **metrics,
+        )
 
     def _safe_queue_size(self) -> int | None:
         """Best-effort queue snapshot used only for diagnostics."""
@@ -429,6 +490,7 @@ class RemotePolicyActionClient:
             self._active_rpc_stage = None
             self._executed_steps = 0
             self._awaiting_execution_confirmation = False
+            self._last_get_action_metrics = None
             self.latest_action_timestep = -1
             self.latest_action = None
             if self.cfg.rtc_enable:
@@ -540,10 +602,13 @@ class RemotePolicyActionClient:
             request_id = f"{self._session_id}:{self._episode_epoch}:{self._request_sequence}"
             submitted_at_wall_s = time.time()
             submitted_at_monotonic_s = time.perf_counter()
+            snapshot_started = time.perf_counter()
+            observation_snapshot = copy.deepcopy(observation)
+            observation_snapshot_ms = (time.perf_counter() - snapshot_started) * 1000
             request = _InferenceRequest(
                 request_id=request_id,
                 episode_epoch=self._episode_epoch,
-                observation=copy.deepcopy(observation),
+                observation=observation_snapshot,
                 task=task,
                 timestep=max(timestep, 0),
                 left_over=left_over,
@@ -551,6 +616,7 @@ class RemotePolicyActionClient:
                 queue_size_at_submit=queue_size,
                 submitted_at_wall_s=submitted_at_wall_s,
                 submitted_at_monotonic_s=submitted_at_monotonic_s,
+                observation_snapshot_ms=observation_snapshot_ms,
             )
             self._in_flight_request_id = request_id
             self._worker_error = None
@@ -566,6 +632,7 @@ class RemotePolicyActionClient:
                 leftover_steps=0 if request.left_over is None else int(request.left_over.shape[0]),
                 leftover=tensor_metadata(request.left_over),
                 executed_steps_at_submit=request.executed_steps_at_submit,
+                observation_snapshot_ms=request.observation_snapshot_ms,
                 estimated_inference_delay=self.cfg.rtc_inference_delay,
                 execution_horizon=self.cfg.rtc_execution_horizon,
             )
@@ -667,10 +734,11 @@ class RemotePolicyActionClient:
                     self._active_rpc_request_id = None
                     self._active_rpc_stage = None
 
-    def _send_observation(self, request: _InferenceRequest) -> None:
+    def _send_observation(self, request: _InferenceRequest) -> _SendObservationMetrics:
         from lerobot.async_inference.helpers import RTCInferenceMetadata, TimedObservation
-        from lerobot.transport.utils import send_bytes_in_chunks
+        from lerobot.transport.utils import CHUNK_SIZE, send_bytes_in_chunks
 
+        total_started = time.perf_counter()
         raw_observation = dict(request.observation)
         if request.task is not None:
             raw_observation["task"] = request.task
@@ -691,12 +759,28 @@ class RemotePolicyActionClient:
                 else None
             ),
         )
+        serialize_started = time.perf_counter()
+        serialized_observation = pickle.dumps(timed_observation)
+        serialize_ms = (time.perf_counter() - serialize_started) * 1000
+        payload_bytes = len(serialized_observation)
+        chunk_count = (payload_bytes + CHUNK_SIZE - 1) // CHUNK_SIZE
+        self._trace_event(
+            "observation_serialized",
+            session_id=self._session_id,
+            request_id=request.request_id,
+            episode_epoch=request.episode_epoch,
+            observation_timestep=request.timestep,
+            observation_serialize_ms=serialize_ms,
+            request_payload_bytes=payload_bytes,
+            request_chunk_count=chunk_count,
+        )
         observation_iterator = send_bytes_in_chunks(
-            pickle.dumps(timed_observation),
+            serialized_observation,
             self.services_pb2.Observation,
             log_prefix="[RECORD_REMOTE_POLICY] Observation",
             silent=True,
         )
+        rpc_started = time.perf_counter()
         self._run_cancellable_rpc(
             request,
             self.stub.SendObservations,
@@ -704,13 +788,39 @@ class RemotePolicyActionClient:
             timeout=self.cfg.obs_queue_timeout_s if self.cfg.obs_queue_timeout_s > 0 else None,
             stage="send_observation",
         )
+        rpc_ms = (time.perf_counter() - rpc_started) * 1000
+        metrics = _SendObservationMetrics(
+            serialize_ms=serialize_ms,
+            payload_bytes=payload_bytes,
+            chunk_count=chunk_count,
+            rpc_ms=rpc_ms,
+            total_ms=(time.perf_counter() - total_started) * 1000,
+        )
+        self._trace_event(
+            "observation_sent",
+            session_id=self._session_id,
+            request_id=request.request_id,
+            episode_epoch=request.episode_epoch,
+            observation_timestep=request.timestep,
+            observation_snapshot_ms=request.observation_snapshot_ms,
+            observation_serialize_ms=metrics.serialize_ms,
+            request_payload_bytes=metrics.payload_bytes,
+            request_chunk_count=metrics.chunk_count,
+            observation_upload_rpc_ms=metrics.rpc_ms,
+            send_total_ms=metrics.total_ms,
+        )
+        return metrics
 
-    def _receive_actions(self, request: _InferenceRequest) -> Any:
+    def _receive_actions(self, request: _InferenceRequest) -> tuple[Any, _ReceiveActionsMetrics]:
+        total_started = time.perf_counter()
         deadline_t = time.perf_counter() + self.cfg.obs_queue_timeout_s
+        rpc_ms = 0.0
+        poll_count = 0
         while not self._stop_event.is_set():
             remaining = deadline_t - time.perf_counter()
             if self.cfg.obs_queue_timeout_s > 0 and remaining <= 0:
                 raise TimeoutError("Timed out waiting for remote policy actions.")
+            rpc_started = time.perf_counter()
             actions_chunk = self._run_cancellable_rpc(
                 request,
                 self.stub.GetActions,
@@ -718,8 +828,33 @@ class RemotePolicyActionClient:
                 timeout=remaining if self.cfg.obs_queue_timeout_s > 0 else None,
                 stage="get_actions",
             )
+            rpc_ms += (time.perf_counter() - rpc_started) * 1000
+            poll_count += 1
             if actions_chunk.data:
-                return pickle.loads(actions_chunk.data)  # nosec
+                payload_bytes = len(actions_chunk.data)
+                deserialize_started = time.perf_counter()
+                response = pickle.loads(actions_chunk.data)  # nosec
+                deserialize_ms = (time.perf_counter() - deserialize_started) * 1000
+                metrics = _ReceiveActionsMetrics(
+                    rpc_ms=rpc_ms,
+                    deserialize_ms=deserialize_ms,
+                    payload_bytes=payload_bytes,
+                    poll_count=poll_count,
+                    total_ms=(time.perf_counter() - total_started) * 1000,
+                )
+                self._trace_event(
+                    "action_response_deserialized",
+                    session_id=self._session_id,
+                    request_id=request.request_id,
+                    episode_epoch=request.episode_epoch,
+                    observation_timestep=request.timestep,
+                    get_actions_rpc_ms=metrics.rpc_ms,
+                    response_deserialize_ms=metrics.deserialize_ms,
+                    response_payload_bytes=metrics.payload_bytes,
+                    get_actions_poll_count=metrics.poll_count,
+                    receive_total_ms=metrics.total_ms,
+                )
+                return response, metrics
 
             if self.cfg.obs_queue_timeout_s == 0 or time.perf_counter() >= deadline_t:
                 raise TimeoutError("Timed out waiting for remote policy actions.")
@@ -736,12 +871,8 @@ class RemotePolicyActionClient:
                 try:
                     if request is None:
                         return
-                    send_start = time.perf_counter()
-                    self._send_observation(request)
-                    send_ms = (time.perf_counter() - send_start) * 1000
-                    receive_start = time.perf_counter()
-                    response = self._receive_actions(request)
-                    receive_ms = (time.perf_counter() - receive_start) * 1000
+                    send_metrics = self._send_observation(request)
+                    response, receive_metrics = self._receive_actions(request)
                     response_request_id = getattr(response, "request_id", None)
                     raw_actions = getattr(response, "raw_actions", None)
                     response_steps = (
@@ -768,8 +899,28 @@ class RemotePolicyActionClient:
                             episode_epoch=request.episode_epoch,
                             current_epoch=current_epoch,
                             observation_timestep=request.timestep,
-                            send_rpc_ms=send_ms,
-                            receive_rpc_ms=receive_ms,
+                            observation_snapshot_ms=request.observation_snapshot_ms,
+                            observation_serialize_ms=send_metrics.serialize_ms,
+                            request_payload_bytes=send_metrics.payload_bytes,
+                            request_chunk_count=send_metrics.chunk_count,
+                            # Preserve the historical aggregate fields so old
+                            # analysis scripts keep working. The explicitly
+                            # named fields below contain pure RPC durations.
+                            send_rpc_ms=send_metrics.total_ms,
+                            send_total_ms=send_metrics.total_ms,
+                            observation_upload_rpc_ms=send_metrics.rpc_ms,
+                            receive_rpc_ms=receive_metrics.total_ms,
+                            get_actions_rpc_ms=receive_metrics.rpc_ms,
+                            response_deserialize_ms=receive_metrics.deserialize_ms,
+                            response_payload_bytes=receive_metrics.payload_bytes,
+                            get_actions_poll_count=receive_metrics.poll_count,
+                            receive_total_ms=receive_metrics.total_ms,
+                            latency_field_semantics={
+                                "send_rpc_ms": "legacy observation serialization + upload RPC total",
+                                "receive_rpc_ms": "legacy GetActions RPC + response deserialization total",
+                                "observation_upload_rpc_ms": "pure SendObservations RPC",
+                                "get_actions_rpc_ms": "pure GetActions RPC, summed across polls",
+                            },
                             end_to_end_ms=(time.perf_counter() - request.submitted_at_monotonic_s) * 1000,
                             response_steps=response_steps,
                             raw_actions=tensor_metadata(raw_actions),
@@ -1097,6 +1248,8 @@ class RemotePolicyActionClient:
                 "after robot.send_action succeeds."
             )
 
+        get_action_started = time.perf_counter()
+        queue_wait_ms = 0.0
         wait_timeout = max(self.cfg.obs_queue_timeout_s + 1.0, 1.0)
         deadline = time.perf_counter() + wait_timeout
         while True:
@@ -1106,7 +1259,15 @@ class RemotePolicyActionClient:
 
             action_tensor = self._pop_action()
             if action_tensor is not None:
-                return self._tensor_to_action(action_tensor)
+                action = self._tensor_to_action(action_tensor)
+                with self._state_lock:
+                    self._last_get_action_metrics = {
+                        "timestep": timestep,
+                        "total_ms": (time.perf_counter() - get_action_started) * 1000,
+                        "queue_wait_ms": queue_wait_ms,
+                        "queue_size_after_pop": self._safe_queue_size(),
+                    }
+                return action
 
             remaining = deadline - time.perf_counter()
             if remaining <= 0:
@@ -1133,4 +1294,6 @@ class RemotePolicyActionClient:
                 raise TimeoutError(
                     "Remote RTC action queue underrun: no fresh action arrived before the safety timeout."
                 )
+            wait_started = time.perf_counter()
             self._pending_event.wait(timeout=min(remaining, 0.05))
+            queue_wait_ms += (time.perf_counter() - wait_started) * 1000

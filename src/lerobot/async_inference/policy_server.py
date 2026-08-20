@@ -105,7 +105,13 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         self.preprocessor: PolicyProcessorPipeline[dict[str, Any], dict[str, Any]] | None = None
         self.postprocessor: PolicyProcessorPipeline[PolicyAction, PolicyAction] | None = None
         self.acp_profiler: Any | None = None
+        self._pending_profiler_shutdowns: list[Any] = []
+        self._acp_profile_disabled = False
+        self._acp_profile_last_dropped = 0
+        self._acp_profile_last_error: str | None = None
         self._acp_chunk_index = 0
+        self._stop_lock = threading.Lock()
+        self._stopped = False
         self._client_protocol_version = 1
         self._client_return_raw_actions = False
         self._client_rtc_enabled = False
@@ -157,7 +163,8 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         )
 
     def _cuda_timing_enabled(self, device: torch.device) -> bool:
-        return device.type == "cuda" and (self.acp_profiler is not None or self._rtc_trace is not None)
+        profiling_active = self.acp_profiler is not None and not self._acp_profile_disabled
+        return device.type == "cuda" and (profiling_active or self._rtc_trace is not None)
 
     def _trace_event(self, event: str, **fields: Any) -> None:
         trace = getattr(self, "_rtc_trace", None)
@@ -280,7 +287,15 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         its warm-up counter intentionally survive across episodes. A new policy
         instruction reload starts a new in-process warm-up sequence.
         """
+        previous_profiler = self.acp_profiler
+        if previous_profiler is not None and not self._close_acp_profiler_instance(
+            previous_profiler, reason="policy_reconfigured"
+        ):
+            self._pending_profiler_shutdowns.append(previous_profiler)
         self.acp_profiler = None
+        self._acp_profile_disabled = False
+        self._acp_profile_last_dropped = 0
+        self._acp_profile_last_error = None
         self._acp_chunk_index = 0
         if not self.batched_cfg_enabled:
             return
@@ -306,6 +321,48 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
             acp.profile,
             self.acp_profiler.output_dir if self.acp_profiler is not None else "disabled",
         )
+
+    def _close_acp_profiler_instance(
+        self,
+        profiler: Any,
+        *,
+        reason: str,
+        timeout_s: float = 5.0,
+    ) -> bool:
+        """Best-effort bounded profiler drain that never breaks policy service."""
+        completed = False
+        close_error: str | None = None
+        try:
+            close = getattr(profiler, "close", None)
+            completed = bool(close(timeout_s=timeout_s)) if callable(close) else True
+        except Exception as exc:
+            close_error = f"{type(exc).__name__}: {exc}"
+            self.logger.warning("Could not close ACP profiler cleanly: %s", close_error)
+
+        status = getattr(profiler, "status", None)
+        status = status if isinstance(status, dict) else {}
+        self._trace_event(
+            "acp_profiler_closed",
+            reason=reason,
+            close_returned=completed,
+            close_error=close_error,
+            **status,
+        )
+        if not completed:
+            self.logger.warning(
+                "ACP profiler did not drain within %.1fs; server shutdown/reconfiguration will continue.",
+                timeout_s,
+            )
+        return completed
+
+    def _close_all_acp_profilers(self, *, reason: str) -> None:
+        profilers = [*self._pending_profiler_shutdowns]
+        self._pending_profiler_shutdowns.clear()
+        if self.acp_profiler is not None:
+            profilers.append(self.acp_profiler)
+            self.acp_profiler = None
+        for profiler in profilers:
+            self._close_acp_profiler_instance(profiler, reason=reason)
 
     def _reset_server(self, *, reason: str = "internal", peer: str | None = None) -> None:
         """Flushes server state when new client connects."""
@@ -468,23 +525,34 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
 
     def SendObservations(self, request_iterator, context):  # noqa: N802
         """Receive observations from the robot client"""
+        handler_starts = time.perf_counter()
+        handler_started_wall_s = time.time()
         client_id = context.peer()
         self.logger.debug(f"Receiving observations from {client_id}")
         with self._generation_lock:
             receive_generation = self._server_generation
 
-        receive_time = time.time()  # comparing timestamps so need time.time()
-        start_deserialize = time.perf_counter()
+        stream_receive_starts = time.perf_counter()
         received_bytes = receive_bytes_in_chunks(
             request_iterator, None, self.shutdown_event, self.logger
         )  # blocking call while looping over request_iterator
+        stream_receive_stops = time.perf_counter()
+        payload_received_wall_s = time.time()
+
+        pickle_deserialize_starts = time.perf_counter()
         timed_observation = pickle.loads(received_bytes)  # nosec
-        deserialize_time = time.perf_counter() - start_deserialize
+        pickle_deserialize_stops = time.perf_counter()
+
+        stream_receive_ms = (stream_receive_stops - stream_receive_starts) * 1000
+        pickle_deserialize_ms = (pickle_deserialize_stops - pickle_deserialize_starts) * 1000
+        receive_and_deserialize_ms = (pickle_deserialize_stops - stream_receive_starts) * 1000
 
         self.logger.debug(f"Received observation #{timed_observation.get_timestep()}")
 
         obs_timestep = timed_observation.get_timestep()
         obs_timestamp = timed_observation.get_timestamp()
+        observation_to_handler_start_wall_ms = (handler_started_wall_s - obs_timestamp) * 1000
+        observation_to_payload_received_wall_ms = (payload_received_wall_s - obs_timestamp) * 1000
         request_id = self._request_id(timed_observation)
         rtc_metadata = getattr(timed_observation, "rtc_metadata", None)
         leftover = (
@@ -503,8 +571,25 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
             observation_timestep=obs_timestep,
             must_go=timed_observation.must_go,
             payload_bytes=len(received_bytes),
-            deserialize_ms=deserialize_time * 1000,
-            client_to_server_wall_ms=(receive_time - obs_timestamp) * 1000,
+            request_payload_bytes=len(received_bytes),
+            stream_receive_ms=stream_receive_ms,
+            pickle_deserialize_ms=pickle_deserialize_ms,
+            receive_and_deserialize_ms=receive_and_deserialize_ms,
+            handler_decode_ready_ms=(pickle_deserialize_stops - handler_starts) * 1000,
+            server_handler_started_wall_s=handler_started_wall_s,
+            server_payload_received_wall_s=payload_received_wall_s,
+            observation_timestamp_to_server_handler_start_wall_ms=observation_to_handler_start_wall_ms,
+            observation_timestamp_to_server_payload_received_wall_ms=(
+                observation_to_payload_received_wall_ms
+            ),
+            cross_host_wall_clock_metrics_require_synchronized_clocks=True,
+            # Compatibility aliases for existing trace consumers. Historically
+            # ``deserialize_ms`` included stream reception, while
+            # ``client_to_server_wall_ms`` ended at server handler entry.
+            deserialize_ms=receive_and_deserialize_ms,
+            deserialize_ms_semantics="legacy_stream_receive_plus_pickle_deserialize",
+            client_to_server_wall_ms=observation_to_handler_start_wall_ms,
+            client_to_server_wall_ms_semantics="legacy_client_timestamp_to_server_handler_start",
             leftover_steps=(
                 int(leftover.shape[0])
                 if isinstance(leftover, torch.Tensor) and leftover.ndim >= 1
@@ -528,13 +613,14 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
             f"Received observation #{obs_timestep} | "
             f"Avg FPS: {fps_metrics['avg_fps']:.2f} | "  # fps at which observations are received from client
             f"Target: {fps_metrics['target_fps']:.2f} | "
-            f"One-way latency: {(receive_time - obs_timestamp) * 1000:.2f}ms"
+            f"Client timestamp to handler start: {observation_to_handler_start_wall_ms:.2f}ms"
         )
 
         self.logger.debug(
-            f"Server timestamp: {receive_time:.6f} | "
+            f"Server handler-start timestamp: {handler_started_wall_s:.6f} | "
             f"Client timestamp: {obs_timestamp:.6f} | "
-            f"Deserialization time: {deserialize_time:.6f}s"
+            f"Stream receive time: {stream_receive_ms / 1000:.6f}s | "
+            f"Pickle deserialization time: {pickle_deserialize_ms / 1000:.6f}s"
         )
 
         with self._generation_lock:
@@ -551,19 +637,30 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
                 current_generation=current_generation,
                 context_active=context_active,
                 observation_timestep=obs_timestep,
+                handler_elapsed_ms=(time.perf_counter() - handler_starts) * 1000,
+                observation_queue_size=self.observation_queue.qsize(),
             )
             return services_pb2.Empty()
 
+        observation_queue_size_before = self.observation_queue.qsize()
+        enqueue_starts = time.perf_counter()
         accepted = self._enqueue_observation(
             timed_observation  # wrapping a RawObservation
         )
+        enqueue_ms = (time.perf_counter() - enqueue_starts) * 1000
+        observation_queue_size_after = self.observation_queue.qsize()
         self._trace_event(
             "observation_enqueued",
             request_id=request_id,
             observation_timestep=obs_timestep,
             generation=current_generation,
             accepted=accepted,
-            observation_queue_size=self.observation_queue.qsize(),
+            enqueue_ms=enqueue_ms,
+            handler_elapsed_ms=(time.perf_counter() - handler_starts) * 1000,
+            observation_queue_size_before=observation_queue_size_before,
+            observation_queue_size_after=observation_queue_size_after,
+            # Compatibility alias for the queue size after the enqueue attempt.
+            observation_queue_size=observation_queue_size_after,
         )
         if not accepted:
             self.logger.warning(
@@ -589,7 +686,9 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
             getactions_starts = time.perf_counter()
             with self._generation_lock:
                 request_generation = self._server_generation
+            queue_wait_starts = time.perf_counter()
             obs = self.observation_queue.get(timeout=self.config.obs_queue_timeout)
+            queue_wait_ms = (time.perf_counter() - queue_wait_starts) * 1000
             request_id = self._request_id(obs)
             phase = "inference"
             self._trace_event(
@@ -599,6 +698,8 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
                 generation=request_generation,
                 observation_timestep=obs.get_timestep(),
                 must_go=obs.must_go,
+                observation_queue_wait_ms=queue_wait_ms,
+                observation_queue_size_after_dequeue=self.observation_queue.qsize(),
             )
             self.logger.info(
                 f"Running inference for observation #{obs.get_timestep()} (must_go: {obs.must_go})"
@@ -607,19 +708,22 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
             with self._predicted_timesteps_lock:
                 self._predicted_timesteps.add(obs.get_timestep())
 
-            start_time = time.perf_counter()
+            inference_starts = time.perf_counter()
             action_chunk = self._run_serialized_inference(obs, request_generation, context)
-            inference_time = time.perf_counter() - start_time
+            serialized_inference_ms = (time.perf_counter() - inference_starts) * 1000
             if action_chunk is None:
                 return services_pb2.Empty()
 
             phase = "serialization"
-            start_time = time.perf_counter()
+            pickle_serialize_starts = time.perf_counter()
             actions_bytes = pickle.dumps(action_chunk)  # nosec
-            serialize_time = time.perf_counter() - start_time
+            response_pickle_serialize_ms = (time.perf_counter() - pickle_serialize_starts) * 1000
 
             # Create and return the action chunk
+            protobuf_build_starts = time.perf_counter()
             actions = services_pb2.Actions(data=actions_bytes)
+            response_protobuf_build_ms = (time.perf_counter() - protobuf_build_starts) * 1000
+            rpc_ready_ms = (time.perf_counter() - getactions_starts) * 1000
             response_steps = (
                 len(action_chunk.actions)
                 if isinstance(action_chunk, RemoteActionChunk)
@@ -631,29 +735,56 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
                 peer=client_id,
                 generation=request_generation,
                 observation_timestep=obs.get_timestep(),
-                inference_rpc_ms=inference_time * 1000,
-                serialize_ms=serialize_time * 1000,
-                total_rpc_ms=(inference_time + serialize_time) * 1000,
+                observation_queue_wait_ms=queue_wait_ms,
+                serialized_inference_ms=serialized_inference_ms,
+                response_pickle_serialize_ms=response_pickle_serialize_ms,
+                response_protobuf_build_ms=response_protobuf_build_ms,
+                rpc_ready_ms=rpc_ready_ms,
+                response_payload_bytes=len(actions_bytes),
                 payload_bytes=len(actions_bytes),
                 response_steps=response_steps,
+                # Compatibility aliases for existing trace consumers. These
+                # legacy fields exclude observation queue wait, protobuf build,
+                # configured pacing and transport back to the client.
+                inference_rpc_ms=serialized_inference_ms,
+                inference_rpc_ms_semantics="legacy_serialized_inference_including_lock_wait",
+                serialize_ms=response_pickle_serialize_ms,
+                serialize_ms_semantics="legacy_response_pickle_serialize",
+                total_rpc_ms=serialized_inference_ms + response_pickle_serialize_ms,
+                total_rpc_ms_semantics="legacy_inference_plus_pickle_serialize",
             )
 
             self.logger.info(
-                f"Action chunk #{obs.get_timestep()} generated | "
-                f"Total time: {(inference_time + serialize_time) * 1000:.2f}ms"
+                f"Action chunk #{obs.get_timestep()} generated | RPC ready time: {rpc_ready_ms:.2f}ms"
             )
 
             self.logger.debug(
                 f"Action chunk #{obs.get_timestep()} generated | "
-                f"Inference time: {inference_time:.2f}s |"
-                f"Serialize time: {serialize_time:.2f}s |"
-                f"Total time: {inference_time + serialize_time:.2f}s"
+                f"Queue wait: {queue_wait_ms / 1000:.2f}s | "
+                f"Inference time: {serialized_inference_ms / 1000:.2f}s | "
+                f"Serialize time: {response_pickle_serialize_ms / 1000:.2f}s | "
+                f"RPC ready time: {rpc_ready_ms / 1000:.2f}s"
             )
 
             phase = "latency_pacing"
-            time.sleep(
-                max(0, self.config.inference_latency - max(0, time.perf_counter() - getactions_starts))
-            )  # sleep controls inference latency
+            pacing_starts = time.perf_counter()
+            requested_pacing_s = max(
+                0, self.config.inference_latency - max(0, pacing_starts - getactions_starts)
+            )
+            time.sleep(requested_pacing_s)  # sleep controls inference latency
+            pacing_sleep_ms = (time.perf_counter() - pacing_starts) * 1000
+            self._trace_event(
+                "response_returning",
+                request_id=request_id,
+                peer=client_id,
+                generation=request_generation,
+                observation_timestep=obs.get_timestep(),
+                rpc_ready_ms=rpc_ready_ms,
+                requested_pacing_ms=requested_pacing_s * 1000,
+                pacing_sleep_ms=pacing_sleep_ms,
+                handler_elapsed_ms=(time.perf_counter() - getactions_starts) * 1000,
+                response_payload_bytes=len(actions_bytes),
+            )
 
             return actions
 
@@ -663,6 +794,8 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
                 peer=client_id,
                 generation=request_generation,
                 observation_queue_timeout_s=self.config.obs_queue_timeout,
+                observation_queue_wait_ms=(time.perf_counter() - queue_wait_starts) * 1000,
+                handler_elapsed_ms=(time.perf_counter() - getactions_starts) * 1000,
             )
             return services_pb2.Empty()
 
@@ -686,7 +819,7 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         request_generation: int,
         context,
     ) -> list[TimedAction] | RemoteActionChunk | None:
-        """Run at most one model forward and discard work invalidated before it starts."""
+        """Run at most one model forward and discard work invalidated before or during it."""
         lock_wait_start = time.perf_counter()
         with self._inference_lock:
             lock_wait_ms = (time.perf_counter() - lock_wait_start) * 1000
@@ -725,6 +858,12 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
                 generation_after_forward = self._server_generation
             cancelled_after_forward = callable(is_active) and not is_active()
             if invalidated_after_forward or cancelled_after_forward:
+                self.logger.info(
+                    "Discarding inference result invalidated during model forward "
+                    "(stale_generation=%s, cancelled=%s).",
+                    invalidated_after_forward,
+                    cancelled_after_forward,
+                )
                 self._trace_event(
                     "inference_invalidated_after_forward",
                     request_id=self._request_id(obs),
@@ -734,6 +873,7 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
                     stale_generation=invalidated_after_forward,
                     context_cancelled=cancelled_after_forward,
                 )
+                return None
             return result
 
     def _obs_sanity_checks(self, obs: TimedObservation, previous_obs: TimedObservation) -> bool:
@@ -1044,7 +1184,8 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         memory_before: int | None,
         peak_memory: int | None,
     ) -> None:
-        if self.acp_profiler is None:
+        profiler = self.acp_profiler
+        if profiler is None or self._acp_profile_disabled:
             return
 
         raw_uncond = artifacts["uncond_raw"]
@@ -1097,7 +1238,7 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
                 int(artifacts["rtc_leftover"].shape[1]) if artifacts["rtc_leftover"] is not None else 0
             ),
         }
-        self.acp_profiler.record(
+        profiler.record(
             metrics,
             chunks={
                 "noise": artifacts["noise"],
@@ -1107,6 +1248,25 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
                 "cfg_processed": processed_cfg,
             },
         )
+        status = getattr(profiler, "status", None)
+        if not isinstance(status, dict):
+            return
+        dropped_records = int(status.get("dropped_records") or 0)
+        writer_error = status.get("writer_error")
+        if dropped_records > self._acp_profile_last_dropped or writer_error != self._acp_profile_last_error:
+            self._trace_event(
+                "acp_profiler_health",
+                request_id=self._request_id(observation_t),
+                observation_timestep=observation_t.get_timestep(),
+                **status,
+            )
+            self._acp_profile_last_dropped = dropped_records
+            self._acp_profile_last_error = writer_error
+        if writer_error is not None:
+            # Stop paying GPU/statistics overhead once persistence has failed.
+            # The profiler object is retained so shutdown can still drain it.
+            self._acp_profile_disabled = True
+            self.logger.warning("Disabling ACP profiling after writer failure: %s", writer_error)
 
     def _predict_action_chunk(self, observation_t: TimedObservation) -> list[TimedAction] | RemoteActionChunk:
         """Predict an action chunk based on an observation.
@@ -1120,7 +1280,12 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         """
         memory_before = peak_memory = None
         profile_device = torch.device(self.device) if self.device is not None else None
-        if self.acp_profiler is not None and profile_device is not None and profile_device.type == "cuda":
+        if (
+            self.acp_profiler is not None
+            and not self._acp_profile_disabled
+            and profile_device is not None
+            and profile_device.type == "cuda"
+        ):
             torch.cuda.synchronize(profile_device)
             torch.cuda.reset_peak_memory_stats(profile_device)
             memory_before = torch.cuda.memory_allocated(profile_device)
@@ -1178,7 +1343,12 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         postprocess_stops = time.perf_counter()
         postprocessing_time = postprocess_stops - start_postprocess
 
-        if self.acp_profiler is not None and profile_device is not None and profile_device.type == "cuda":
+        if (
+            self.acp_profiler is not None
+            and not self._acp_profile_disabled
+            and profile_device is not None
+            and profile_device.type == "cuda"
+        ):
             peak_memory = torch.cuda.max_memory_allocated(profile_device)
 
         """5. Convert to TimedAction list"""
@@ -1229,21 +1399,37 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         if self.batched_cfg_enabled:
             if acp_artifacts is None:
                 raise RuntimeError("Missing ACP-CFG inference artifacts.")
-            self._record_acp_profile(
-                observation_t=observation_t,
-                artifacts=acp_artifacts,
-                processed_cfg=processed_action_tensor,
-                timings_s={
-                    "prepare": prepare_time,
-                    "preprocess": preprocessing_time,
-                    "inference": inference_time,
-                    "postprocess": postprocessing_time,
-                },
-                wall_latency_s=wall_latency_s,
-                cuda_latency_ms=cuda_latency_ms,
-                memory_before=memory_before,
-                peak_memory=peak_memory,
-            )
+            try:
+                self._record_acp_profile(
+                    observation_t=observation_t,
+                    artifacts=acp_artifacts,
+                    processed_cfg=processed_action_tensor,
+                    timings_s={
+                        "prepare": prepare_time,
+                        "preprocess": preprocessing_time,
+                        "inference": inference_time,
+                        "postprocess": postprocessing_time,
+                    },
+                    wall_latency_s=wall_latency_s,
+                    cuda_latency_ms=cuda_latency_ms,
+                    memory_before=memory_before,
+                    peak_memory=peak_memory,
+                )
+            except Exception as exc:
+                # Profiling is diagnostic-only. A reduction/serialization bug
+                # must never turn a valid robot action into an INTERNAL RPC.
+                self._acp_profile_disabled = True
+                self._trace_event(
+                    "acp_profiler_record_failed",
+                    request_id=self._request_id(observation_t),
+                    observation_timestep=observation_t.get_timestep(),
+                    error_type=type(exc).__name__,
+                    error_message=str(exc),
+                )
+                self.logger.warning(
+                    "Disabling ACP profiling after a record error; action inference will continue.",
+                    exc_info=True,
+                )
             self._acp_chunk_index += 1
 
         self.logger.info(
@@ -1287,14 +1473,33 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         return action_chunk
 
     def stop(self):
-        """Stop the server"""
+        """Stop the server after quiescing inference and draining diagnostics."""
+        with self._stop_lock:
+            if self._stopped:
+                return
+            self._stopped = True
+
         self._trace_event("server_stopping")
         self._reset_server(reason="server_stop")
         self.logger.info("Server stopping...")
+
+        quiesce_starts = time.perf_counter()
+        with self._inference_lock:
+            pass
+        self._trace_event(
+            "server_inference_quiesced",
+            wait_ms=(time.perf_counter() - quiesce_starts) * 1000,
+        )
+
+        self._close_all_acp_profilers(reason="server_stop")
         self._trace_event("server_stopped")
         trace = getattr(self, "_rtc_trace", None)
         if trace is not None:
-            trace.close()
+            trace_status = trace.close(timeout_s=5.0)
+            if isinstance(trace_status, dict) and (
+                trace_status.get("writer_alive", False) or trace_status.get("pending_events", 0) > 0
+            ):
+                self.logger.warning("RTC trace did not fully drain at shutdown: %s", trace_status)
 
 
 @draccus.wrap()
@@ -1321,11 +1526,11 @@ def serve(cfg: PolicyServerConfig):
     try:
         server.wait_for_termination()
     finally:
+        # Stop accepting new RPCs before invalidating/waiting for any forward
+        # already in progress. Both calls are idempotent.
+        server.stop(grace=0)
+        policy_server.stop()
         policy_server.logger.info("Server terminated")
-        policy_server._trace_event("server_terminated")
-        trace = getattr(policy_server, "_rtc_trace", None)
-        if trace is not None:
-            trace.close()
 
 
 if __name__ == "__main__":

@@ -17,6 +17,7 @@ Monkey-patch the `policy` attribute with a stub so that no real model inference 
 
 from __future__ import annotations
 
+import pickle  # nosec
 import threading
 import time
 from dataclasses import replace
@@ -268,6 +269,179 @@ def test_server_serializes_model_inference_across_rpc_threads(monkeypatch, polic
 
     assert all(not thread.is_alive() for thread in threads)
     assert max_active_calls == 1
+
+
+@pytest.mark.parametrize("invalidation", ["generation", "cancellation"])
+def test_server_discards_result_invalidated_during_forward(monkeypatch, policy_server, invalidation):
+    class _Context:
+        active = True
+
+        def is_active(self):
+            return self.active
+
+    context = _Context()
+    generation = policy_server._server_generation
+    policy_server._rtc_trace = _TraceSpy()
+
+    def fake_predict(_observation):
+        if invalidation == "generation":
+            with policy_server._generation_lock:
+                policy_server._server_generation += 1
+        else:
+            context.active = False
+        return ["must-not-be-returned"]
+
+    monkeypatch.setattr(policy_server, "_predict_action_chunk", fake_predict)
+
+    result = policy_server._run_serialized_inference(
+        _make_obs(torch.zeros(6), timestep=8), generation, context
+    )
+
+    assert result is None
+    invalidated = [
+        event
+        for event in policy_server._rtc_trace.events
+        if event["event"] == "inference_invalidated_after_forward"
+    ]
+    assert len(invalidated) == 1
+    assert invalidated[0]["stale_generation"] == (invalidation == "generation")
+    assert invalidated[0]["context_cancelled"] == (invalidation == "cancellation")
+
+
+def test_server_stop_closes_async_profiler_once(policy_server):
+    class _Profiler:
+        def __init__(self):
+            self.close_calls = []
+            self.status = {
+                "pending_records": 0,
+                "dropped_records": 0,
+                "writer_error": None,
+                "close_completed": True,
+                "writer_alive": False,
+            }
+
+        def close(self, *, timeout_s):
+            self.close_calls.append(timeout_s)
+            return True
+
+    profiler = _Profiler()
+    policy_server.acp_profiler = profiler
+
+    policy_server.stop()
+    policy_server.stop()
+
+    assert profiler.close_calls == [5.0]
+    assert policy_server.acp_profiler is None
+    assert policy_server.shutdown_event.is_set()
+
+
+def test_send_observations_traces_receive_deserialize_and_enqueue_stages(policy_server):
+    from lerobot.transport import services_pb2
+    from lerobot.transport.utils import send_bytes_in_chunks
+
+    class _Context:
+        def peer(self):
+            return "test-client"
+
+        def is_active(self):
+            return True
+
+    observation = _make_obs(torch.zeros(6), timestep=13, must_go=True)
+    payload = pickle.dumps(observation)  # nosec
+    request_iterator = send_bytes_in_chunks(payload, services_pb2.Observation)
+    policy_server._rtc_trace = _TraceSpy()
+
+    response = policy_server.SendObservations(request_iterator, _Context())
+
+    assert isinstance(response, services_pb2.Empty)
+    received = [
+        event for event in policy_server._rtc_trace.events if event["event"] == "observation_received"
+    ]
+    assert len(received) == 1
+    received = received[0]
+    assert received["request_payload_bytes"] == len(payload)
+    assert received["payload_bytes"] == len(payload)
+    assert received["stream_receive_ms"] >= 0
+    assert received["pickle_deserialize_ms"] >= 0
+    assert received["receive_and_deserialize_ms"] >= (
+        received["stream_receive_ms"] + received["pickle_deserialize_ms"]
+    )
+    assert received["deserialize_ms"] == received["receive_and_deserialize_ms"]
+    assert received["deserialize_ms_semantics"] == "legacy_stream_receive_plus_pickle_deserialize"
+    assert received["handler_decode_ready_ms"] >= received["receive_and_deserialize_ms"]
+    assert (
+        received["observation_timestamp_to_server_payload_received_wall_ms"]
+        >= received["observation_timestamp_to_server_handler_start_wall_ms"]
+    )
+    assert received["cross_host_wall_clock_metrics_require_synchronized_clocks"] is True
+
+    enqueued = [
+        event for event in policy_server._rtc_trace.events if event["event"] == "observation_enqueued"
+    ]
+    assert len(enqueued) == 1
+    enqueued = enqueued[0]
+    assert enqueued["accepted"] is True
+    assert enqueued["enqueue_ms"] >= 0
+    assert enqueued["handler_elapsed_ms"] >= received["handler_decode_ready_ms"]
+    assert enqueued["observation_queue_size_before"] == 0
+    assert enqueued["observation_queue_size_after"] == 1
+    assert enqueued["observation_queue_size"] == 1
+
+
+def test_get_actions_traces_queue_inference_and_response_stages(monkeypatch, policy_server):
+    from lerobot.async_inference.helpers import RTCInferenceMetadata
+    from lerobot.transport import services_pb2
+
+    class _Context:
+        def peer(self):
+            return "test-client"
+
+        def is_active(self):
+            return True
+
+    observation = _make_obs(torch.zeros(6), timestep=14, must_go=True)
+    observation.rtc_metadata = RTCInferenceMetadata(request_id="request-14")
+    policy_server.observation_queue.put(observation)
+    policy_server._rtc_trace = _TraceSpy()
+    policy_server.config.inference_latency = 0
+    expected_chunk = policy_server._time_action_chunk(
+        observation.get_timestamp(), [torch.zeros(6), torch.ones(6)], observation.get_timestep()
+    )
+    monkeypatch.setattr(
+        policy_server,
+        "_run_serialized_inference",
+        lambda *_args, **_kwargs: expected_chunk,
+    )
+
+    response = policy_server.GetActions(services_pb2.Empty(), _Context())
+
+    decoded_chunk = pickle.loads(response.data)  # nosec
+    assert [action.get_timestep() for action in decoded_chunk] == [14, 15]
+    torch.testing.assert_close(decoded_chunk[0].get_action(), torch.zeros(6))
+    torch.testing.assert_close(decoded_chunk[1].get_action(), torch.ones(6))
+    dequeued = [event for event in policy_server._rtc_trace.events if event["event"] == "inference_dequeued"]
+    assert len(dequeued) == 1
+    assert dequeued[0]["observation_queue_wait_ms"] >= 0
+    assert dequeued[0]["observation_queue_size_after_dequeue"] == 0
+
+    ready = [event for event in policy_server._rtc_trace.events if event["event"] == "response_ready"]
+    assert len(ready) == 1
+    ready = ready[0]
+    assert ready["request_id"] == "request-14"
+    assert ready["serialized_inference_ms"] >= 0
+    assert ready["response_pickle_serialize_ms"] >= 0
+    assert ready["response_protobuf_build_ms"] >= 0
+    assert ready["rpc_ready_ms"] >= ready["total_rpc_ms"]
+    assert ready["response_payload_bytes"] == len(response.data)
+    assert ready["payload_bytes"] == len(response.data)
+    assert ready["inference_rpc_ms"] == ready["serialized_inference_ms"]
+    assert ready["serialize_ms"] == ready["response_pickle_serialize_ms"]
+    assert ready["total_rpc_ms"] == (ready["serialized_inference_ms"] + ready["response_pickle_serialize_ms"])
+
+    returning = [event for event in policy_server._rtc_trace.events if event["event"] == "response_returning"]
+    assert len(returning) == 1
+    assert returning[0]["handler_elapsed_ms"] >= ready["rpc_ready_ms"]
+    assert returning[0]["response_payload_bytes"] == len(response.data)
 
 
 def test_get_actions_traces_inference_error_before_abort(monkeypatch, policy_server):

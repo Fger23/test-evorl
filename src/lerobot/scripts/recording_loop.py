@@ -260,11 +260,17 @@ def record_loop(
                 sleep_s = interval_s if interval_s > 0.0 else remaining_s
                 time.sleep(min(sleep_s, remaining_s))
 
-    timestamp = 0 # 从录制开始到当前帧累计运行秒数
+    timestamp = 0  # 从录制开始到当前帧累计运行秒数
     step_idx = 0
-    start_episode_t = time.perf_counter() # 录制开始的时间戳
+    start_episode_t = time.perf_counter()  # 录制开始的时间戳
+    previous_loop_start_t: float | None = None
+    control_period_s = 1 / fps
     while timestamp < control_time_s:
-        start_loop_t = time.perf_counter() # 当前帧录制开始的时间戳
+        start_loop_t = time.perf_counter()  # 当前帧录制开始的时间戳
+        loop_start_interval_ms = (
+            None if previous_loop_start_t is None else (start_loop_t - previous_loop_start_t) * 1000
+        )
+        previous_loop_start_t = start_loop_t
 
         if events["exit_early"]:
             events["exit_early"] = False
@@ -303,15 +309,20 @@ def record_loop(
                 logging.info("Intervention toggle ignored because policy+teleop are not both active.")
 
         # Get robot observation
+        get_observation_started = time.perf_counter()
         obs = robot.get_observation()
+        get_observation_ms = (time.perf_counter() - get_observation_started) * 1000
 
         # Applies a pipeline to the raw robot observation, default is IdentityProcessor
+        observation_process_started = time.perf_counter()
         obs_processed = robot_observation_processor(obs)
 
         if dataset is not None:
             observation_frame = build_dataset_frame(dataset.features, obs_processed, prefix=OBS_STR)
+        observation_process_ms = (time.perf_counter() - observation_process_started) * 1000
 
         # Get action from policy and/or teleop
+        get_action_started = time.perf_counter()
         act_processed_policy: RobotAction | None = None
         act_processed_teleop: RobotAction | None = None
         if not (intervention_enabled and intervention_state == INTERVENTION_STATE_ACTIVE):
@@ -353,6 +364,7 @@ def record_loop(
             base_action = robot._from_keyboard_to_base_action(keyboard_action)
             act = {**arm_action, **base_action} if len(base_action) > 0 else arm_action
             act_processed_teleop = teleop_action_processor((act, obs))
+        get_action_ms = (time.perf_counter() - get_action_started) * 1000
 
         if act_processed_policy is None and act_processed_teleop is None:
             logging.info(
@@ -362,6 +374,7 @@ def record_loop(
             )
             continue
 
+        action_process_started = time.perf_counter()
         if act_processed_teleop is not None:
             last_teleop_action = act_processed_teleop
             teleop_fallback_warned = False
@@ -401,12 +414,14 @@ def record_loop(
 
         # Applies a pipeline to the action, default is IdentityProcessor
         robot_action_to_send = robot_action_processor((action_values, obs))
+        action_process_ms = (time.perf_counter() - action_process_started) * 1000
 
         # Send action to robot
         # Action can eventually be clipped using `max_relative_target`,
         # so action actually sent is saved in the dataset. action = postprocessor.process(action)
         # TODO(steven, pepijn, adil): we should use a pipeline step to clip the action, so the sent action is the action that we input to the robot.
         selected_from_policy = act_processed_policy is not None and action_values is act_processed_policy
+        send_action_started = time.perf_counter()
         if policy_sync_executor is not None and selected_from_policy:
             _sent_action = run_with_connection_retry(
                 "policy_sync_executor.send_action",
@@ -419,14 +434,18 @@ def record_loop(
                 "robot.send_action",
                 lambda robot_action_to_send=robot_action_to_send: robot.send_action(robot_action_to_send),
             )
+        send_action_ms = (time.perf_counter() - send_action_started) * 1000
 
         # RTC's real inference delay is the number of policy actions that were
         # successfully sent while a chunk request was running. Confirm only
         # after send_action returns; a queue pop alone is not robot execution.
+        execution_confirmation_started = time.perf_counter()
         if remote_policy_client is not None and selected_from_policy:
             remote_policy_client.mark_action_executed()
+        execution_confirmation_ms = (time.perf_counter() - execution_confirmation_started) * 1000
 
         # Write to dataset
+        dataset_started = time.perf_counter()
         if dataset is not None:
             action_frame = build_dataset_frame(dataset.features, action_values, prefix=ACTION)
             policy_action_frame = build_dataset_frame(
@@ -447,17 +466,47 @@ def record_loop(
                     human_id=collector_policy_id_human,
                 )
             dataset.add_frame(frame)
+        dataset_ms = (time.perf_counter() - dataset_started) * 1000
 
+        display_started = time.perf_counter()
         if display_data:
             log_rerun_data(
                 observation=obs_processed, action=action_values, compress_images=display_compressed_images
             )
+        display_ms = (time.perf_counter() - display_started) * 1000
 
         if intervention_state == INTERVENTION_STATE_RELEASE:
             intervention_state = INTERVENTION_STATE_POLICY
 
-        dt_s = time.perf_counter() - start_loop_t
-        precise_sleep(max(1 / fps - dt_s, 0.0))
+        active_work_s = time.perf_counter() - start_loop_t
+        sleep_requested_s = max(control_period_s - active_work_s, 0.0)
+        sleep_started = time.perf_counter()
+        precise_sleep(sleep_requested_s)
+        sleep_ms = (time.perf_counter() - sleep_started) * 1000
+        loop_total_ms = (time.perf_counter() - start_loop_t) * 1000
 
-        timestamp = time.perf_counter() - start_episode_t ## 更新已录制时长
+        if remote_policy_client is not None:
+            remote_policy_client.record_control_loop_metrics(
+                timestep=step_idx,
+                target_period_ms=control_period_s * 1000,
+                loop_start_interval_ms=loop_start_interval_ms,
+                get_observation_ms=get_observation_ms,
+                observation_process_ms=observation_process_ms,
+                get_action_ms=get_action_ms,
+                action_process_ms=action_process_ms,
+                send_action_ms=send_action_ms,
+                execution_confirmation_ms=execution_confirmation_ms,
+                dataset_ms=dataset_ms,
+                display_ms=display_ms,
+                active_work_ms=active_work_s * 1000,
+                sleep_requested_ms=sleep_requested_s * 1000,
+                sleep_ms=sleep_ms,
+                loop_total_ms=loop_total_ms,
+                deadline_missed=active_work_s > control_period_s,
+                deadline_overrun_ms=max(active_work_s - control_period_s, 0.0) * 1000,
+                selected_from_policy=selected_from_policy,
+                intervention_state=intervention_state,
+            )
+
+        timestamp = time.perf_counter() - start_episode_t  ## 更新已录制时长
         step_idx += 1

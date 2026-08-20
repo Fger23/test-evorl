@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import pickle  # nosec
 import threading
 import time
 from queue import Queue
@@ -80,6 +81,7 @@ def rtc_client() -> RemotePolicyActionClient:
     client._session_id = "test-session"
     client._executed_steps = 0
     client._awaiting_execution_confirmation = False
+    client._last_get_action_metrics = None
     client._started = True
     client._rtc_trace = _TraceSpy()
     return client
@@ -162,6 +164,7 @@ def test_submit_uses_one_in_flight_request_and_raw_snapshot(rtc_client):
     assert submitted[0]["queue_size_at_submit"] == 6
     assert submitted[0]["leftover_steps"] == 6
     assert submitted[0]["observation_timestep"] == 5
+    assert submitted[0]["observation_snapshot_ms"] >= 0
 
     # Removing the queued item does not permit another request while its RPC is active.
     assert not rtc_client._submit_if_needed(observation={}, task=None, timestep=6)
@@ -174,6 +177,106 @@ def test_first_request_has_no_leftover(rtc_client):
     assert request.left_over is None
     assert request.queue_size_at_submit == 0
     assert request.executed_steps_at_submit == 0
+
+
+def test_request_and_response_transport_timings_are_split(rtc_client):
+    from lerobot.transport.utils import CHUNK_SIZE
+
+    class _Observation:
+        def __init__(self, transfer_state, data):
+            self.transfer_state = transfer_state
+            self.data = data
+
+    class _Empty:
+        pass
+
+    class _ImmediateFuture:
+        def __init__(self, result):
+            self._result = result
+
+        def result(self):
+            return self._result
+
+        def cancel(self):
+            return True
+
+    class _SendRPC:
+        def __init__(self):
+            self.chunks = []
+
+        def future(self, argument, timeout=None):
+            assert timeout == rtc_client.cfg.obs_queue_timeout_s
+            self.chunks = list(argument)
+            return _ImmediateFuture(SimpleNamespace())
+
+    response = {"status": "ok", "steps": 6}
+    serialized_response = pickle.dumps(response)
+
+    class _GetRPC:
+        def future(self, _argument, timeout=None):
+            assert timeout is not None and timeout > 0
+            return _ImmediateFuture(SimpleNamespace(data=serialized_response))
+
+    send_rpc = _SendRPC()
+    rtc_client.services_pb2 = SimpleNamespace(Observation=_Observation, Empty=_Empty)
+    rtc_client.stub = SimpleNamespace(SendObservations=send_rpc, GetActions=_GetRPC())
+    assert rtc_client._submit_if_needed(
+        observation={"state": [0.0, 1.0], "camera": bytearray(64)},
+        task="test",
+        timestep=7,
+    )
+    request = _take_submitted_request(rtc_client)
+
+    send_metrics = rtc_client._send_observation(request)
+    decoded_response, receive_metrics = rtc_client._receive_actions(request)
+
+    assert decoded_response == response
+    assert send_metrics.serialize_ms >= 0
+    assert send_metrics.rpc_ms >= 0
+    assert send_metrics.total_ms >= send_metrics.serialize_ms
+    assert send_metrics.payload_bytes == sum(len(chunk.data) for chunk in send_rpc.chunks)
+    assert send_metrics.chunk_count == (send_metrics.payload_bytes + CHUNK_SIZE - 1) // CHUNK_SIZE
+    assert len(send_rpc.chunks) == send_metrics.chunk_count
+    assert receive_metrics.rpc_ms >= 0
+    assert receive_metrics.deserialize_ms >= 0
+    assert receive_metrics.total_ms >= receive_metrics.deserialize_ms
+    assert receive_metrics.payload_bytes == len(serialized_response)
+    assert receive_metrics.poll_count == 1
+
+    serialized_events = _trace_events(rtc_client, "observation_serialized")
+    sent_events = _trace_events(rtc_client, "observation_sent")
+    response_events = _trace_events(rtc_client, "action_response_deserialized")
+    assert serialized_events[0]["request_payload_bytes"] == send_metrics.payload_bytes
+    assert serialized_events[0]["request_chunk_count"] == send_metrics.chunk_count
+    assert sent_events[0]["observation_upload_rpc_ms"] == send_metrics.rpc_ms
+    assert response_events[0]["get_actions_rpc_ms"] == receive_metrics.rpc_ms
+    assert response_events[0]["response_deserialize_ms"] == receive_metrics.deserialize_ms
+    assert response_events[0]["response_payload_bytes"] == len(serialized_response)
+
+
+def test_control_loop_trace_includes_remote_queue_wait_metrics(rtc_client):
+    _, processed = _seed_queue(rtc_client)
+    rtc_client.cfg.chunk_size_threshold = 0.0
+
+    action = rtc_client.get_action(observation={}, task=None, timestep=4)
+    assert action["joint_0"] == processed[0, 0].item()
+    rtc_client.mark_action_executed()
+    rtc_client.record_control_loop_metrics(
+        timestep=4,
+        get_observation_ms=1.0,
+        get_action_ms=2.0,
+        loop_total_ms=33.0,
+        deadline_missed=False,
+    )
+
+    events = _trace_events(rtc_client, "control_loop_step")
+    assert len(events) == 1
+    assert events[0]["observation_timestep"] == 4
+    assert events[0]["remote_get_action_ms"] >= 0
+    assert events[0]["remote_queue_wait_ms"] >= 0
+    assert events[0]["queue_size_after_pop"] == 5
+    assert events[0]["get_observation_ms"] == 1.0
+    assert events[0]["get_action_ms"] == 2.0
 
 
 def test_pending_chunk_is_cropped_by_confirmed_executed_steps(rtc_client):

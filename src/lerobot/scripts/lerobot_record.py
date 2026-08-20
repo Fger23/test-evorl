@@ -127,7 +127,6 @@ from lerobot.teleoperators import (  # noqa: F401
 from lerobot.utils.constants import ACTION
 from lerobot.utils.control_utils import (
     init_keyboard_listener,
-    is_headless,
     sanity_check_bimanual_piper_pair,
     sanity_check_dataset_name,
     sanity_check_dataset_robot_compatibility,
@@ -610,8 +609,7 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
         if dataset:
             dataset.finalize()
             logging.info(
-                "To inspect the recorded dataset, run:\n"
-                "  lerobot-dataset-report --dataset %s",
+                "To inspect the recorded dataset, run:\n  lerobot-dataset-report --dataset %s",
                 dataset.repo_id,
             )
 
@@ -619,6 +617,8 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
             policy_sync_executor.shutdown()
         if remote_policy_client is not None:
             remote_policy_client.stop()
+        if batched_cfg_runtime is not None:
+            batched_cfg_runtime.close()
 
         if robot.is_connected:
             robot.disconnect()

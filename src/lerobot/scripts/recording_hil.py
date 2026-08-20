@@ -199,6 +199,12 @@ class ACPBatchedCFGRuntime:
         """Discard stale actions while retaining all profiler records."""
         self._action_queue.clear()
 
+    def close(self) -> None:
+        """Flush the optional asynchronous profiler during clean shutdown."""
+        close = getattr(self.profiler, "close", None)
+        if callable(close):
+            close()
+
     def predict_action(
         self,
         *,
