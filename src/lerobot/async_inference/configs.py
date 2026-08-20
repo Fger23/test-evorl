@@ -53,13 +53,13 @@ class ACPRTCConfig:
     execution_horizon: int = 25
     max_guidance_weight: float = 10.0
     prefix_attention_schedule: RTCAttentionSchedule = RTCAttentionSchedule.LINEAR
+    trace_enabled: bool = True
+    trace_output_dir: str = "logs/rtc_trace"
 
     def __post_init__(self) -> None:
         if isinstance(self.prefix_attention_schedule, str):
             try:
-                self.prefix_attention_schedule = RTCAttentionSchedule(
-                    self.prefix_attention_schedule.upper()
-                )
+                self.prefix_attention_schedule = RTCAttentionSchedule(self.prefix_attention_schedule.upper())
             except ValueError as exc:
                 choices = ", ".join(schedule.value for schedule in RTCAttentionSchedule)
                 raise ValueError(
@@ -83,6 +83,8 @@ class ACPRTCConfig:
             )
         if not math.isfinite(self.max_guidance_weight) or self.max_guidance_weight <= 0:
             raise ValueError("`acp_inference.rtc.max_guidance_weight` must be finite and > 0.")
+        if self.trace_enabled and not self.trace_output_dir.strip():
+            raise ValueError("`acp_inference.rtc.trace_output_dir` must be non-empty.")
 
 
 @dataclass
@@ -170,9 +172,7 @@ class PolicyServerConfig:
         if self.obs_queue_timeout < 0:
             raise ValueError(f"obs_queue_timeout must be non-negative, got {self.obs_queue_timeout}")
 
-        if self.acp_inference.enable and not (
-            self.acp_inference.use_cfg and self.acp_inference.batched_cfg
-        ):
+        if self.acp_inference.enable and not (self.acp_inference.use_cfg and self.acp_inference.batched_cfg):
             raise ValueError(
                 "PolicyServer ACP inference currently requires "
                 "`enable=true`, `use_cfg=true`, and `batched_cfg=true`."
@@ -216,9 +216,9 @@ class PolicyServerConfig:
                     "inference_delay": self.acp_inference.rtc.inference_delay,
                     "execution_horizon": self.acp_inference.rtc.execution_horizon,
                     "max_guidance_weight": self.acp_inference.rtc.max_guidance_weight,
-                    "prefix_attention_schedule": (
-                        self.acp_inference.rtc.prefix_attention_schedule.value
-                    ),
+                    "prefix_attention_schedule": (self.acp_inference.rtc.prefix_attention_schedule.value),
+                    "trace_enabled": self.acp_inference.rtc.trace_enabled,
+                    "trace_output_dir": self.acp_inference.rtc.trace_output_dir,
                 },
                 "profile": self.acp_inference.profile,
                 "profile_output_dir": self.acp_inference.profile_output_dir,

@@ -30,6 +30,16 @@ from lerobot.policies.rtc.configuration_rtc import RTCConfig
 from lerobot.scripts.recording_remote_policy import RemotePolicyActionClient, RemotePolicyRecordConfig
 
 
+class _TraceSpy:
+    def __init__(self):
+        self.events = []
+        self.lock = threading.Lock()
+
+    def record(self, event, **fields):
+        with self.lock:
+            self.events.append({"event": event, **fields})
+
+
 @pytest.fixture
 def rtc_client() -> RemotePolicyActionClient:
     """Build the state machine without opening a gRPC channel or worker thread."""
@@ -50,9 +60,7 @@ def rtc_client() -> RemotePolicyActionClient:
     client.cfg = cfg
     client.robot = SimpleNamespace(action_features={"joint_0": object(), "joint_1": object()})
     client.environment_dt = 1 / 30
-    client.action_queue = ActionQueue(
-        RTCConfig(enabled=True, execution_horizon=cfg.rtc_execution_horizon)
-    )
+    client.action_queue = ActionQueue(RTCConfig(enabled=True, execution_horizon=cfg.rtc_execution_horizon))
     client.latest_action_timestep = -1
     client.latest_action = None
     client.aggregate_fn = lambda _old, new: new
@@ -66,11 +74,14 @@ def rtc_client() -> RemotePolicyActionClient:
     client._in_flight_request_id = None
     client._active_rpc_future = None
     client._active_rpc_request_id = None
+    client._active_rpc_stage = None
     client._episode_epoch = 0
     client._request_sequence = 0
+    client._session_id = "test-session"
     client._executed_steps = 0
     client._awaiting_execution_confirmation = False
     client._started = True
+    client._rtc_trace = _TraceSpy()
     return client
 
 
@@ -109,6 +120,10 @@ def _take_submitted_request(client: RemotePolicyActionClient):
     return request
 
 
+def _trace_events(client: RemotePolicyActionClient, event: str) -> list[dict]:
+    return [record for record in client._rtc_trace.events if record["event"] == event]
+
+
 def test_submit_uses_one_in_flight_request_and_raw_snapshot(rtc_client):
     raw, processed = _seed_queue(rtc_client)
     barrier = threading.Barrier(9)
@@ -119,9 +134,7 @@ def test_submit_uses_one_in_flight_request_and_raw_snapshot(rtc_client):
     def submit() -> None:
         barrier.wait()
         try:
-            result = rtc_client._submit_if_needed(
-                observation={"state": [0.0, 1.0]}, task="test", timestep=5
-            )
+            result = rtc_client._submit_if_needed(observation={"state": [0.0, 1.0]}, task="test", timestep=5)
             with results_lock:
                 results.append(result)
         except BaseException as exc:
@@ -140,8 +153,15 @@ def test_submit_uses_one_in_flight_request_and_raw_snapshot(rtc_client):
     assert rtc_client._request_queue.qsize() == 1
     request = _take_submitted_request(rtc_client)
     assert request.request_id == rtc_client._in_flight_request_id
+    assert request.request_id == "test-session:0:1"
     assert torch.equal(request.left_over, raw)
     assert not torch.equal(request.left_over, processed)
+    submitted = _trace_events(rtc_client, "request_submitted")
+    assert len(submitted) == 1
+    assert submitted[0]["request_id"] == request.request_id
+    assert submitted[0]["queue_size_at_submit"] == 6
+    assert submitted[0]["leftover_steps"] == 6
+    assert submitted[0]["observation_timestep"] == 5
 
     # Removing the queued item does not permit another request while its RPC is active.
     assert not rtc_client._submit_if_needed(observation={}, task=None, timestep=6)
@@ -182,6 +202,16 @@ def test_pending_chunk_is_cropped_by_confirmed_executed_steps(rtc_client):
     assert snapshot.queue_size == 3
     assert torch.equal(snapshot.left_over, new_raw[3:])
     assert torch.equal(rtc_client._pop_action(), new_processed[3])
+
+    installed = _trace_events(rtc_client, "chunk_installed")
+    assert len(installed) == 1
+    assert installed[0]["request_id"] == request.request_id
+    assert installed[0]["queue_size_at_submit"] == 6
+    assert installed[0]["leftover_steps_at_submit"] == 6
+    assert installed[0]["response_steps"] == 6
+    assert installed[0]["actual_delay"] == 3
+    assert installed[0]["discarded_prefix_steps"] == 3
+    assert installed[0]["queue_size_after_install"] == 3
 
 
 def test_stale_epoch_response_does_not_replace_current_queue(rtc_client):
@@ -262,6 +292,43 @@ def test_reset_cancels_active_rpc_and_clears_queue(rtc_client):
     assert rtc_client._in_flight_request_id is None
     assert isinstance(rtc_client.action_queue, ActionQueue)
     assert rtc_client.action_queue.empty()
+    reset_events = _trace_events(rtc_client, "episode_reset")
+    assert len(reset_events) == 1
+    assert reset_events[0]["old_epoch"] == 0
+    assert reset_events[0]["new_epoch"] == 1
+    assert reset_events[0]["queue_size_before"] == 6
+    assert reset_events[0]["cancelled_request_id"] == request.request_id
+    assert reset_events[0]["cancellation_requested"] is True
+
+
+def test_worker_error_trace_distinguishes_retry_and_fatal(rtc_client):
+    _seed_queue(rtc_client)
+    assert rtc_client._submit_if_needed(observation={}, task=None, timestep=0)
+    request = _take_submitted_request(rtc_client)
+    with rtc_client._state_lock:
+        rtc_client._in_flight_request_id = None
+        rtc_client._worker_error = (request, TimeoutError("network stalled"))
+
+    rtc_client._raise_or_log_worker_error()
+
+    retry = _trace_events(rtc_client, "request_retry_scheduled")
+    assert len(retry) == 1
+    assert retry[0]["request_id"] == request.request_id
+    assert retry[0]["queue_size"] == 6
+    assert retry[0]["error_type"] == "TimeoutError"
+    assert retry[0]["error_message"] == "network stalled"
+
+    assert isinstance(rtc_client.action_queue, ActionQueue)
+    rtc_client.action_queue.clear()
+    with rtc_client._state_lock:
+        rtc_client._worker_error = (request, RuntimeError("server failed"))
+    with pytest.raises(RuntimeError, match="Remote policy request"):
+        rtc_client._raise_or_log_worker_error()
+
+    fatal = _trace_events(rtc_client, "request_failure_escalated")
+    assert len(fatal) == 1
+    assert fatal[0]["request_id"] == request.request_id
+    assert fatal[0]["error_type"] == "RuntimeError"
 
 
 def test_previous_action_requires_execution_confirmation(rtc_client):

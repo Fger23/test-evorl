@@ -33,6 +33,16 @@ from tests.utils import require_package
 # -----------------------------------------------------------------------------
 
 
+class _TraceSpy:
+    def __init__(self):
+        self.events = []
+        self.lock = threading.Lock()
+
+    def record(self, event, **fields):
+        with self.lock:
+            self.events.append({"event": event, **fields})
+
+
 class MockPolicy:
     """A minimal mock for an actual policy, returning zeros.
     Refer to tests/policies for tests of the individual policies supported."""
@@ -135,6 +145,7 @@ def test_policy_server_acp_config_validation_and_round_trip():
             cfg_beta=1.5,
             profile=True,
             profile_save_chunks=False,
+            rtc=ACPRTCConfig(trace_enabled=True, trace_output_dir="custom/rtc-trace"),
         )
     )
     restored = PolicyServerConfig.from_dict(config.to_dict())
@@ -146,9 +157,13 @@ def test_policy_server_acp_config_validation_and_round_trip():
     assert restored.acp_inference.rtc.execution_horizon == 25
     assert restored.acp_inference.rtc.max_guidance_weight == 10.0
     assert restored.acp_inference.rtc.prefix_attention_schedule is RTCAttentionSchedule.LINEAR
+    assert restored.acp_inference.rtc.trace_enabled is True
+    assert restored.acp_inference.rtc.trace_output_dir == "custom/rtc-trace"
 
     with pytest.raises(ValueError, match="greater than"):
         ACPRTCConfig(enabled=True, inference_delay=20, execution_horizon=20)
+    with pytest.raises(ValueError, match="trace_output_dir"):
+        ACPRTCConfig(trace_enabled=True, trace_output_dir="")
 
     rtc_config = PolicyServerConfig(
         acp_inference=ACPInferenceConfig(
@@ -253,6 +268,44 @@ def test_server_serializes_model_inference_across_rpc_threads(monkeypatch, polic
 
     assert all(not thread.is_alive() for thread in threads)
     assert max_active_calls == 1
+
+
+def test_get_actions_traces_inference_error_before_abort(monkeypatch, policy_server):
+    from lerobot.async_inference.helpers import RTCInferenceMetadata
+
+    class _AbortError(Exception):
+        pass
+
+    class _Context:
+        def peer(self):
+            return "test-client"
+
+        def is_active(self):
+            return True
+
+        def abort(self, _code, details):
+            raise _AbortError(details)
+
+    observation = _make_obs(torch.zeros(6), timestep=9, must_go=True)
+    observation.rtc_metadata = RTCInferenceMetadata(request_id="request-error")
+    policy_server.observation_queue.put(observation)
+    policy_server._rtc_trace = _TraceSpy()
+
+    def fail_inference(*_args, **_kwargs):
+        raise ValueError("model exploded")
+
+    monkeypatch.setattr(policy_server, "_run_serialized_inference", fail_inference)
+
+    with pytest.raises(_AbortError, match="model exploded"):
+        policy_server.GetActions(object(), _Context())
+
+    errors = [event for event in policy_server._rtc_trace.events if event["event"] == "inference_error"]
+    assert len(errors) == 1
+    assert errors[0]["request_id"] == "request-error"
+    assert errors[0]["observation_timestep"] == 9
+    assert errors[0]["phase"] == "inference"
+    assert errors[0]["error_type"] == "ValueError"
+    assert errors[0]["error_message"] == "model exploded"
 
 
 def test_maybe_enqueue_observation_must_go(policy_server):
@@ -521,10 +574,13 @@ def test_server_rtc_cfg_v2_envelope_shares_leftover_and_runtime_inputs(policy_se
     policy_server._client_protocol_version = 2
     policy_server._client_return_raw_actions = True
     policy_server._client_rtc_enabled = True
+    policy_server._rtc_trace = _TraceSpy()
     policy_server._configure_policy_rtc()
 
     assert policy_server.policy.config.rtc_config.enabled is True
     assert policy_server.policy.rtc_processor is policy_server.policy.model.rtc_processor
+    assert policy_server.acp_profiler is None
+    assert policy_server._cuda_timing_enabled(torch.device("cuda")) is True
 
     leftover = torch.tensor([[0.1, 0.2], [0.3, 0.4], [0.5, 0.6]])
     observation = _make_obs(torch.zeros(6), timestep=12)
@@ -550,9 +606,7 @@ def test_server_rtc_cfg_v2_envelope_shares_leftover_and_runtime_inputs(policy_se
     assert torch.equal(shared_noise[0], shared_noise[1])
     assert rtc_kwargs["prev_chunk_left_over"].shape == (2, 3, 2)
     assert torch.equal(rtc_kwargs["prev_chunk_left_over"][0], leftover)
-    assert torch.equal(
-        rtc_kwargs["prev_chunk_left_over"][0], rtc_kwargs["prev_chunk_left_over"][1]
-    )
+    assert torch.equal(rtc_kwargs["prev_chunk_left_over"][0], rtc_kwargs["prev_chunk_left_over"][1])
     assert rtc_kwargs["inference_delay"] == 1
     assert rtc_kwargs["execution_horizon"] == 3
 
@@ -561,3 +615,26 @@ def test_server_rtc_cfg_v2_envelope_shares_leftover_and_runtime_inputs(policy_se
     assert len(policy_server.postprocessor.inputs) == 1
     torch.testing.assert_close(policy_server.postprocessor.inputs[0], expected_raw.unsqueeze(0))
     torch.testing.assert_close(response.actions[0].get_action(), expected_raw[0].square())
+
+    completed = [
+        event for event in policy_server._rtc_trace.events if event["event"] == "inference_completed"
+    ]
+    assert len(completed) == 1
+    assert completed[0]["request_id"] == "request-12"
+    assert completed[0]["observation_timestep"] == 12
+    assert completed[0]["rtc_applied"] is True
+    assert completed[0]["requested_leftover_steps"] == 3
+    assert completed[0]["effective_leftover_steps"] == 3
+    assert completed[0]["effective_inference_delay"] == 1
+    assert completed[0]["effective_execution_horizon"] == 3
+    assert completed[0]["cuda_latency_ms"] is None
+    assert completed[0]["raw_actions"]["shape"] == [1, 4, 2]
+    assert completed[0]["processed_actions"]["shape"] == [4, 2]
+    for timing in (
+        "prepare_ms",
+        "preprocess_ms",
+        "model_and_cfg_ms",
+        "postprocess_and_d2h_ms",
+        "wall_ms",
+    ):
+        assert completed[0][timing] >= 0

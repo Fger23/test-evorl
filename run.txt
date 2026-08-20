@@ -213,6 +213,8 @@ python -m lerobot.async_inference.policy_server \
   --acp_inference.rtc.execution_horizon=25 \
   --acp_inference.rtc.max_guidance_weight=10 \
   --acp_inference.rtc.prefix_attention_schedule=LINEAR \
+  --acp_inference.rtc.trace_enabled=true \
+  --acp_inference.rtc.trace_output_dir=logs/rtc_trace \
   --acp_inference.profile=false
 
 # 7.真机端启动人在环采集
@@ -239,4 +241,12 @@ lerobot-human-inloop-record \
 --remote_policy.rtc_execution_horizon=25 \
 --remote_policy.rtc_max_guidance_weight=10 \
 --remote_policy.rtc_prefix_attention_schedule=LINEAR \
---remote_policy.rtc_cfg_beta=1.5
+--remote_policy.rtc_cfg_beta=1.5 \
+--remote_policy.rtc_trace_enabled=true \
+--remote_policy.rtc_trace_output_dir=logs/rtc_trace
+
+# RTC 故障日志（服务端和客户端各自机器上的本地路径）：
+#   logs/rtc_trace/rtc_server_<hostname>_<pid>_<UTC>.jsonl
+#   logs/rtc_trace/rtc_client_<hostname>_<pid>_<UTC>.jsonl
+# 两边日志用 request_id 对齐。日志只保存耗时、队列步数、形状和错误，不保存图像/提示词/动作值。
+# 日志由后台线程非阻塞写入；单文件 64 MiB、每次运行最多 4 段，历史运行文件不会被自动删除。
