@@ -264,13 +264,44 @@ class RobotClientConfig:
     )
 
     # Control behavior configuration
-    chunk_size_threshold: float = field(default=0.5, metadata={"help": "Threshold for chunk size control"})
+    chunk_size_threshold: float = field(default=0.7, metadata={"help": "Threshold for chunk size control"})
     fps: int = field(default=DEFAULT_FPS, metadata={"help": "Frames per second"})
 
     # Aggregate function configuration (CLI-compatible)
     aggregate_fn_name: str = field(
         default="weighted_average",
         metadata={"help": f"Name of aggregate function to use. Options: {list(AGGREGATE_FUNCTIONS.keys())}"},
+    )
+
+    # ``python -m lerobot.async_inference.robot_client`` is the dedicated
+    # RTC-CFG robot entrypoint.  ``rtc_enable=false`` keeps the historical
+    # protocol-v1 client available for tests and backwards compatibility.
+    rtc_enable: bool = field(default=True, metadata={"help": "Enable protocol-v2 RTC-CFG inference"})
+    obs_queue_timeout_s: float = field(
+        default=30.0,
+        metadata={"help": "Maximum seconds to wait for a remote RTC action chunk"},
+    )
+    rtc_inference_delay: int = field(
+        default=21,
+        metadata={"help": "Estimated inference delay in executed action steps"},
+    )
+    rtc_execution_horizon: int = field(
+        default=35,
+        metadata={"help": "RTC prefix execution horizon in action steps"},
+    )
+    rtc_max_guidance_weight: float = field(
+        default=10.0,
+        metadata={"help": "Maximum RTC prefix-attention guidance weight"},
+    )
+    rtc_prefix_attention_schedule: RTCAttentionSchedule = field(
+        default=RTCAttentionSchedule.LINEAR,
+        metadata={"help": "RTC prefix-attention schedule (ZEROS, ONES, LINEAR or EXP)"},
+    )
+    rtc_cfg_beta: float = field(default=1.5, metadata={"help": "ACP-CFG guidance coefficient"})
+    rtc_trace_enabled: bool = field(default=True, metadata={"help": "Write RTC diagnostic JSONL"})
+    rtc_trace_output_dir: str = field(
+        default="logs/rtc_trace",
+        metadata={"help": "Directory for RTC diagnostic JSONL"},
     )
 
     # Debug configuration
@@ -295,6 +326,15 @@ class RobotClientConfig:
 
     def __post_init__(self):
         """Validate configuration after initialization."""
+        if isinstance(self.rtc_prefix_attention_schedule, str):
+            try:
+                self.rtc_prefix_attention_schedule = RTCAttentionSchedule(
+                    self.rtc_prefix_attention_schedule.upper()
+                )
+            except ValueError as exc:
+                choices = ", ".join(schedule.value for schedule in RTCAttentionSchedule)
+                raise ValueError(f"rtc_prefix_attention_schedule must be one of: {choices}") from exc
+
         if not self.server_address:
             raise ValueError("server_address cannot be empty")
 
@@ -319,6 +359,35 @@ class RobotClientConfig:
         if self.actions_per_chunk <= 0:
             raise ValueError(f"actions_per_chunk must be positive, got {self.actions_per_chunk}")
 
+        if self.obs_queue_timeout_s < 0:
+            raise ValueError("obs_queue_timeout_s must be non-negative")
+
+        if self.rtc_enable:
+            if self.policy_type != "pi05":
+                raise ValueError("RTC-CFG robot_client currently supports only policy_type=pi05")
+            if self.obs_queue_timeout_s == 0:
+                raise ValueError("RTC-CFG requires obs_queue_timeout_s to be positive")
+            if (
+                not isinstance(self.rtc_inference_delay, int)
+                or isinstance(self.rtc_inference_delay, bool)
+                or self.rtc_inference_delay < 0
+            ):
+                raise ValueError("rtc_inference_delay must be a non-negative integer")
+            if (
+                not isinstance(self.rtc_execution_horizon, int)
+                or isinstance(self.rtc_execution_horizon, bool)
+                or self.rtc_execution_horizon <= self.rtc_inference_delay
+            ):
+                raise ValueError("rtc_execution_horizon must be an integer larger than rtc_inference_delay")
+            if self.rtc_execution_horizon > self.actions_per_chunk:
+                raise ValueError("rtc_execution_horizon cannot exceed actions_per_chunk")
+            if not math.isfinite(self.rtc_max_guidance_weight) or self.rtc_max_guidance_weight <= 0:
+                raise ValueError("rtc_max_guidance_weight must be finite and positive")
+            if not math.isfinite(self.rtc_cfg_beta) or self.rtc_cfg_beta < 0:
+                raise ValueError("rtc_cfg_beta must be finite and non-negative")
+            if self.rtc_trace_enabled and not self.rtc_trace_output_dir.strip():
+                raise ValueError("rtc_trace_output_dir must be non-empty when tracing is enabled")
+
         self.aggregate_fn = get_aggregate_function(self.aggregate_fn_name)
 
     @classmethod
@@ -340,4 +409,13 @@ class RobotClientConfig:
             "task": self.task,
             "debug_visualize_queue_size": self.debug_visualize_queue_size,
             "aggregate_fn_name": self.aggregate_fn_name,
+            "rtc_enable": self.rtc_enable,
+            "obs_queue_timeout_s": self.obs_queue_timeout_s,
+            "rtc_inference_delay": self.rtc_inference_delay,
+            "rtc_execution_horizon": self.rtc_execution_horizon,
+            "rtc_max_guidance_weight": self.rtc_max_guidance_weight,
+            "rtc_prefix_attention_schedule": self.rtc_prefix_attention_schedule.value,
+            "rtc_cfg_beta": self.rtc_cfg_beta,
+            "rtc_trace_enabled": self.rtc_trace_enabled,
+            "rtc_trace_output_dir": self.rtc_trace_output_dir,
         }

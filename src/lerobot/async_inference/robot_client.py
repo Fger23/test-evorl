@@ -69,6 +69,7 @@ from lerobot.transport import (
     services_pb2_grpc,  # type: ignore
 )
 from lerobot.transport.utils import grpc_channel_options, send_bytes_in_chunks
+from lerobot.utils.robot_utils import precise_sleep
 
 from .configs import RobotClientConfig
 from .constants import SUPPORTED_ROBOTS
@@ -645,12 +646,112 @@ class RobotClient:
         return _captured_observation, _performed_action
 
 
+def _make_rtc_action_client(cfg: RobotClientConfig, robot: Robot):
+    """Build the protocol-v2 RTC client used only by this module entrypoint."""
+    from lerobot.scripts.recording_remote_policy import (
+        RemotePolicyActionClient,
+        RemotePolicyRecordConfig,
+    )
+
+    remote_cfg = RemotePolicyRecordConfig(
+        enable=True,
+        server_address=cfg.server_address,
+        policy_type=cfg.policy_type,
+        pretrained_name_or_path=cfg.pretrained_name_or_path,
+        policy_device=cfg.policy_device,
+        client_device=cfg.client_device,
+        actions_per_chunk=cfg.actions_per_chunk,
+        chunk_size_threshold=cfg.chunk_size_threshold,
+        # RTC installs a single raw/processed pair atomically; overlap
+        # aggregation is intentionally not part of this path.
+        aggregate_fn_name="latest_only",
+        obs_queue_timeout_s=cfg.obs_queue_timeout_s,
+        rtc_enable=True,
+        rtc_inference_delay=cfg.rtc_inference_delay,
+        rtc_execution_horizon=cfg.rtc_execution_horizon,
+        rtc_max_guidance_weight=cfg.rtc_max_guidance_weight,
+        rtc_prefix_attention_schedule=cfg.rtc_prefix_attention_schedule,
+        rtc_cfg_beta=cfg.rtc_cfg_beta,
+        rtc_trace_enabled=cfg.rtc_trace_enabled,
+        rtc_trace_output_dir=cfg.rtc_trace_output_dir,
+    )
+    return RemotePolicyActionClient(cfg=remote_cfg, robot=robot, fps=cfg.fps)
+
+
+def _rtc_control_loop(
+    cfg: RobotClientConfig,
+    robot: Robot,
+    action_client,
+    *,
+    max_steps: int | None = None,
+) -> int:
+    """Execute RTC actions and confirm only actions that reached the robot.
+
+    ``max_steps`` exists for deterministic unit tests. Production runs until
+    Ctrl+C, matching the historical robot client entrypoint.
+    """
+    executed_steps = 0
+    while max_steps is None or executed_steps < max_steps:
+        loop_start = time.perf_counter()
+        observation = robot.get_observation()
+        action = action_client.get_action(
+            observation=observation,
+            task=cfg.task,
+            timestep=executed_steps,
+        )
+
+        # The RTC actual-delay counter advances only after this call succeeds.
+        robot.send_action(action)
+        action_client.mark_action_executed()
+        executed_steps += 1
+
+        precise_sleep(max(cfg.environment_dt - (time.perf_counter() - loop_start), 0.0))
+
+    return executed_steps
+
+
+def run_rtc_client(cfg: RobotClientConfig) -> None:
+    """Run the dedicated RTC-CFG robot client lifecycle."""
+    logger = get_logger("rtc_robot_client")
+    robot = make_robot_from_config(cfg.robot)
+    action_client = None
+
+    try:
+        robot.connect()
+        action_client = _make_rtc_action_client(cfg, robot)
+        action_client.start()
+        # Reset after policy setup so the freshly loaded policy and the local
+        # raw/processed ActionQueue start in the same episode epoch.
+        action_client.reset()
+        logger.info(
+            "RTC-CFG client ready: server=%s, d=%d, H=%d, beta=%.3f, threshold=%.3f",
+            cfg.server_address,
+            cfg.rtc_inference_delay,
+            cfg.rtc_execution_horizon,
+            cfg.rtc_cfg_beta,
+            cfg.chunk_size_threshold,
+        )
+        _rtc_control_loop(cfg, robot, action_client)
+    except KeyboardInterrupt:
+        logger.info("RTC-CFG client interrupted by user")
+    finally:
+        if action_client is not None:
+            action_client.stop()
+        if robot.is_connected:
+            robot.disconnect()
+        logger.info("RTC-CFG client stopped")
+
+
 @draccus.wrap()
 def async_client(cfg: RobotClientConfig):
     logging.info(pformat(asdict(cfg)))
 
     if cfg.robot.type not in SUPPORTED_ROBOTS:
         raise ValueError(f"Robot {cfg.robot.type} not yet supported!")
+
+    if cfg.rtc_enable:
+        run_rtc_client(cfg)
+        return
 
     client = RobotClient(cfg)
 
