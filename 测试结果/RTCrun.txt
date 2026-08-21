@@ -6,6 +6,10 @@ python -m lerobot.scripts.lerobot_record \
     --robot.id=bimanual_follower \
     --robot.left_arm_config.cameras="{fixed: {type: intelrealsense, serial_number_or_name: '260322276426', width: 640, height: 480, fps: 30}, wrist: {type: opencv, index_or_path: /dev/video2, width: 640, height: 480, fps: 30, fourcc: MJPG}}" \
     --robot.right_arm_config.cameras="{wrist: {type: opencv, index_or_path: /dev/video0, width: 640, height: 480, fps: 30, fourcc: MJPG}}" \
+    --robot.left_arm_config.use_latest_camera_frames=true \
+    --robot.left_arm_config.camera_latest_max_age_ms=200 \
+    --robot.right_arm_config.use_latest_camera_frames=true \
+    --robot.right_arm_config.camera_latest_max_age_ms=200 \
     --remote_policy.enable=true \
     --remote_policy.server_address=10.61.5.8:8090 \
     --remote_policy.policy_type=pi05 \
@@ -14,6 +18,10 @@ python -m lerobot.scripts.lerobot_record \
     --remote_policy.actions_per_chunk=50 \
     --remote_policy.obs_queue_timeout_s=30 \
     --remote_policy.chunk_size_threshold=0.7 \
+    --remote_policy.observation_compression=auto \
+    --remote_policy.observation_zlib_level=1 \
+    --remote_policy.observation_compression_min_bytes=262144 \
+    --remote_policy.observation_compression_min_savings_ratio=0.05 \
     --remote_policy.rtc_enable=true \
     --remote_policy.rtc_inference_delay=21 \
     --remote_policy.rtc_execution_horizon=35 \
