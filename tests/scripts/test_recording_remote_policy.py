@@ -470,6 +470,28 @@ def test_pending_result_rejects_misaligned_processed_action_dimension(rtc_client
         rtc_client._apply_pending_result()
 
 
+@pytest.mark.parametrize(
+    ("field_name", "invalid_value", "message"),
+    [
+        ("inference_delay", 2, "inference_delay mismatch"),
+        ("execution_horizon", 4, "execution_horizon mismatch"),
+    ],
+)
+def test_pending_result_rejects_server_rtc_parameter_drift(rtc_client, field_name, invalid_value, message):
+    _seed_queue(rtc_client)
+    assert rtc_client._submit_if_needed(observation={}, task=None, timestep=0)
+    request = _take_submitted_request(rtc_client)
+    raw = torch.zeros(6, 2)
+    response = _make_response(request.request_id, raw, raw)
+    setattr(response, field_name, invalid_value)
+    with rtc_client._state_lock:
+        rtc_client._in_flight_request_id = None
+        rtc_client._pending_result = (request, response)
+
+    with pytest.raises(RuntimeError, match=message):
+        rtc_client._apply_pending_result()
+
+
 class _ReadyCall:
     def __init__(self, metadata):
         self._metadata = metadata

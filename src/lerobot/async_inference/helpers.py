@@ -324,6 +324,9 @@ class RemotePolicyConfig:
     # explicitly negotiate an aligned raw/processed RemoteActionChunk envelope.
     protocol_version: int = 1
     return_raw_actions: bool = False
+    # In policy-server client-managed mode these fields are the authoritative
+    # per-session CFG/RTC inference contract. Server-side trace/profile paths
+    # remain infrastructure settings and are intentionally not transported.
     rtc_enabled: bool = False
     rtc_inference_delay: int | None = None
     rtc_execution_horizon: int | None = None

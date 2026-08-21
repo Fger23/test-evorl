@@ -1,4 +1,12 @@
-//客户端
+# 1. H200 服务端（先启动）
+python -m lerobot.async_inference.policy_server \
+    --host=0.0.0.0 \
+    --port=8090 \
+    --acp_inference.enable=true \
+    --acp_inference.profile=true \
+    --acp_inference.profile_output_dir=outputs/acp_inference_profile
+
+# 2. 机器人客户端（服务端就绪后启动）
 python -m lerobot.scripts.lerobot_record \
     --robot.type=bi_so_follower \
     --robot.left_arm_config.port=/dev/ttyACM0 \
@@ -38,21 +46,3 @@ python -m lerobot.scripts.lerobot_record \
     --dataset.num_episodes=10 \
     --dataset.episode_time_s=3600 \
     --dataset.reset_time_s=15
-
-//服务端
-python -m lerobot.async_inference.policy_server \
-    --host=0.0.0.0 \
-    --port=8090 \
-    --acp_inference.enable=true \
-    --acp_inference.use_cfg=true \
-    --acp_inference.batched_cfg=true \
-    --acp_inference.cfg_beta=1.5 \
-    --acp_inference.rtc.enabled=true \
-    --acp_inference.rtc.inference_delay=21 \
-    --acp_inference.rtc.execution_horizon=35 \
-    --acp_inference.rtc.max_guidance_weight=10.0 \
-    --acp_inference.rtc.prefix_attention_schedule=LINEAR \
-    --acp_inference.rtc.trace_enabled=true \
-    --acp_inference.rtc.trace_output_dir=logs/rtc_trace \
-    --acp_inference.profile=true \
-    --acp_inference.profile_output_dir=outputs/acp_inference_profile

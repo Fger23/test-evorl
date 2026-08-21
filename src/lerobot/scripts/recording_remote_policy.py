@@ -1211,7 +1211,7 @@ class RemotePolicyActionClient:
         if not isinstance(payload, RemoteActionChunk):
             raise RuntimeError(
                 "RTC recording requires a v2 RemoteActionChunk response. "
-                "Start the policy server with `acp_inference.rtc.enabled=true`."
+                "Start the policy server with `acp_inference.enable=true` and use an RTC-enabled client."
             )
         if payload.request_id != request.request_id:
             raise RuntimeError(
@@ -1224,6 +1224,16 @@ class RemotePolicyActionClient:
             )
         if not payload.rtc_enabled:
             raise RuntimeError("The policy server returned a chunk without RTC enabled.")
+        if payload.inference_delay != self.cfg.rtc_inference_delay:
+            raise RuntimeError(
+                "RTC response inference_delay mismatch: "
+                f"expected {self.cfg.rtc_inference_delay}, got {payload.inference_delay}."
+            )
+        if payload.execution_horizon != self.cfg.rtc_execution_horizon:
+            raise RuntimeError(
+                "RTC response execution_horizon mismatch: "
+                f"expected {self.cfg.rtc_execution_horizon}, got {payload.execution_horizon}."
+            )
 
         raw_actions = payload.raw_actions
         if not isinstance(raw_actions, torch.Tensor) or raw_actions.ndim != 2:

@@ -25,12 +25,13 @@ python -m lerobot.async_inference.policy_server \
 """
 
 import logging
+import math
 import pickle  # nosec
 import threading
 import time
 from concurrent import futures
 from contextlib import suppress
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from pprint import pformat
 from queue import Empty, Queue
 from typing import Any
@@ -61,7 +62,7 @@ from lerobot.transport.utils import (
     receive_bytes_in_chunks,
 )
 
-from .configs import PolicyServerConfig
+from .configs import ACPInferenceConfig, PolicyServerConfig
 from .constants import SUPPORTED_POLICIES
 from .helpers import (
     FPSTracker,
@@ -95,6 +96,7 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         # forward already in progress. Serialize forwards so a reset cannot run
         # an old and a new Pi0.5 request concurrently on the same model.
         self._inference_lock = threading.Lock()
+        self._setup_lock = threading.Lock()
         self._generation_lock = threading.Lock()
         self._server_generation = 0
 
@@ -125,6 +127,10 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         self._client_rtc_enabled = False
         self._client_observation_wire_version = 0
         self._client_observation_codec = OBSERVATION_CODEC_NONE
+        # A successful policy setup installs one effective session config.
+        # ``None`` keeps direct/local server usage on the static CLI config.
+        self._effective_acp_inference: ACPInferenceConfig | None = None
+        self._acp_parameter_source = "server_static"
         rtc_trace = config.acp_inference.rtc
         self._rtc_trace = (
             create_rtc_trace(role="server", output_dir=rtc_trace.trace_output_dir)
@@ -156,13 +162,19 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         return self.policy.config.image_features
 
     @property
+    def acp_inference(self) -> ACPInferenceConfig:
+        """Return the immutable-for-this-session effective ACP configuration."""
+
+        return self._effective_acp_inference or self.config.acp_inference
+
+    @property
     def batched_cfg_enabled(self) -> bool:
-        acp = self.config.acp_inference
+        acp = self.acp_inference
         return acp.enable and acp.use_cfg and acp.batched_cfg
 
     @property
     def rtc_enabled(self) -> bool:
-        return self.batched_cfg_enabled and self.config.acp_inference.rtc.enabled
+        return self.batched_cfg_enabled and self.acp_inference.rtc.enabled
 
     @property
     def return_remote_action_chunk(self) -> bool:
@@ -190,44 +202,255 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
             return metadata.request_id
         return None
 
-    def _validate_client_rtc_contract(self, policy_specs: RemotePolicyConfig) -> None:
-        """Fail setup early if the robot and H200 would use different RTC/CFG parameters."""
-        if self._client_rtc_enabled and not self.rtc_enabled:
-            raise ValueError(
-                "The client requested RTC, but the server was not started with "
-                "`acp_inference.rtc.enabled=true`."
-            )
-        if not self.rtc_enabled:
-            return
+    @staticmethod
+    def _normalize_client_schedule(value: Any) -> RTCAttentionSchedule:
+        if isinstance(value, RTCAttentionSchedule):
+            return value
+        if isinstance(value, str):
+            try:
+                return RTCAttentionSchedule(value.upper())
+            except ValueError as exc:
+                choices = ", ".join(schedule.value for schedule in RTCAttentionSchedule)
+                raise ValueError(f"Client RTC attention schedule must be one of: {choices}.") from exc
+        raise TypeError("Client `rtc_prefix_attention_schedule` must be an RTCAttentionSchedule or string.")
 
-        rtc = self.config.acp_inference.rtc
+    def _resolve_client_acp_contract(
+        self,
+        policy_specs: RemotePolicyConfig,
+    ) -> tuple[ACPInferenceConfig, str]:
+        """Build a validated per-session ACP config without mutating server state.
+
+        An enable-only server config is client-managed.  The legacy fully
+        specified server config remains static and keeps its equality checks.
+        Profile/trace paths always remain server-owned.
+        """
+
+        server_acp = self.config.acp_inference
+        client_rtc_enabled = getattr(policy_specs, "rtc_enabled", False)
+        if not isinstance(client_rtc_enabled, bool):
+            raise TypeError("Client `rtc_enabled` must be a bool.")
+
+        if client_rtc_enabled and not server_acp.enable:
+            raise ValueError(
+                "The client requested RTC-CFG, but this server does not authorize ACP. "
+                "Start it with `--acp_inference.enable=true`."
+            )
+
+        if server_acp.client_managed:
+            if not client_rtc_enabled:
+                return (
+                    replace(
+                        server_acp,
+                        use_cfg=False,
+                        batched_cfg=False,
+                        rtc=replace(server_acp.rtc, enabled=False),
+                    ),
+                    "client_managed_disabled",
+                )
+
+            if policy_specs.policy_type != "pi05":
+                raise ValueError("Client-managed RTC-CFG currently supports only Pi0.5.")
+            protocol_version = getattr(policy_specs, "protocol_version", 1)
+            return_raw_actions = getattr(policy_specs, "return_raw_actions", False)
+            if protocol_version < 2 or return_raw_actions is not True:
+                raise ValueError(
+                    "Client-managed RTC-CFG requires protocol_version>=2 and return_raw_actions=true."
+                )
+
+            delay = getattr(policy_specs, "rtc_inference_delay", None)
+            horizon = getattr(policy_specs, "rtc_execution_horizon", None)
+            weight = getattr(policy_specs, "rtc_max_guidance_weight", None)
+            beta = getattr(policy_specs, "rtc_cfg_beta", None)
+            schedule = self._normalize_client_schedule(
+                getattr(policy_specs, "rtc_prefix_attention_schedule", None)
+            )
+            if not isinstance(delay, int) or isinstance(delay, bool) or delay < 0:
+                raise ValueError("Client `rtc_inference_delay` must be a non-negative integer.")
+            if not isinstance(horizon, int) or isinstance(horizon, bool) or horizon <= delay:
+                raise ValueError(
+                    "Client `rtc_execution_horizon` must be an integer greater than inference delay."
+                )
+            actions_per_chunk = getattr(policy_specs, "actions_per_chunk", None)
+            if (
+                not isinstance(actions_per_chunk, int)
+                or isinstance(actions_per_chunk, bool)
+                or actions_per_chunk <= 0
+            ):
+                raise ValueError("Client `actions_per_chunk` must be a positive integer.")
+            if horizon > actions_per_chunk:
+                raise ValueError("Client RTC execution horizon cannot exceed actions_per_chunk.")
+            if (
+                isinstance(weight, bool)
+                or not isinstance(weight, (int, float))
+                or not math.isfinite(float(weight))
+                or float(weight) <= 0
+            ):
+                raise ValueError("Client `rtc_max_guidance_weight` must be finite and > 0.")
+            if (
+                isinstance(beta, bool)
+                or not isinstance(beta, (int, float))
+                or not math.isfinite(float(beta))
+                or float(beta) < 0
+            ):
+                raise ValueError("Client `rtc_cfg_beta` must be finite and >= 0.")
+
+            effective_rtc = replace(
+                server_acp.rtc,
+                enabled=True,
+                inference_delay=delay,
+                execution_horizon=horizon,
+                max_guidance_weight=float(weight),
+                prefix_attention_schedule=schedule,
+            )
+            return (
+                replace(
+                    server_acp,
+                    use_cfg=True,
+                    batched_cfg=True,
+                    cfg_beta=float(beta),
+                    rtc=effective_rtc,
+                ),
+                "client_policy_setup",
+            )
+
+        server_rtc_enabled = server_acp.rtc.enabled
+        if client_rtc_enabled != server_rtc_enabled:
+            raise ValueError(
+                "RTC client/server enable mismatch: "
+                f"client={client_rtc_enabled}, server={server_rtc_enabled}."
+            )
+        if not server_rtc_enabled:
+            return server_acp, "server_static"
+
         expected = {
-            "rtc_inference_delay": rtc.inference_delay,
-            "rtc_execution_horizon": rtc.execution_horizon,
-            "rtc_max_guidance_weight": rtc.max_guidance_weight,
-            "rtc_prefix_attention_schedule": rtc.prefix_attention_schedule,
-            "rtc_cfg_beta": self.config.acp_inference.cfg_beta,
+            "rtc_inference_delay": server_acp.rtc.inference_delay,
+            "rtc_execution_horizon": server_acp.rtc.execution_horizon,
+            "rtc_max_guidance_weight": server_acp.rtc.max_guidance_weight,
+            "rtc_prefix_attention_schedule": server_acp.rtc.prefix_attention_schedule,
+            "rtc_cfg_beta": server_acp.cfg_beta,
         }
         mismatches = []
         for field_name, expected_value in expected.items():
             actual_value = getattr(policy_specs, field_name, None)
-            if field_name == "rtc_prefix_attention_schedule" and isinstance(actual_value, str):
-                with suppress(ValueError):
-                    actual_value = RTCAttentionSchedule(actual_value.upper())
+            if field_name == "rtc_prefix_attention_schedule":
+                with suppress(TypeError, ValueError):
+                    actual_value = self._normalize_client_schedule(actual_value)
             if actual_value != expected_value:
                 mismatches.append(f"{field_name}: client={actual_value!r}, server={expected_value!r}")
         if mismatches:
             self._trace_event(
                 "rtc_contract_mismatch",
                 mismatches=mismatches,
-                protocol_version=self._client_protocol_version,
-                client_rtc_enabled=self._client_rtc_enabled,
+                protocol_version=getattr(policy_specs, "protocol_version", 1),
+                client_rtc_enabled=client_rtc_enabled,
             )
             raise ValueError("RTC client/server parameter mismatch: " + "; ".join(mismatches))
+        return server_acp, "server_static"
+
+    def _ensure_runtime_rtc_trace(self) -> None:
+        rtc = self.acp_inference.rtc
+        if self._rtc_trace is None and self.rtc_enabled and rtc.trace_enabled:
+            self._rtc_trace = create_rtc_trace(role="server", output_dir=rtc.trace_output_dir)
+
+    def _install_policy_session(
+        self,
+        policy_specs: RemotePolicyConfig,
+        *,
+        effective_acp: ACPInferenceConfig,
+        parameter_source: str,
+        protocol_version: int,
+        return_raw_actions: bool,
+        client_rtc_enabled: bool,
+        observation_wire_version: int,
+        observation_codec: str,
+    ) -> float:
+        """Load and atomically install one policy/runtime configuration.
+
+        Model replacement shares the inference lock with CUDA forwards.  A
+        failed load restores the previous active policy/session instead of
+        leaving client fields and RTC semantics half-updated.
+        """
+
+        state_names = (
+            "device",
+            "policy_type",
+            "pretrained_name_or_path",
+            "lerobot_features",
+            "actions_per_chunk",
+            "policy",
+            "preprocessor",
+            "postprocessor",
+            "_client_protocol_version",
+            "_client_return_raw_actions",
+            "_client_rtc_enabled",
+            "_client_observation_wire_version",
+            "_client_observation_codec",
+            "_effective_acp_inference",
+            "_acp_parameter_source",
+        )
+
+        with self._setup_lock, self._inference_lock:
+            previous_state = {name: getattr(self, name) for name in state_names}
+            setup_started = time.perf_counter()
+            try:
+                self.device = policy_specs.device
+                self.policy_type = policy_specs.policy_type
+                self.pretrained_name_or_path = policy_specs.pretrained_name_or_path
+                self.lerobot_features = policy_specs.lerobot_features
+                self.actions_per_chunk = policy_specs.actions_per_chunk
+                self._client_protocol_version = protocol_version
+                self._client_return_raw_actions = return_raw_actions
+                self._client_rtc_enabled = client_rtc_enabled
+                self._client_observation_wire_version = observation_wire_version
+                self._client_observation_codec = observation_codec
+                self._effective_acp_inference = effective_acp
+                self._acp_parameter_source = parameter_source
+
+                policy_class = get_policy_class(self.policy_type)
+                self.policy = policy_class.from_pretrained(
+                    self.pretrained_name_or_path,
+                    device=self.device,
+                )
+                self.policy.to(self.device)
+                self._configure_policy_rtc()
+
+                device_override = {"device": self.device}
+                self.preprocessor, self.postprocessor = make_pre_post_processors(
+                    self.policy.config,
+                    pretrained_path=self.pretrained_name_or_path,
+                    preprocessor_overrides={
+                        "device_processor": device_override,
+                        "rename_observations_processor": {"rename_map": policy_specs.rename_map},
+                    },
+                    postprocessor_overrides={"device_processor": device_override},
+                )
+            except Exception:
+                for name, value in previous_state.items():
+                    setattr(self, name, value)
+                raise
+
+            self._ensure_runtime_rtc_trace()
+            self._configure_acp_profiler()
+            return time.perf_counter() - setup_started
 
     def _configure_policy_rtc(self) -> None:
         """Install an RTCProcessor into an already-loaded Pi0.5 checkpoint."""
         if not self.rtc_enabled:
+            if self._acp_parameter_source.startswith("client_managed"):
+                # A new non-RTC client session must not inherit a checkpoint or
+                # prior session's processor.  Pi0.5 setup always loads a fresh
+                # policy, but clear both wrapper/core fields defensively.
+                if hasattr(self.policy.config, "rtc_config"):
+                    self.policy.config.rtc_config = None
+                if hasattr(self.policy, "rtc_processor"):
+                    self.policy.rtc_processor = None
+                core_model = getattr(self.policy, "model", None)
+                if core_model is not None:
+                    if hasattr(core_model, "config"):
+                        core_model.config.rtc_config = None
+                    if hasattr(core_model, "rtc_processor"):
+                        core_model.rtc_processor = None
+                return
             if self.batched_cfg_enabled and getattr(self.policy.config, "rtc_config", None) is not None:
                 raise ValueError(
                     "Batched ACP-CFG profiling is a no-RTC baseline unless "
@@ -248,7 +471,7 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         if not hasattr(self.policy, "init_rtc_processor"):
             raise TypeError("The loaded Pi0.5 policy does not expose `init_rtc_processor()`.")
 
-        server_rtc = self.config.acp_inference.rtc
+        server_rtc = self.acp_inference.rtc
         model_chunk_size = int(self.policy.config.chunk_size)
         if self.actions_per_chunk > model_chunk_size:
             raise ValueError(
@@ -283,7 +506,8 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
             raise RuntimeError("Failed to attach RTCProcessor to the loaded Pi0.5 core model.")
 
         self.logger.info(
-            "Server-side RTC enabled (delay=%d, horizon=%d, weight=%.3f, schedule=%s).",
+            "Server-side RTC enabled (source=%s, delay=%d, horizon=%d, weight=%.3f, schedule=%s).",
+            self._acp_parameter_source,
             server_rtc.inference_delay,
             server_rtc.execution_horizon,
             server_rtc.max_guidance_weight,
@@ -310,7 +534,7 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         if not self.batched_cfg_enabled:
             return
 
-        acp = self.config.acp_inference
+        acp = self.acp_inference
         if acp.profile:
             from lerobot.scripts.acp_inference_profile import ACPInferenceProfiler
 
@@ -475,42 +699,45 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
                 f"Policy type {policy_specs.policy_type} not supported. "
                 f"Supported policies: {SUPPORTED_POLICIES}"
             )
-        if self.batched_cfg_enabled and policy_specs.policy_type != "pi05":
-            raise ValueError("Server-side batched ACP-CFG inference is supported only for Pi0.5.")
 
         # getattr preserves compatibility with RemotePolicyConfig objects
         # pickled by version-1 clients before these capability fields existed.
-        self._client_protocol_version = getattr(policy_specs, "protocol_version", 1)
-        self._client_return_raw_actions = getattr(policy_specs, "return_raw_actions", False)
-        self._client_rtc_enabled = getattr(policy_specs, "rtc_enabled", False)
-        self._client_observation_wire_version = getattr(policy_specs, "observation_wire_version", 0)
-        self._client_observation_codec = getattr(policy_specs, "observation_codec", OBSERVATION_CODEC_NONE)
+        client_protocol_version = getattr(policy_specs, "protocol_version", 1)
+        client_return_raw_actions = getattr(policy_specs, "return_raw_actions", False)
+        client_rtc_enabled = getattr(policy_specs, "rtc_enabled", False)
+        client_observation_wire_version = getattr(policy_specs, "observation_wire_version", 0)
+        client_observation_codec = getattr(policy_specs, "observation_codec", OBSERVATION_CODEC_NONE)
         if (
-            not isinstance(self._client_protocol_version, int)
-            or isinstance(self._client_protocol_version, bool)
-            or self._client_protocol_version < 1
+            not isinstance(client_protocol_version, int)
+            or isinstance(client_protocol_version, bool)
+            or client_protocol_version < 1
         ):
             raise ValueError("Remote policy `protocol_version` must be a positive integer.")
+        if not isinstance(client_return_raw_actions, bool):
+            raise TypeError("Remote policy `return_raw_actions` must be a bool.")
         if (
-            not isinstance(self._client_observation_wire_version, int)
-            or isinstance(self._client_observation_wire_version, bool)
-            or self._client_observation_wire_version < 0
+            not isinstance(client_observation_wire_version, int)
+            or isinstance(client_observation_wire_version, bool)
+            or client_observation_wire_version < 0
         ):
             raise ValueError("Remote policy `observation_wire_version` must be a non-negative integer.")
-        if not isinstance(self._client_observation_codec, str) or self._client_observation_codec not in {
+        if not isinstance(client_observation_codec, str) or client_observation_codec not in {
             OBSERVATION_CODEC_NONE,
             OBSERVATION_CODEC_ZLIB,
         }:
-            raise ValueError(f"Unsupported client observation codec {self._client_observation_codec!r}.")
-        if self._client_observation_codec == OBSERVATION_CODEC_ZLIB:
+            raise ValueError(f"Unsupported client observation codec {client_observation_codec!r}.")
+        if client_observation_codec == OBSERVATION_CODEC_ZLIB:
             if not self.config.accept_zlib_observations:
                 raise ValueError("This policy server is configured to reject zlib observations.")
-            if self._client_observation_wire_version != OBSERVATION_PAYLOAD_VERSION:
+            if client_observation_wire_version != OBSERVATION_PAYLOAD_VERSION:
                 raise ValueError(
                     "zlib observation transport requires observation wire version "
                     f"{OBSERVATION_PAYLOAD_VERSION}."
                 )
-        self._validate_client_rtc_contract(policy_specs)
+
+        effective_acp, parameter_source = self._resolve_client_acp_contract(policy_specs)
+        if effective_acp.enable and effective_acp.batched_cfg and policy_specs.policy_type != "pi05":
+            raise ValueError("Server-side batched ACP-CFG inference is supported only for Pi0.5.")
 
         self.logger.info(
             f"Receiving policy instructions from {client_id} | "
@@ -519,45 +746,37 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
             f"Actions per chunk: {policy_specs.actions_per_chunk} | "
             f"Device: {policy_specs.device}"
         )
-
-        self.device = policy_specs.device
-        self.policy_type = policy_specs.policy_type  # act, pi0, etc.
-        self.pretrained_name_or_path = policy_specs.pretrained_name_or_path
-        self.lerobot_features = policy_specs.lerobot_features
-        self.actions_per_chunk = policy_specs.actions_per_chunk
-
-        policy_class = get_policy_class(self.policy_type)
-
-        start = time.perf_counter()
-        # self.policy = policy_class.from_pretrained(policy_specs.pretrained_name_or_path)
-        # self.policy.to(self.device)
-        # Pass device parameter to from_pretrained to ensure model is initialized with correct device
-        self.policy = policy_class.from_pretrained(
-            policy_specs.pretrained_name_or_path,
-            device=self.device,
-        )
-        # Move policy to device (in case device wasn't set during initialization)
-        self.policy.to(self.device)
-
-        self._configure_policy_rtc()
-
-        # Load preprocessor and postprocessor, overriding device to match requested device
-        device_override = {"device": self.device}
-        self.preprocessor, self.postprocessor = make_pre_post_processors(
-            self.policy.config,
-            pretrained_path=policy_specs.pretrained_name_or_path,
-            preprocessor_overrides={
-                "device_processor": device_override,
-                "rename_observations_processor": {"rename_map": policy_specs.rename_map},
-            },
-            postprocessor_overrides={"device_processor": device_override},
+        setup_time = self._install_policy_session(
+            policy_specs,
+            effective_acp=effective_acp,
+            parameter_source=parameter_source,
+            protocol_version=client_protocol_version,
+            return_raw_actions=client_return_raw_actions,
+            client_rtc_enabled=client_rtc_enabled,
+            observation_wire_version=client_observation_wire_version,
+            observation_codec=client_observation_codec,
         )
 
-        self._configure_acp_profiler()
-
-        end = time.perf_counter()
-
-        self.logger.info(f"Time taken to put policy on {self.device}: {end - start:.4f} seconds")
+        self.logger.info(
+            "Time taken to put policy on %s: %.4f seconds (ACP parameters=%s)",
+            self.device,
+            setup_time,
+            self._acp_parameter_source,
+        )
+        self._trace_event(
+            "client_inference_contract_applied",
+            peer=client_id,
+            parameter_source=self._acp_parameter_source,
+            batched_cfg_enabled=self.batched_cfg_enabled,
+            rtc_enabled=self.rtc_enabled,
+            cfg_beta=self.acp_inference.cfg_beta if self.batched_cfg_enabled else None,
+            inference_delay=(self.acp_inference.rtc.inference_delay if self.rtc_enabled else None),
+            execution_horizon=(self.acp_inference.rtc.execution_horizon if self.rtc_enabled else None),
+            max_guidance_weight=(self.acp_inference.rtc.max_guidance_weight if self.rtc_enabled else None),
+            prefix_attention_schedule=(
+                self.acp_inference.rtc.prefix_attention_schedule if self.rtc_enabled else None
+            ),
+        )
         self._trace_event(
             "policy_loaded",
             peer=client_id,
@@ -567,10 +786,12 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
             actions_per_chunk=self.actions_per_chunk,
             model_chunk_size=getattr(self.policy.config, "chunk_size", None),
             model_action_dim=getattr(self.policy.config, "max_action_dim", None),
-            setup_ms=(end - start) * 1000,
+            setup_ms=setup_time * 1000,
             protocol_version=self._client_protocol_version,
             return_raw_actions=self._client_return_raw_actions,
             rtc_enabled=self.rtc_enabled,
+            acp_parameter_source=self._acp_parameter_source,
+            cfg_beta=self.acp_inference.cfg_beta if self.batched_cfg_enabled else None,
             observation_wire_version=self._client_observation_wire_version,
             observation_codec=self._client_observation_codec,
         )
@@ -1146,7 +1367,7 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         device: torch.device,
     ) -> tuple[torch.Tensor | None, int, int]:
         """Canonicalize one raw leftover and share it across the U/C rows."""
-        rtc = self.config.acp_inference.rtc
+        rtc = self.acp_inference.rtc
         requested_delay = (
             metadata.inference_delay
             if metadata is not None and metadata.inference_delay is not None
@@ -1167,9 +1388,9 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
             raise ValueError("RTC `execution_horizon` must be an integer greater than inference delay.")
         if requested_delay != rtc.inference_delay or requested_horizon != rtc.execution_horizon:
             raise ValueError(
-                "Per-request RTC parameters must match the negotiated server configuration: "
+                "Per-request RTC parameters must match the negotiated session configuration: "
                 f"client delay/horizon={requested_delay}/{requested_horizon}, "
-                f"server={rtc.inference_delay}/{rtc.execution_horizon}."
+                f"session={rtc.inference_delay}/{rtc.execution_horizon}."
             )
 
         leftover = metadata.prev_chunk_left_over if metadata is not None else None
@@ -1268,7 +1489,7 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
 
         raw_uncond = raw_chunks[0:1]
         raw_cond = raw_chunks[1:2]
-        raw_cfg = raw_uncond + self.config.acp_inference.cfg_beta * (raw_cond - raw_uncond)
+        raw_cfg = raw_uncond + self.acp_inference.cfg_beta * (raw_cond - raw_uncond)
         if not bool(torch.isfinite(raw_cfg).all()):
             raise FloatingPointError("Batched ACP-CFG produced a non-finite raw action chunk.")
         if cuda_end is not None:
@@ -1347,7 +1568,7 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         raw_cfg = artifacts["cfg_raw"]
         shared_noise = artifacts["shared_noise"]
         branch_delta = raw_cond - raw_uncond
-        acp = self.config.acp_inference
+        acp = self.acp_inference
 
         metrics = {
             "chunk_index": self._acp_chunk_index,
@@ -1358,6 +1579,7 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
             "dtype": str(raw_cfg.dtype),
             "batch_size": 2,
             "cfg_beta": acp.cfg_beta,
+            "acp_parameter_source": self._acp_parameter_source,
             "fps": self.config.fps,
             "model_chunk_size": int(self.policy.config.chunk_size),
             "execution_steps": int(processed_cfg.shape[1]),
@@ -1551,7 +1773,7 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
             effective_execution_horizon=(
                 acp_artifacts["rtc_execution_horizon"] if acp_artifacts is not None else None
             ),
-            cfg_beta=self.config.acp_inference.cfg_beta if self.batched_cfg_enabled else None,
+            cfg_beta=self.acp_inference.cfg_beta if self.batched_cfg_enabled else None,
             prepare_ms=prepare_time * 1000,
             prepare_calling_thread_cpu_ms=prepare_cpu_time * 1000,
             prepare_non_calling_thread_or_wait_ms=max(prepare_time - prepare_cpu_time, 0) * 1000,

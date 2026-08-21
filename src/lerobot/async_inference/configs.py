@@ -93,6 +93,11 @@ class ACPInferenceConfig:
 
     The defaults preserve the original single-branch policy-server behavior.
     All fields are nested under ``--acp_inference.*`` in the policy-server CLI.
+
+    ``enable=true`` with both ``use_cfg`` and ``batched_cfg`` left false is the
+    client-managed mode: the server authorizes ACP, while an RTC-capable client
+    supplies the effective CFG/RTC parameters during policy setup.  Setting
+    both legacy flags true keeps the original server-static configuration.
     """
 
     enable: bool = False
@@ -111,10 +116,13 @@ class ACPInferenceConfig:
             self.rtc = ACPRTCConfig(**self.rtc)
         if self.use_cfg and not self.enable:
             raise ValueError("`acp_inference.use_cfg=true` requires `acp_inference.enable=true`.")
-        if self.batched_cfg and not self.use_cfg:
-            raise ValueError("`acp_inference.batched_cfg=true` requires `acp_inference.use_cfg=true`.")
-        if self.profile and not self.batched_cfg:
-            raise ValueError("`acp_inference.profile=true` requires `acp_inference.batched_cfg=true`.")
+        if self.use_cfg != self.batched_cfg:
+            raise ValueError(
+                "`acp_inference.use_cfg` and `acp_inference.batched_cfg` must both be true "
+                "(server-static mode) or both be false (client-managed mode)."
+            )
+        if self.profile and not self.enable:
+            raise ValueError("`acp_inference.profile=true` requires `acp_inference.enable=true`.")
         if self.rtc.enabled and not (self.enable and self.use_cfg and self.batched_cfg):
             raise ValueError(
                 "`acp_inference.rtc.enabled=true` requires ACP `enable=true`, "
@@ -130,6 +138,12 @@ class ACPInferenceConfig:
             or self.profile_warmup_chunks < 0
         ):
             raise ValueError("`acp_inference.profile_warmup_chunks` must be a non-negative integer.")
+
+    @property
+    def client_managed(self) -> bool:
+        """Whether remote policy setup supplies the effective CFG/RTC values."""
+
+        return self.enable and not self.use_cfg and not self.batched_cfg
 
 
 @dataclass
@@ -190,12 +204,6 @@ class PolicyServerConfig:
             or self.max_observation_payload_bytes <= 0
         ):
             raise ValueError("max_observation_payload_bytes must be a positive integer")
-
-        if self.acp_inference.enable and not (self.acp_inference.use_cfg and self.acp_inference.batched_cfg):
-            raise ValueError(
-                "PolicyServer ACP inference currently requires "
-                "`enable=true`, `use_cfg=true`, and `batched_cfg=true`."
-            )
 
     @classmethod
     def from_dict(cls, config_dict: dict) -> "PolicyServerConfig":
