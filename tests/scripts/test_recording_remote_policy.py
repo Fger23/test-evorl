@@ -471,6 +471,48 @@ def test_pending_result_rejects_misaligned_processed_action_dimension(rtc_client
 
 
 @pytest.mark.parametrize(
+    ("configured_delay", "leftover_steps", "server_delay", "server_horizon"),
+    [
+        (1, 2, 1, 2),
+        (2, 1, 1, 1),
+    ],
+)
+def test_pending_result_accepts_effective_rtc_window_for_short_leftover(
+    rtc_client,
+    configured_delay,
+    leftover_steps,
+    server_delay,
+    server_horizon,
+):
+    rtc_client.cfg.rtc_inference_delay = configured_delay
+    old_raw = torch.arange(leftover_steps * 2, dtype=torch.float32).reshape(leftover_steps, 2)
+    old_processed = old_raw + 100
+    assert isinstance(rtc_client.action_queue, ActionQueue)
+    rtc_client.action_queue.merge(old_raw, old_processed, real_delay=0)
+
+    assert rtc_client._submit_if_needed(observation={}, task=None, timestep=0)
+    request = _take_submitted_request(rtc_client)
+    assert request.left_over is not None
+    assert request.left_over.shape[0] == leftover_steps
+
+    new_raw = torch.arange(12, dtype=torch.float32).reshape(6, 2)
+    response = _make_response(request.request_id, new_raw, new_raw + 1_000)
+    response.inference_delay = server_delay
+    response.execution_horizon = server_horizon
+    with rtc_client._state_lock:
+        rtc_client._in_flight_request_id = None
+        rtc_client._pending_result = (request, response)
+
+    assert rtc_client._apply_pending_result()
+    assert rtc_client.action_queue.qsize() == 6
+    installed = _trace_events(rtc_client, "chunk_installed")[-1]
+    assert installed["expected_effective_inference_delay"] == server_delay
+    assert installed["expected_effective_execution_horizon"] == server_horizon
+    assert installed["server_inference_delay"] == server_delay
+    assert installed["server_execution_horizon"] == server_horizon
+
+
+@pytest.mark.parametrize(
     ("field_name", "invalid_value", "message"),
     [
         ("inference_delay", 2, "inference_delay mismatch"),

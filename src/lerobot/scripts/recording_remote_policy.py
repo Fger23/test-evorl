@@ -185,6 +185,8 @@ class _InferenceRequest:
     task: str | None
     timestep: int
     left_over: torch.Tensor | None
+    rtc_inference_delay: int | None
+    rtc_execution_horizon: int | None
     executed_steps_at_submit: int
     queue_size_at_submit: int
     submitted_at_wall_s: float
@@ -752,6 +754,8 @@ class RemotePolicyActionClient:
                 task=task,
                 timestep=max(timestep, 0),
                 left_over=left_over,
+                rtc_inference_delay=(self.cfg.rtc_inference_delay if self.cfg.rtc_enable else None),
+                rtc_execution_horizon=(self.cfg.rtc_execution_horizon if self.cfg.rtc_enable else None),
                 executed_steps_at_submit=self._executed_steps,
                 queue_size_at_submit=queue_size,
                 submitted_at_wall_s=submitted_at_wall_s,
@@ -773,8 +777,8 @@ class RemotePolicyActionClient:
                 leftover=tensor_metadata(request.left_over),
                 executed_steps_at_submit=request.executed_steps_at_submit,
                 observation_snapshot_ms=request.observation_snapshot_ms,
-                estimated_inference_delay=self.cfg.rtc_inference_delay,
-                execution_horizon=self.cfg.rtc_execution_horizon,
+                estimated_inference_delay=request.rtc_inference_delay,
+                execution_horizon=request.rtc_execution_horizon,
             )
             try:
                 self._request_queue.put_nowait(request)
@@ -892,8 +896,8 @@ class RemotePolicyActionClient:
                 RTCInferenceMetadata(
                     request_id=request.request_id,
                     prev_chunk_left_over=request.left_over,
-                    inference_delay=self.cfg.rtc_inference_delay,
-                    execution_horizon=self.cfg.rtc_execution_horizon,
+                    inference_delay=request.rtc_inference_delay,
+                    execution_horizon=request.rtc_execution_horizon,
                 )
                 if self.cfg.rtc_enable
                 else None
@@ -1174,6 +1178,30 @@ class RemotePolicyActionClient:
             )
             raise
 
+    @staticmethod
+    def _expected_rtc_response_parameters(request: _InferenceRequest) -> tuple[int, int]:
+        """Mirror the server's per-request RTC window clamping.
+
+        The negotiated delay and horizon remain fixed for the session, but the
+        server reports the effective values used by this request. A non-empty
+        leftover shorter than the configured horizon legally shrinks the
+        horizon, and can also shrink the delay. Empty/no leftover follows the
+        server's no-prefix path and keeps the configured values.
+        """
+
+        configured_delay = request.rtc_inference_delay
+        configured_horizon = request.rtc_execution_horizon
+        if configured_delay is None or configured_horizon is None:
+            raise RuntimeError("RTC request is missing its delay/horizon snapshot.")
+
+        leftover = request.left_over
+        if leftover is None or len(leftover) == 0:
+            return configured_delay, configured_horizon
+
+        effective_horizon = min(configured_horizon, len(leftover))
+        effective_delay = min(configured_delay, effective_horizon)
+        return effective_delay, effective_horizon
+
     def _apply_pending_result_impl(self) -> bool:
         with self._state_lock:
             pending = self._pending_result
@@ -1224,15 +1252,16 @@ class RemotePolicyActionClient:
             )
         if not payload.rtc_enabled:
             raise RuntimeError("The policy server returned a chunk without RTC enabled.")
-        if payload.inference_delay != self.cfg.rtc_inference_delay:
+        expected_delay, expected_horizon = self._expected_rtc_response_parameters(request)
+        if payload.inference_delay != expected_delay:
             raise RuntimeError(
                 "RTC response inference_delay mismatch: "
-                f"expected {self.cfg.rtc_inference_delay}, got {payload.inference_delay}."
+                f"expected effective value {expected_delay}, got {payload.inference_delay}."
             )
-        if payload.execution_horizon != self.cfg.rtc_execution_horizon:
+        if payload.execution_horizon != expected_horizon:
             raise RuntimeError(
                 "RTC response execution_horizon mismatch: "
-                f"expected {self.cfg.rtc_execution_horizon}, got {payload.execution_horizon}."
+                f"expected effective value {expected_horizon}, got {payload.execution_horizon}."
             )
 
         raw_actions = payload.raw_actions
@@ -1314,11 +1343,13 @@ class RemotePolicyActionClient:
                 ),
                 response_steps=int(raw_actions.shape[0]),
                 action_dim=int(raw_actions.shape[1]),
-                estimated_inference_delay=self.cfg.rtc_inference_delay,
+                estimated_inference_delay=request.rtc_inference_delay,
+                expected_effective_inference_delay=expected_delay,
                 server_inference_delay=payload.inference_delay,
                 actual_delay=actual_delay,
-                delay_delta=actual_delay - self.cfg.rtc_inference_delay,
-                execution_horizon=self.cfg.rtc_execution_horizon,
+                delay_delta=actual_delay - request.rtc_inference_delay,
+                execution_horizon=request.rtc_execution_horizon,
+                expected_effective_execution_horizon=expected_horizon,
                 server_execution_horizon=payload.execution_horizon,
                 discarded_prefix_steps=actual_delay,
                 installed_steps=int(raw_actions.shape[0]) - actual_delay,
