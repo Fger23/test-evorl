@@ -74,6 +74,14 @@ class RemotePolicyRecordConfig:
     obs_queue_timeout_s: float = 2.0
     rename_map: dict[str, str] = field(default_factory=dict)
 
+    # Lossless observation transport. ``none`` preserves the historical raw
+    # pickle bytes; ``auto`` negotiates zlib and falls back safely; ``zlib``
+    # requires a server that advertises support.
+    observation_compression: str = "none"
+    observation_zlib_level: int = 1
+    observation_compression_min_bytes: int = 256 * 1024
+    observation_compression_min_savings_ratio: float = 0.05
+
     # Estimated RTC values are used inside denoising. The response is still
     # cropped with the number of actions actually sent while the RPC ran.
     rtc_enable: bool = False
@@ -118,6 +126,24 @@ class RemotePolicyRecordConfig:
             )
         if self.obs_queue_timeout_s < 0:
             raise ValueError("`remote_policy.obs_queue_timeout_s` must be non-negative.")
+        if self.observation_compression not in {"none", "auto", "zlib"}:
+            raise ValueError("`remote_policy.observation_compression` must be one of: none, auto, zlib.")
+        if (
+            not isinstance(self.observation_zlib_level, int)
+            or isinstance(self.observation_zlib_level, bool)
+            or not 0 <= self.observation_zlib_level <= 9
+        ):
+            raise ValueError("`remote_policy.observation_zlib_level` must be an integer from 0 to 9.")
+        if (
+            not isinstance(self.observation_compression_min_bytes, int)
+            or isinstance(self.observation_compression_min_bytes, bool)
+            or self.observation_compression_min_bytes < 0
+        ):
+            raise ValueError(
+                "`remote_policy.observation_compression_min_bytes` must be a non-negative integer."
+            )
+        if not 0 <= self.observation_compression_min_savings_ratio < 1:
+            raise ValueError("`remote_policy.observation_compression_min_savings_ratio` must be in [0, 1).")
 
         if (
             not isinstance(self.rtc_inference_delay, int)
@@ -171,8 +197,15 @@ class _SendObservationMetrics:
     """Client-side request serialization and upload timings."""
 
     serialize_ms: float
+    compression_ms: float
+    uncompressed_payload_bytes: int
     payload_bytes: int
     chunk_count: int
+    compression_ratio: float
+    codec_requested: str
+    codec_selected: str
+    codec_used: str
+    compression_skipped_reason: str | None
     rpc_ms: float
     total_ms: float
 
@@ -252,6 +285,11 @@ class RemotePolicyActionClient:
         self._awaiting_execution_confirmation = False
         self._last_get_action_metrics: dict[str, Any] | None = None
         self._started = False
+        self._server_observation_codecs: set[str] = {"none"}
+        self._server_observation_wire_version = 0
+        self._observation_wire_version = 0
+        self._observation_codec = "none"
+        self._observation_compression_fallback_reason: str | None = None
         self._rtc_trace = (
             create_rtc_trace(role="client", output_dir=cfg.rtc_trace_output_dir)
             if cfg.rtc_enable and cfg.rtc_trace_enabled
@@ -334,6 +372,98 @@ class RemotePolicyActionClient:
                 fields["grpc_details"] = details_fn()
         return fields
 
+    @staticmethod
+    def _metadata_items(metadata: Any) -> dict[str, str]:
+        """Normalize gRPC metadata while remaining friendly to test doubles."""
+
+        result: dict[str, str] = {}
+        for item in metadata or ():
+            try:
+                key, value = item
+            except (TypeError, ValueError):
+                key = getattr(item, "key", None)
+                value = getattr(item, "value", None)
+            if key is not None and value is not None:
+                result[str(key).lower()] = str(value)
+        return result
+
+    def _ready_and_negotiate_observation_codec(self) -> None:
+        """Run Ready and select a codec without breaking old policy servers."""
+
+        from lerobot.transport.utils import (
+            OBSERVATION_CODEC_NONE,
+            OBSERVATION_CODEC_ZLIB,
+            OBSERVATION_CODECS_METADATA_KEY,
+            OBSERVATION_PAYLOAD_VERSION,
+            OBSERVATION_WIRE_VERSION_METADATA_KEY,
+        )
+
+        ready_rpc = self.stub.Ready
+        with_call = getattr(ready_rpc, "with_call", None)
+        if callable(with_call):
+            _, call = with_call(self.services_pb2.Empty())
+            trailing_metadata = call.trailing_metadata()
+        else:
+            # Simple stubs and old test doubles expose only __call__.  An old
+            # real server also advertises no metadata and therefore behaves the
+            # same as this conservative fallback.
+            ready_rpc(self.services_pb2.Empty())
+            trailing_metadata = ()
+
+        metadata = self._metadata_items(trailing_metadata)
+        advertised = {
+            codec.strip().lower()
+            for codec in metadata.get(OBSERVATION_CODECS_METADATA_KEY, OBSERVATION_CODEC_NONE).split(",")
+            if codec.strip()
+        }
+        advertised.add(OBSERVATION_CODEC_NONE)
+        try:
+            wire_version = int(metadata.get(OBSERVATION_WIRE_VERSION_METADATA_KEY, "0"))
+        except ValueError:
+            wire_version = 0
+
+        requested = self.cfg.observation_compression
+        zlib_advertised = OBSERVATION_CODEC_ZLIB in advertised
+        zlib_available = zlib_advertised and wire_version == OBSERVATION_PAYLOAD_VERSION
+        fallback_reason = None
+        if requested == OBSERVATION_CODEC_NONE:
+            selected = OBSERVATION_CODEC_NONE
+        elif requested == "auto":
+            selected = OBSERVATION_CODEC_ZLIB if zlib_available else OBSERVATION_CODEC_NONE
+            if selected == OBSERVATION_CODEC_NONE:
+                fallback_reason = (
+                    "incompatible_observation_wire_version"
+                    if zlib_advertised
+                    else "server_did_not_advertise_zlib"
+                )
+        elif not zlib_available:
+            raise RuntimeError(
+                "`remote_policy.observation_compression=zlib` requires a policy server that "
+                f"advertises observation wire version {OBSERVATION_PAYLOAD_VERSION} and the "
+                "zlib codec. Use `auto` to "
+                "fall back when connecting to an older server."
+            )
+        else:
+            selected = OBSERVATION_CODEC_ZLIB
+
+        self._server_observation_codecs = advertised
+        self._server_observation_wire_version = wire_version
+        self._observation_wire_version = (
+            OBSERVATION_PAYLOAD_VERSION if selected == OBSERVATION_CODEC_ZLIB else 0
+        )
+        self._observation_codec = selected
+        self._observation_compression_fallback_reason = fallback_reason
+        self._trace_event(
+            "observation_transport_negotiated",
+            session_id=self._session_id,
+            observation_codec_requested=requested,
+            observation_codec_advertised=sorted(advertised),
+            observation_codec_selected=selected,
+            observation_wire_version=self._observation_wire_version,
+            server_observation_wire_version=wire_version,
+            observation_compression_fallback_reason=fallback_reason,
+        )
+
     def start(self) -> None:
         """Negotiate the payload format and start the persistent RPC worker."""
         if self._started:
@@ -354,6 +484,10 @@ class RemotePolicyActionClient:
             actions_per_chunk=self.cfg.actions_per_chunk,
             chunk_size_threshold=self.cfg.chunk_size_threshold,
             rpc_timeout_s=self.cfg.obs_queue_timeout_s,
+            observation_codec_requested=self.cfg.observation_compression,
+            observation_zlib_level=self.cfg.observation_zlib_level,
+            observation_compression_min_bytes=self.cfg.observation_compression_min_bytes,
+            observation_compression_min_savings_ratio=(self.cfg.observation_compression_min_savings_ratio),
             rtc_enabled=self.cfg.rtc_enable,
             cfg_beta=self.cfg.rtc_cfg_beta,
             inference_delay=self.cfg.rtc_inference_delay,
@@ -362,7 +496,7 @@ class RemotePolicyActionClient:
             prefix_attention_schedule=self.cfg.rtc_prefix_attention_schedule,
         )
         try:
-            self.stub.Ready(self.services_pb2.Empty())
+            self._ready_and_negotiate_observation_codec()
             policy_config = RemotePolicyConfig(
                 policy_type=self.cfg.policy_type,
                 pretrained_name_or_path=self.cfg.pretrained_name_or_path,
@@ -380,6 +514,8 @@ class RemotePolicyActionClient:
                     self.cfg.rtc_prefix_attention_schedule if self.cfg.rtc_enable else None
                 ),
                 rtc_cfg_beta=self.cfg.rtc_cfg_beta if self.cfg.rtc_enable else None,
+                observation_wire_version=self._observation_wire_version,
+                observation_codec=self._observation_codec,
             )
             self.stub.SendPolicyInstructions(self.services_pb2.PolicySetup(data=pickle.dumps(policy_config)))
         except Exception as exc:
@@ -402,6 +538,10 @@ class RemotePolicyActionClient:
             "client_started",
             session_id=self._session_id,
             setup_ms=(time.perf_counter() - setup_start) * 1000,
+            observation_codec_requested=self.cfg.observation_compression,
+            observation_codec_selected=self._observation_codec,
+            observation_wire_version=self._observation_wire_version,
+            server_observation_wire_version=self._server_observation_wire_version,
         )
         logging.info(
             "Remote policy recording client connected to %s (RTC=%s, d=%d, H=%d, trace=%s).",
@@ -736,7 +876,7 @@ class RemotePolicyActionClient:
 
     def _send_observation(self, request: _InferenceRequest) -> _SendObservationMetrics:
         from lerobot.async_inference.helpers import RTCInferenceMetadata, TimedObservation
-        from lerobot.transport.utils import CHUNK_SIZE, send_bytes_in_chunks
+        from lerobot.transport.utils import CHUNK_SIZE, encode_observation_payload, send_bytes_in_chunks
 
         total_started = time.perf_counter()
         raw_observation = dict(request.observation)
@@ -762,7 +902,17 @@ class RemotePolicyActionClient:
         serialize_started = time.perf_counter()
         serialized_observation = pickle.dumps(timed_observation)
         serialize_ms = (time.perf_counter() - serialize_started) * 1000
-        payload_bytes = len(serialized_observation)
+        codec_selected = getattr(self, "_observation_codec", "none")
+        encoded_observation = encode_observation_payload(
+            serialized_observation,
+            codec=codec_selected,
+            zlib_level=self.cfg.observation_zlib_level,
+            min_bytes=self.cfg.observation_compression_min_bytes,
+            min_savings_ratio=self.cfg.observation_compression_min_savings_ratio,
+            require_savings=self.cfg.observation_compression == "auto",
+        )
+        wire_observation = encoded_observation.data
+        payload_bytes = encoded_observation.wire_bytes
         chunk_count = (payload_bytes + CHUNK_SIZE - 1) // CHUNK_SIZE
         self._trace_event(
             "observation_serialized",
@@ -771,11 +921,19 @@ class RemotePolicyActionClient:
             episode_epoch=request.episode_epoch,
             observation_timestep=request.timestep,
             observation_serialize_ms=serialize_ms,
+            observation_compress_ms=encoded_observation.compression_ms,
+            observation_pickle_bytes=encoded_observation.raw_bytes,
             request_payload_bytes=payload_bytes,
             request_chunk_count=chunk_count,
+            observation_compression_ratio=encoded_observation.compression_ratio,
+            observation_compression_savings_bytes=encoded_observation.raw_bytes - payload_bytes,
+            observation_codec_requested=self.cfg.observation_compression,
+            observation_codec_selected=codec_selected,
+            observation_codec_used=encoded_observation.codec,
+            observation_compression_skipped_reason=encoded_observation.skipped_reason,
         )
         observation_iterator = send_bytes_in_chunks(
-            serialized_observation,
+            wire_observation,
             self.services_pb2.Observation,
             log_prefix="[RECORD_REMOTE_POLICY] Observation",
             silent=True,
@@ -791,8 +949,15 @@ class RemotePolicyActionClient:
         rpc_ms = (time.perf_counter() - rpc_started) * 1000
         metrics = _SendObservationMetrics(
             serialize_ms=serialize_ms,
+            compression_ms=encoded_observation.compression_ms,
+            uncompressed_payload_bytes=encoded_observation.raw_bytes,
             payload_bytes=payload_bytes,
             chunk_count=chunk_count,
+            compression_ratio=encoded_observation.compression_ratio,
+            codec_requested=self.cfg.observation_compression,
+            codec_selected=codec_selected,
+            codec_used=encoded_observation.codec,
+            compression_skipped_reason=encoded_observation.skipped_reason,
             rpc_ms=rpc_ms,
             total_ms=(time.perf_counter() - total_started) * 1000,
         )
@@ -804,8 +969,18 @@ class RemotePolicyActionClient:
             observation_timestep=request.timestep,
             observation_snapshot_ms=request.observation_snapshot_ms,
             observation_serialize_ms=metrics.serialize_ms,
+            observation_compress_ms=metrics.compression_ms,
+            observation_pickle_bytes=metrics.uncompressed_payload_bytes,
             request_payload_bytes=metrics.payload_bytes,
             request_chunk_count=metrics.chunk_count,
+            observation_compression_ratio=metrics.compression_ratio,
+            observation_compression_savings_bytes=(
+                metrics.uncompressed_payload_bytes - metrics.payload_bytes
+            ),
+            observation_codec_requested=metrics.codec_requested,
+            observation_codec_selected=metrics.codec_selected,
+            observation_codec_used=metrics.codec_used,
+            observation_compression_skipped_reason=metrics.compression_skipped_reason,
             observation_upload_rpc_ms=metrics.rpc_ms,
             send_total_ms=metrics.total_ms,
         )
@@ -901,8 +1076,18 @@ class RemotePolicyActionClient:
                             observation_timestep=request.timestep,
                             observation_snapshot_ms=request.observation_snapshot_ms,
                             observation_serialize_ms=send_metrics.serialize_ms,
+                            observation_compress_ms=send_metrics.compression_ms,
+                            observation_pickle_bytes=send_metrics.uncompressed_payload_bytes,
                             request_payload_bytes=send_metrics.payload_bytes,
                             request_chunk_count=send_metrics.chunk_count,
+                            observation_compression_ratio=send_metrics.compression_ratio,
+                            observation_compression_savings_bytes=(
+                                send_metrics.uncompressed_payload_bytes - send_metrics.payload_bytes
+                            ),
+                            observation_codec_requested=send_metrics.codec_requested,
+                            observation_codec_selected=send_metrics.codec_selected,
+                            observation_codec_used=send_metrics.codec_used,
+                            observation_compression_skipped_reason=(send_metrics.compression_skipped_reason),
                             # Preserve the historical aggregate fields so old
                             # analysis scripts keep working. The explicitly
                             # named fields below contain pure RPC durations.
@@ -916,7 +1101,9 @@ class RemotePolicyActionClient:
                             get_actions_poll_count=receive_metrics.poll_count,
                             receive_total_ms=receive_metrics.total_ms,
                             latency_field_semantics={
-                                "send_rpc_ms": "legacy observation serialization + upload RPC total",
+                                "send_rpc_ms": (
+                                    "legacy observation serialization + compression + upload RPC total"
+                                ),
                                 "receive_rpc_ms": "legacy GetActions RPC + response deserialization total",
                                 "observation_upload_rpc_ms": "pure SendObservations RPC",
                                 "get_actions_rpc_ms": "pure GetActions RPC, summed across polls",

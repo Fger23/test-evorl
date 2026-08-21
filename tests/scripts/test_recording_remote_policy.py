@@ -22,6 +22,7 @@ import time
 from queue import Queue
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 
@@ -467,3 +468,166 @@ def test_pending_result_rejects_misaligned_processed_action_dimension(rtc_client
 
     with pytest.raises(ValueError, match="not aligned"):
         rtc_client._apply_pending_result()
+
+
+class _ReadyCall:
+    def __init__(self, metadata):
+        self._metadata = metadata
+
+    def trailing_metadata(self):
+        return self._metadata
+
+
+class _ReadyRPC:
+    def __init__(self, metadata):
+        self.metadata = metadata
+        self.calls = 0
+
+    def with_call(self, _request):
+        self.calls += 1
+        return SimpleNamespace(), _ReadyCall(self.metadata)
+
+
+def test_observation_transport_auto_negotiates_zlib(rtc_client):
+    ready = _ReadyRPC(
+        (
+            ("lerobot-observation-codecs", "none,zlib"),
+            ("lerobot-observation-wire-version", "1"),
+        )
+    )
+    rtc_client.cfg.observation_compression = "auto"
+    rtc_client.services_pb2 = SimpleNamespace(Empty=lambda: SimpleNamespace())
+    rtc_client.stub = SimpleNamespace(Ready=ready)
+
+    rtc_client._ready_and_negotiate_observation_codec()
+
+    assert ready.calls == 1
+    assert rtc_client._observation_codec == "zlib"
+    assert rtc_client._observation_wire_version == 1
+    assert rtc_client._server_observation_wire_version == 1
+    negotiated = _trace_events(rtc_client, "observation_transport_negotiated")[-1]
+    assert negotiated["observation_codec_selected"] == "zlib"
+    assert negotiated["observation_compression_fallback_reason"] is None
+
+
+def test_observation_transport_auto_falls_back_for_old_server(rtc_client):
+    calls = []
+    rtc_client.cfg.observation_compression = "auto"
+    rtc_client.services_pb2 = SimpleNamespace(Empty=lambda: SimpleNamespace())
+    rtc_client.stub = SimpleNamespace(Ready=lambda request: calls.append(request))
+
+    rtc_client._ready_and_negotiate_observation_codec()
+
+    assert len(calls) == 1
+    assert rtc_client._observation_codec == "none"
+    assert rtc_client._server_observation_wire_version == 0
+    assert rtc_client._observation_compression_fallback_reason == "server_did_not_advertise_zlib"
+
+
+def test_observation_transport_auto_rejects_incompatible_future_wire_version(rtc_client):
+    ready = _ReadyRPC(
+        (
+            ("lerobot-observation-codecs", "none,zlib"),
+            ("lerobot-observation-wire-version", "2"),
+        )
+    )
+    rtc_client.cfg.observation_compression = "auto"
+    rtc_client.services_pb2 = SimpleNamespace(Empty=lambda: SimpleNamespace())
+    rtc_client.stub = SimpleNamespace(Ready=ready)
+
+    rtc_client._ready_and_negotiate_observation_codec()
+
+    assert rtc_client._observation_codec == "none"
+    assert rtc_client._observation_wire_version == 0
+    assert rtc_client._server_observation_wire_version == 2
+    assert rtc_client._observation_compression_fallback_reason == ("incompatible_observation_wire_version")
+
+
+def test_observation_transport_forced_zlib_rejects_old_server(rtc_client):
+    rtc_client.cfg.observation_compression = "zlib"
+    rtc_client.services_pb2 = SimpleNamespace(Empty=lambda: SimpleNamespace())
+    rtc_client.stub = SimpleNamespace(Ready=lambda _request: SimpleNamespace())
+
+    with pytest.raises(RuntimeError, match="requires a policy server"):
+        rtc_client._ready_and_negotiate_observation_codec()
+
+
+def test_send_observation_zlib_is_lossless_and_reports_wire_metrics(rtc_client):
+    from lerobot.transport.utils import decode_observation_payload
+
+    class _Observation:
+        def __init__(self, transfer_state, data):
+            self.transfer_state = transfer_state
+            self.data = data
+
+    class _ImmediateFuture:
+        def result(self):
+            return SimpleNamespace()
+
+        def cancel(self):
+            return True
+
+    class _SendRPC:
+        def __init__(self):
+            self.chunks = []
+
+        def future(self, argument, timeout=None):
+            assert timeout == rtc_client.cfg.obs_queue_timeout_s
+            self.chunks = list(argument)
+            return _ImmediateFuture()
+
+    send_rpc = _SendRPC()
+    rtc_client.services_pb2 = SimpleNamespace(Observation=_Observation)
+    rtc_client.stub = SimpleNamespace(SendObservations=send_rpc)
+    rtc_client.cfg.observation_compression = "auto"
+    rtc_client.cfg.observation_compression_min_bytes = 1
+    rtc_client._observation_codec = "zlib"
+    expected_leftover, _ = _seed_queue(rtc_client)
+    image = np.zeros((64, 64, 3), dtype=np.uint8)
+    assert rtc_client._submit_if_needed(
+        observation={"state": [0.0, 1.0], "camera": image},
+        task="test",
+        timestep=8,
+    )
+    request = _take_submitted_request(rtc_client)
+
+    metrics = rtc_client._send_observation(request)
+    wire_payload = b"".join(chunk.data for chunk in send_rpc.chunks)
+    decoded_payload = decode_observation_payload(wire_payload)
+    decoded_observation = pickle.loads(decoded_payload.data)  # nosec
+
+    assert metrics.codec_selected == "zlib"
+    assert metrics.codec_used == "zlib"
+    assert metrics.payload_bytes == len(wire_payload)
+    assert metrics.payload_bytes < metrics.uncompressed_payload_bytes
+    assert metrics.compression_ratio < 1
+    assert metrics.compression_ms >= 0
+    assert np.array_equal(decoded_observation.observation["camera"], image)
+    assert decoded_observation.observation["state"] == [0.0, 1.0]
+    assert torch.equal(decoded_observation.rtc_metadata.prev_chunk_left_over, expected_leftover)
+
+    serialized = _trace_events(rtc_client, "observation_serialized")[-1]
+    assert serialized["observation_codec_used"] == "zlib"
+    assert serialized["observation_pickle_bytes"] == metrics.uncompressed_payload_bytes
+    assert serialized["request_payload_bytes"] == metrics.payload_bytes
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        ({"observation_compression": "jpeg"}, "observation_compression"),
+        ({"observation_zlib_level": 10}, "observation_zlib_level"),
+        ({"observation_compression_min_bytes": -1}, "compression_min_bytes"),
+        ({"observation_compression_min_savings_ratio": 1.0}, "min_savings_ratio"),
+    ],
+)
+def test_observation_compression_config_validation(overrides, message):
+    kwargs = {
+        "enable": True,
+        "policy_type": "pi05",
+        "pretrained_name_or_path": "dummy/pi05",
+        "actions_per_chunk": 6,
+        **overrides,
+    }
+    with pytest.raises(ValueError, match=message):
+        RemotePolicyRecordConfig(**kwargs)

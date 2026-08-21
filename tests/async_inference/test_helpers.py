@@ -26,6 +26,7 @@ from lerobot.async_inference.helpers import (
     RTCInferenceMetadata,
     TimedAction,
     TimedObservation,
+    extract_images_from_raw_observation,
     observations_similar,
     prepare_image,
     prepare_raw_observation,
@@ -356,6 +357,28 @@ def test_resize_robot_observation_image():
     # Check that resizing preserves value range
     assert resized.min() >= 0
     assert resized.max() <= 255
+
+
+def test_extract_images_uses_zero_copy_for_contiguous_numpy_arrays():
+    image = np.zeros((8, 10, 3), dtype=np.uint8)
+
+    tensor = extract_images_from_raw_observation({"camera": image}, "camera")
+    image[2, 3, 1] = 123
+
+    assert tensor.is_contiguous()
+    assert tensor[2, 3, 1].item() == 123
+
+
+def test_extract_images_safely_copies_unusual_numpy_layouts():
+    source = np.arange(8 * 10 * 3, dtype=np.uint8).reshape(8, 10, 3)
+    reversed_image = source[:, ::-1, :]
+
+    tensor = extract_images_from_raw_observation({"camera": reversed_image}, "camera")
+    expected = torch.from_numpy(reversed_image.copy())
+    reversed_image[0, 0, 0] = 0
+
+    assert tensor.is_contiguous()
+    torch.testing.assert_close(tensor, expected)
 
 
 def test_prepare_raw_observation():

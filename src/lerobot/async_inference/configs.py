@@ -154,6 +154,18 @@ class PolicyServerConfig:
         default=DEFAULT_OBS_QUEUE_TIMEOUT, metadata={"help": "Timeout for observation queue in seconds"}
     )
 
+    # Lossless remote-observation transport.  Raw legacy pickle payloads remain
+    # accepted regardless of this flag; it only controls zlib advertisement and
+    # decoding.
+    accept_zlib_observations: bool = field(
+        default=True,
+        metadata={"help": "Advertise and accept lossless zlib-compressed observation payloads"},
+    )
+    max_observation_payload_bytes: int = field(
+        default=64 * 1024 * 1024,
+        metadata={"help": "Maximum encoded or decoded observation payload size in bytes"},
+    )
+
     # Optional Pi0.5 batch=2 ACP-CFG inference. This is configured on the H200
     # policy server; the robot client continues to receive one action chunk.
     acp_inference: ACPInferenceConfig = field(default_factory=ACPInferenceConfig)
@@ -171,6 +183,13 @@ class PolicyServerConfig:
 
         if self.obs_queue_timeout < 0:
             raise ValueError(f"obs_queue_timeout must be non-negative, got {self.obs_queue_timeout}")
+
+        if (
+            not isinstance(self.max_observation_payload_bytes, int)
+            or isinstance(self.max_observation_payload_bytes, bool)
+            or self.max_observation_payload_bytes <= 0
+        ):
+            raise ValueError("max_observation_payload_bytes must be a positive integer")
 
         if self.acp_inference.enable and not (self.acp_inference.use_cfg and self.acp_inference.batched_cfg):
             raise ValueError(
@@ -206,6 +225,8 @@ class PolicyServerConfig:
             "environment_dt": self.environment_dt,
             "inference_latency": self.inference_latency,
             "obs_queue_timeout": self.obs_queue_timeout,
+            "accept_zlib_observations": self.accept_zlib_observations,
+            "max_observation_payload_bytes": self.max_observation_payload_bytes,
             "acp_inference": {
                 "enable": self.acp_inference.enable,
                 "use_cfg": self.acp_inference.use_cfg,

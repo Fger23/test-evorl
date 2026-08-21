@@ -22,6 +22,15 @@ from lerobot.cameras import CameraConfig
 from ..config import RobotConfig
 
 
+def _validate_so_follower_config(config: "SOFollowerConfig") -> None:
+    if (
+        not isinstance(config.camera_latest_max_age_ms, int)
+        or isinstance(config.camera_latest_max_age_ms, bool)
+        or config.camera_latest_max_age_ms <= 0
+    ):
+        raise ValueError("`camera_latest_max_age_ms` must be a positive integer.")
+
+
 @dataclass
 class SOFollowerConfig:
     """Base configuration class for SO Follower robots."""
@@ -39,15 +48,26 @@ class SOFollowerConfig:
     # cameras
     cameras: dict[str, CameraConfig] = field(default_factory=dict)
 
+    # `async_read` waits for a frame that has not yet been consumed, which can
+    # synchronize the control loop to the camera FPS. `read_latest` instead
+    # peeks at the camera's existing background buffer and bounds staleness.
+    use_latest_camera_frames: bool = False
+    camera_latest_max_age_ms: int = 200
+
     # Set to `True` for backward compatibility with previous policies/dataset
     use_degrees: bool = False
+
+    def __post_init__(self) -> None:
+        _validate_so_follower_config(self)
 
 
 @RobotConfig.register_subclass("so101_follower")
 @RobotConfig.register_subclass("so100_follower")
 @dataclass
 class SOFollowerRobotConfig(RobotConfig, SOFollowerConfig):
-    pass
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        _validate_so_follower_config(self)
 
 
 SO100FollowerConfig: TypeAlias = SOFollowerRobotConfig

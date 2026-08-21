@@ -20,6 +20,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import torch
 
 from lerobot.configs.types import PolicyFeature, RTCAttentionSchedule
@@ -116,7 +117,7 @@ def extract_state_from_raw_observation(
     lerobot_obs: RawObservation,
 ) -> torch.Tensor:
     """Extract the state from a raw observation."""
-    state = torch.tensor(lerobot_obs[OBS_STATE])
+    state = _as_preprocessing_tensor(lerobot_obs[OBS_STATE])
 
     if state.ndim == 1:
         state = state.unsqueeze(0)
@@ -127,9 +128,27 @@ def extract_state_from_raw_observation(
 def extract_images_from_raw_observation(
     lerobot_obs: RawObservation,
     camera_key: str,
-) -> dict[str, torch.Tensor]:
+) -> torch.Tensor:
     """Extract the images from a raw observation."""
-    return torch.tensor(lerobot_obs[camera_key])
+    return _as_preprocessing_tensor(lerobot_obs[camera_key])
+
+
+def _as_preprocessing_tensor(value: Any) -> torch.Tensor:
+    """Create a CPU tensor while avoiding redundant copies for normal camera arrays.
+
+    Remote observations are immutable for the duration of synchronous
+    preprocessing. A contiguous, writable NumPy array can therefore safely
+    share storage until resize creates the independent policy-sized tensor.
+    Unusual layouts and read-only arrays retain the legacy copy semantics.
+    """
+    if isinstance(value, torch.Tensor):
+        return value
+    if isinstance(value, np.ndarray):
+        array = value
+        if not array.flags.c_contiguous or not array.flags.writeable:
+            array = np.array(array, copy=True, order="C")
+        return torch.from_numpy(array)
+    return torch.as_tensor(value)
 
 
 def make_lerobot_observation(
@@ -155,14 +174,12 @@ def prepare_raw_observation(
     image_keys = list(filter(is_image_key, lerobot_obs))
     # state's shape is expected as (B, state_dim)
     state_dict = {OBS_STATE: extract_state_from_raw_observation(lerobot_obs)}
-    image_dict = {
-        image_k: extract_images_from_raw_observation(lerobot_obs, image_k) for image_k in image_keys
-    }
-
     # Turns the image features to (C, H, W) with H, W matching the policy image features.
     # This reduces the resolution of the images
     image_dict = {
-        key: resize_robot_observation_image(torch.tensor(lerobot_obs[key]), policy_image_features[key].shape)
+        key: resize_robot_observation_image(
+            extract_images_from_raw_observation(lerobot_obs, key), policy_image_features[key].shape
+        )
         for key in image_keys
     }
 
@@ -259,9 +276,7 @@ class RemoteActionChunk:
 
     def __post_init__(self) -> None:
         if self.raw_actions.ndim != 2:
-            raise ValueError(
-                f"`raw_actions` must have shape [T, A], got {tuple(self.raw_actions.shape)}."
-            )
+            raise ValueError(f"`raw_actions` must have shape [T, A], got {tuple(self.raw_actions.shape)}.")
         if len(self.actions) != self.raw_actions.shape[0]:
             raise ValueError(
                 "`actions` and `raw_actions` must contain the same number of timesteps, "
@@ -315,6 +330,12 @@ class RemotePolicyConfig:
     rtc_max_guidance_weight: float | None = None
     rtc_prefix_attention_schedule: RTCAttentionSchedule | None = None
     rtc_cfg_beta: float | None = None
+    # Observation transport is negotiated independently from
+    # ``protocol_version``, which describes the action response envelope.
+    # Defaults preserve compatibility with clients pickled before compression
+    # support existed.
+    observation_wire_version: int = 0
+    observation_codec: str = "none"
 
 
 def _compare_observation_states(obs1_state: torch.Tensor, obs2_state: torch.Tensor, atol: float) -> bool:

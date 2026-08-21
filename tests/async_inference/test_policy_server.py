@@ -160,11 +160,15 @@ def test_policy_server_acp_config_validation_and_round_trip():
     assert restored.acp_inference.rtc.prefix_attention_schedule is RTCAttentionSchedule.LINEAR
     assert restored.acp_inference.rtc.trace_enabled is True
     assert restored.acp_inference.rtc.trace_output_dir == "custom/rtc-trace"
+    assert restored.accept_zlib_observations is True
+    assert restored.max_observation_payload_bytes == 64 * 1024 * 1024
 
     with pytest.raises(ValueError, match="greater than"):
         ACPRTCConfig(enabled=True, inference_delay=20, execution_horizon=20)
     with pytest.raises(ValueError, match="trace_output_dir"):
         ACPRTCConfig(trace_enabled=True, trace_output_dir="")
+    with pytest.raises(ValueError, match="max_observation_payload_bytes"):
+        PolicyServerConfig(max_observation_payload_bytes=0)
 
     rtc_config = PolicyServerConfig(
         acp_inference=ACPInferenceConfig(
@@ -176,6 +180,36 @@ def test_policy_server_acp_config_validation_and_round_trip():
     )
     rtc_restored = PolicyServerConfig.from_dict(rtc_config.to_dict())
     assert rtc_restored.acp_inference.rtc.enabled is True
+
+
+@pytest.mark.parametrize(
+    ("wire_version", "codec", "message"),
+    [
+        (True, "zlib", "non-negative integer"),
+        (-1, "zlib", "non-negative integer"),
+        (2, "zlib", "requires observation wire version 1"),
+        (0, ["zlib"], "Unsupported client observation codec"),
+    ],
+)
+def test_server_rejects_invalid_observation_transport_contract(policy_server, wire_version, codec, message):
+    from lerobot.async_inference.helpers import RemotePolicyConfig
+
+    class _Context:
+        def peer(self):
+            return "test-client"
+
+    policy_config = RemotePolicyConfig(
+        policy_type="act",
+        pretrained_name_or_path="dummy/act",
+        lerobot_features={},
+        actions_per_chunk=20,
+        observation_wire_version=wire_version,
+        observation_codec=codec,
+    )
+    request = type("Request", (), {"data": pickle.dumps(policy_config)})()  # nosec
+
+    with pytest.raises(ValueError, match=message):
+        policy_server.SendPolicyInstructions(request, _Context())
 
 
 def test_server_rejects_mismatched_rtc_client_contract(policy_server):
@@ -367,7 +401,9 @@ def test_send_observations_traces_receive_deserialize_and_enqueue_stages(policy_
         received["stream_receive_ms"] + received["pickle_deserialize_ms"]
     )
     assert received["deserialize_ms"] == received["receive_and_deserialize_ms"]
-    assert received["deserialize_ms_semantics"] == "legacy_stream_receive_plus_pickle_deserialize"
+    assert received["deserialize_ms_semantics"] == (
+        "stream_receive_plus_payload_decode_plus_pickle_deserialize"
+    )
     assert received["handler_decode_ready_ms"] >= received["receive_and_deserialize_ms"]
     assert (
         received["observation_timestamp_to_server_payload_received_wall_ms"]
@@ -386,6 +422,174 @@ def test_send_observations_traces_receive_deserialize_and_enqueue_stages(policy_
     assert enqueued["observation_queue_size_before"] == 0
     assert enqueued["observation_queue_size_after"] == 1
     assert enqueued["observation_queue_size"] == 1
+
+
+def test_ready_advertises_backward_compatible_observation_codecs(policy_server):
+    class _Context:
+        def __init__(self):
+            self.metadata = None
+
+        def peer(self):
+            return "test-client"
+
+        def set_trailing_metadata(self, metadata):
+            self.metadata = dict(metadata)
+
+    context = _Context()
+    policy_server.Ready(None, context)
+
+    assert context.metadata["lerobot-observation-codecs"] == "none,zlib"
+    assert context.metadata["lerobot-observation-wire-version"] == "1"
+
+    policy_server.config.accept_zlib_observations = False
+    context = _Context()
+    policy_server.Ready(None, context)
+    assert context.metadata["lerobot-observation-codecs"] == "none"
+
+
+def test_send_observations_accepts_zlib_and_reports_compression_metrics(policy_server):
+    from lerobot.transport import services_pb2
+    from lerobot.transport.utils import encode_observation_payload, send_bytes_in_chunks
+
+    class _Context:
+        def peer(self):
+            return "test-client"
+
+        def is_active(self):
+            return True
+
+    observation = _make_obs(torch.arange(6), timestep=17, must_go=True)
+    raw_payload = pickle.dumps(observation)  # nosec
+    encoded = encode_observation_payload(
+        raw_payload,
+        codec="zlib",
+        min_bytes=1,
+        require_savings=False,
+    )
+    policy_server._rtc_trace = _TraceSpy()
+
+    response = policy_server.SendObservations(
+        send_bytes_in_chunks(encoded.data, services_pb2.Observation),
+        _Context(),
+    )
+
+    assert isinstance(response, services_pb2.Empty)
+    queued = policy_server.observation_queue.get_nowait()
+    assert queued.get_timestep() == 17
+    assert queued.get_observation() == observation.get_observation()
+    received = [
+        event for event in policy_server._rtc_trace.events if event["event"] == "observation_received"
+    ][0]
+    assert received["observation_codec"] == "zlib"
+    assert received["observation_wire_version"] == 1
+    assert received["request_payload_bytes"] == len(encoded.data)
+    assert received["observation_pickle_bytes"] == len(raw_payload)
+    assert received["observation_decompress_ms"] >= 0
+    assert received["observation_payload_decode_ms"] >= received["observation_decompress_ms"]
+    assert received["observation_compression_ratio"] == pytest.approx(len(encoded.data) / len(raw_payload))
+
+
+def test_send_observations_rejects_corrupt_compressed_payload(policy_server):
+    from lerobot.transport import services_pb2
+    from lerobot.transport.utils import encode_observation_payload, send_bytes_in_chunks
+
+    class _AbortError(Exception):
+        pass
+
+    class _Context:
+        def peer(self):
+            return "test-client"
+
+        def abort(self, code, details):
+            raise _AbortError(f"{code}: {details}")
+
+    raw_payload = pickle.dumps(_make_obs(torch.zeros(6)))  # nosec
+    payload = encode_observation_payload(
+        raw_payload,
+        codec="zlib",
+        require_savings=False,
+    ).data
+    corrupt_payload = payload[:-1] + bytes([payload[-1] ^ 0xFF])
+    policy_server._rtc_trace = _TraceSpy()
+
+    with pytest.raises(_AbortError, match="INVALID_ARGUMENT"):
+        policy_server.SendObservations(
+            send_bytes_in_chunks(corrupt_payload, services_pb2.Observation),
+            _Context(),
+        )
+
+    rejected = [
+        event for event in policy_server._rtc_trace.events if event["event"] == "observation_payload_rejected"
+    ]
+    assert len(rejected) == 1
+
+
+@pytest.mark.parametrize(
+    ("payload", "expected_stage"),
+    [
+        (b"not-a-pickle", "pickle_deserialize"),
+        (pickle.dumps({"not": "a TimedObservation"}), "pickle_deserialize"),  # nosec
+    ],
+)
+def test_send_observations_rejects_invalid_pickled_observation(policy_server, payload, expected_stage):
+    from lerobot.transport import services_pb2
+    from lerobot.transport.utils import send_bytes_in_chunks
+
+    class _AbortError(Exception):
+        pass
+
+    class _Context:
+        def peer(self):
+            return "test-client"
+
+        def abort(self, code, details):
+            raise _AbortError(f"{code}: {details}")
+
+    policy_server._rtc_trace = _TraceSpy()
+
+    with pytest.raises(_AbortError, match="INVALID_ARGUMENT"):
+        policy_server.SendObservations(
+            send_bytes_in_chunks(payload, services_pb2.Observation),
+            _Context(),
+        )
+
+    rejected = [
+        event for event in policy_server._rtc_trace.events if event["event"] == "observation_payload_rejected"
+    ]
+    assert len(rejected) == 1
+    assert rejected[0]["stage"] == expected_stage
+
+
+def test_send_observations_rejects_stream_without_transfer_end(policy_server):
+    from lerobot.transport import services_pb2
+    from lerobot.transport.utils import TransferState
+
+    class _AbortError(Exception):
+        pass
+
+    class _Context:
+        def peer(self):
+            return "test-client"
+
+        def is_active(self):
+            return True
+
+        def abort(self, code, details):
+            raise _AbortError(f"{code}: {details}")
+
+    incomplete_stream = iter(
+        [services_pb2.Observation(transfer_state=TransferState.TRANSFER_BEGIN, data=b"partial")]
+    )
+    policy_server._rtc_trace = _TraceSpy()
+
+    with pytest.raises(_AbortError, match="INVALID_ARGUMENT"):
+        policy_server.SendObservations(incomplete_stream, _Context())
+
+    rejected = [
+        event for event in policy_server._rtc_trace.events if event["event"] == "observation_payload_rejected"
+    ]
+    assert len(rejected) == 1
+    assert rejected[0]["stage"] == "stream_receive"
 
 
 def test_get_actions_traces_queue_inference_and_response_stages(monkeypatch, policy_server):
@@ -672,6 +876,10 @@ def test_server_batched_cfg_shared_noise_raw_blend_and_profile(policy_server):
     assert metrics["cfg_beta"] == 1.5
     assert metrics["shared_noise_max_abs_diff"] == 0.0
     assert metrics["wall_latency_s"] >= 0.0
+    assert metrics["prepare_calling_thread_cpu_latency_ms"] >= 0.0
+    assert metrics["prepare_non_calling_thread_or_wait_ms"] >= 0.0
+    assert metrics["preprocess_calling_thread_cpu_latency_ms"] >= 0.0
+    assert metrics["preprocess_non_calling_thread_or_wait_ms"] >= 0.0
     assert metrics["cuda_latency_ms"] is None
     assert torch.equal(chunks["cfg_raw"], expected_raw_cfg)
     assert torch.equal(chunks["cfg_processed"], expected_raw_cfg.square())
@@ -806,7 +1014,11 @@ def test_server_rtc_cfg_v2_envelope_shares_leftover_and_runtime_inputs(policy_se
     assert completed[0]["processed_actions"]["shape"] == [4, 2]
     for timing in (
         "prepare_ms",
+        "prepare_calling_thread_cpu_ms",
+        "prepare_non_calling_thread_or_wait_ms",
         "preprocess_ms",
+        "preprocess_calling_thread_cpu_ms",
+        "preprocess_non_calling_thread_or_wait_ms",
         "model_and_cfg_ms",
         "postprocess_and_d2h_ms",
         "wall_ms",

@@ -51,7 +51,15 @@ from lerobot.transport import (
     services_pb2,  # type: ignore
     services_pb2_grpc,  # type: ignore
 )
-from lerobot.transport.utils import receive_bytes_in_chunks
+from lerobot.transport.utils import (
+    OBSERVATION_CODEC_NONE,
+    OBSERVATION_CODEC_ZLIB,
+    OBSERVATION_CODECS_METADATA_KEY,
+    OBSERVATION_PAYLOAD_VERSION,
+    OBSERVATION_WIRE_VERSION_METADATA_KEY,
+    decode_observation_payload,
+    receive_bytes_in_chunks,
+)
 
 from .configs import PolicyServerConfig
 from .constants import SUPPORTED_POLICIES
@@ -115,6 +123,8 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         self._client_protocol_version = 1
         self._client_return_raw_actions = False
         self._client_rtc_enabled = False
+        self._client_observation_wire_version = 0
+        self._client_observation_codec = OBSERVATION_CODEC_NONE
         rtc_trace = config.acp_inference.rtc
         self._rtc_trace = (
             create_rtc_trace(role="server", output_dir=rtc_trace.trace_output_dir)
@@ -405,6 +415,25 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         self._reset_server(reason="client_ready", peer=client_id)
         self.shutdown_event.clear()
 
+        supported_codecs = [OBSERVATION_CODEC_NONE]
+        if self.config.accept_zlib_observations:
+            supported_codecs.append(OBSERVATION_CODEC_ZLIB)
+        set_trailing_metadata = getattr(context, "set_trailing_metadata", None)
+        if callable(set_trailing_metadata):
+            set_trailing_metadata(
+                (
+                    (OBSERVATION_CODECS_METADATA_KEY, ",".join(supported_codecs)),
+                    (OBSERVATION_WIRE_VERSION_METADATA_KEY, str(OBSERVATION_PAYLOAD_VERSION)),
+                )
+            )
+        self._trace_event(
+            "observation_transport_advertised",
+            peer=client_id,
+            observation_codecs=supported_codecs,
+            observation_wire_version=OBSERVATION_PAYLOAD_VERSION,
+            max_observation_payload_bytes=self.config.max_observation_payload_bytes,
+        )
+
         return services_pb2.Empty()
 
     def SendPolicyInstructions(self, request, context):  # noqa: N802
@@ -437,6 +466,8 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
             client_max_guidance_weight=getattr(policy_specs, "rtc_max_guidance_weight", None),
             client_prefix_attention_schedule=getattr(policy_specs, "rtc_prefix_attention_schedule", None),
             client_cfg_beta=getattr(policy_specs, "rtc_cfg_beta", None),
+            client_observation_wire_version=getattr(policy_specs, "observation_wire_version", 0),
+            client_observation_codec=getattr(policy_specs, "observation_codec", OBSERVATION_CODEC_NONE),
         )
 
         if policy_specs.policy_type not in SUPPORTED_POLICIES:
@@ -452,12 +483,33 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         self._client_protocol_version = getattr(policy_specs, "protocol_version", 1)
         self._client_return_raw_actions = getattr(policy_specs, "return_raw_actions", False)
         self._client_rtc_enabled = getattr(policy_specs, "rtc_enabled", False)
+        self._client_observation_wire_version = getattr(policy_specs, "observation_wire_version", 0)
+        self._client_observation_codec = getattr(policy_specs, "observation_codec", OBSERVATION_CODEC_NONE)
         if (
             not isinstance(self._client_protocol_version, int)
             or isinstance(self._client_protocol_version, bool)
             or self._client_protocol_version < 1
         ):
             raise ValueError("Remote policy `protocol_version` must be a positive integer.")
+        if (
+            not isinstance(self._client_observation_wire_version, int)
+            or isinstance(self._client_observation_wire_version, bool)
+            or self._client_observation_wire_version < 0
+        ):
+            raise ValueError("Remote policy `observation_wire_version` must be a non-negative integer.")
+        if not isinstance(self._client_observation_codec, str) or self._client_observation_codec not in {
+            OBSERVATION_CODEC_NONE,
+            OBSERVATION_CODEC_ZLIB,
+        }:
+            raise ValueError(f"Unsupported client observation codec {self._client_observation_codec!r}.")
+        if self._client_observation_codec == OBSERVATION_CODEC_ZLIB:
+            if not self.config.accept_zlib_observations:
+                raise ValueError("This policy server is configured to reject zlib observations.")
+            if self._client_observation_wire_version != OBSERVATION_PAYLOAD_VERSION:
+                raise ValueError(
+                    "zlib observation transport requires observation wire version "
+                    f"{OBSERVATION_PAYLOAD_VERSION}."
+                )
         self._validate_client_rtc_contract(policy_specs)
 
         self.logger.info(
@@ -519,6 +571,8 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
             protocol_version=self._client_protocol_version,
             return_raw_actions=self._client_return_raw_actions,
             rtc_enabled=self.rtc_enabled,
+            observation_wire_version=self._client_observation_wire_version,
+            observation_codec=self._client_observation_codec,
         )
 
         return services_pb2.Empty()
@@ -533,17 +587,107 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
             receive_generation = self._server_generation
 
         stream_receive_starts = time.perf_counter()
-        received_bytes = receive_bytes_in_chunks(
-            request_iterator, None, self.shutdown_event, self.logger
-        )  # blocking call while looping over request_iterator
+        try:
+            received_bytes = receive_bytes_in_chunks(
+                request_iterator,
+                None,
+                self.shutdown_event,
+                self.logger,
+                max_size_bytes=self.config.max_observation_payload_bytes,
+            )  # blocking call while looping over request_iterator
+        except ValueError as exc:
+            self._trace_event(
+                "observation_payload_rejected",
+                peer=client_id,
+                stage="stream_receive",
+                error_type=type(exc).__name__,
+                error_message=str(exc),
+            )
+            abort = getattr(context, "abort", None)
+            if callable(abort):
+                return abort(grpc.StatusCode.INVALID_ARGUMENT, str(exc))
+            raise
         stream_receive_stops = time.perf_counter()
         payload_received_wall_s = time.time()
 
+        if received_bytes is None:
+            with self._generation_lock:
+                stale_generation = receive_generation != self._server_generation
+                current_generation = self._server_generation
+            is_active = getattr(context, "is_active", None)
+            context_active = bool(is_active()) if callable(is_active) else True
+            if stale_generation or not context_active or self.shutdown_event.is_set():
+                self._trace_event(
+                    "observation_discarded",
+                    peer=client_id,
+                    reason="stream_ended_during_reset_or_cancellation",
+                    receive_generation=receive_generation,
+                    current_generation=current_generation,
+                    context_active=context_active,
+                    handler_elapsed_ms=(time.perf_counter() - handler_starts) * 1000,
+                )
+                return services_pb2.Empty()
+
+            exc = ValueError("Observation stream ended before a TRANSFER_END chunk was received.")
+            self._trace_event(
+                "observation_payload_rejected",
+                peer=client_id,
+                stage="stream_receive",
+                error_type=type(exc).__name__,
+                error_message=str(exc),
+            )
+            abort = getattr(context, "abort", None)
+            if callable(abort):
+                return abort(grpc.StatusCode.INVALID_ARGUMENT, str(exc))
+            raise exc
+
+        payload_decode_starts = time.perf_counter()
+        try:
+            decoded_observation = decode_observation_payload(
+                received_bytes,
+                max_uncompressed_bytes=self.config.max_observation_payload_bytes,
+                allow_zlib=self.config.accept_zlib_observations,
+            )
+        except ValueError as exc:
+            self._trace_event(
+                "observation_payload_rejected",
+                peer=client_id,
+                stage="payload_decode",
+                payload_bytes=len(received_bytes),
+                error_type=type(exc).__name__,
+                error_message=str(exc),
+            )
+            abort = getattr(context, "abort", None)
+            if callable(abort):
+                return abort(grpc.StatusCode.INVALID_ARGUMENT, str(exc))
+            raise
+        payload_decode_stops = time.perf_counter()
+
         pickle_deserialize_starts = time.perf_counter()
-        timed_observation = pickle.loads(received_bytes)  # nosec
+        try:
+            timed_observation = pickle.loads(decoded_observation.data)  # nosec
+            if not isinstance(timed_observation, TimedObservation):
+                raise TypeError(
+                    f"Decoded observation must be a TimedObservation, got {type(timed_observation).__name__}."
+                )
+        except Exception as exc:
+            self._trace_event(
+                "observation_payload_rejected",
+                peer=client_id,
+                stage="pickle_deserialize",
+                payload_bytes=len(received_bytes),
+                observation_pickle_bytes=decoded_observation.raw_bytes,
+                error_type=type(exc).__name__,
+                error_message=str(exc),
+            )
+            abort = getattr(context, "abort", None)
+            if callable(abort):
+                return abort(grpc.StatusCode.INVALID_ARGUMENT, str(exc))
+            raise
         pickle_deserialize_stops = time.perf_counter()
 
         stream_receive_ms = (stream_receive_stops - stream_receive_starts) * 1000
+        payload_decode_ms = (payload_decode_stops - payload_decode_starts) * 1000
         pickle_deserialize_ms = (pickle_deserialize_stops - pickle_deserialize_starts) * 1000
         receive_and_deserialize_ms = (pickle_deserialize_stops - stream_receive_starts) * 1000
 
@@ -572,6 +716,15 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
             must_go=timed_observation.must_go,
             payload_bytes=len(received_bytes),
             request_payload_bytes=len(received_bytes),
+            observation_pickle_bytes=decoded_observation.raw_bytes,
+            observation_codec=decoded_observation.codec,
+            observation_wire_version=decoded_observation.wire_version,
+            observation_payload_decode_ms=payload_decode_ms,
+            observation_decompress_ms=decoded_observation.decompression_ms,
+            observation_compression_ratio=decoded_observation.compression_ratio,
+            observation_compression_savings_bytes=(
+                decoded_observation.raw_bytes - decoded_observation.wire_bytes
+            ),
             stream_receive_ms=stream_receive_ms,
             pickle_deserialize_ms=pickle_deserialize_ms,
             receive_and_deserialize_ms=receive_and_deserialize_ms,
@@ -584,10 +737,11 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
             ),
             cross_host_wall_clock_metrics_require_synchronized_clocks=True,
             # Compatibility aliases for existing trace consumers. Historically
-            # ``deserialize_ms`` included stream reception, while
+            # ``deserialize_ms`` included stream reception; it now also includes
+            # the explicitly reported payload decode/decompression stage.  The
             # ``client_to_server_wall_ms`` ended at server handler entry.
             deserialize_ms=receive_and_deserialize_ms,
-            deserialize_ms_semantics="legacy_stream_receive_plus_pickle_deserialize",
+            deserialize_ms_semantics=("stream_receive_plus_payload_decode_plus_pickle_deserialize"),
             client_to_server_wall_ms=observation_to_handler_start_wall_ms,
             client_to_server_wall_ms_semantics="legacy_client_timestamp_to_server_handler_start",
             leftover_steps=(
@@ -1210,7 +1364,15 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
             "action_dim": int(processed_cfg.shape[2]),
             "wall_latency_s": wall_latency_s,
             "prepare_latency_ms": timings_s["prepare"] * 1000,
+            "prepare_calling_thread_cpu_latency_ms": timings_s["prepare_cpu"] * 1000,
+            "prepare_non_calling_thread_or_wait_ms": (
+                max(timings_s["prepare"] - timings_s["prepare_cpu"], 0) * 1000
+            ),
             "preprocess_latency_ms": timings_s["preprocess"] * 1000,
+            "preprocess_calling_thread_cpu_latency_ms": timings_s["preprocess_cpu"] * 1000,
+            "preprocess_non_calling_thread_or_wait_ms": (
+                max(timings_s["preprocess"] - timings_s["preprocess_cpu"], 0) * 1000
+            ),
             "model_and_cfg_latency_ms": timings_s["inference"] * 1000,
             "postprocess_and_d2h_latency_ms": timings_s["postprocess"] * 1000,
             "cuda_latency_ms": cuda_latency_ms,
@@ -1294,20 +1456,24 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
 
         """1. Prepare observation"""
         start_prepare = time.perf_counter()
+        start_prepare_cpu = time.thread_time()
         observation: Observation = raw_observation_to_observation(
             observation_t.get_observation(),
             self.lerobot_features,
             self.policy_image_features,
         )
+        prepare_cpu_time = time.thread_time() - start_prepare_cpu
         prepare_time = time.perf_counter() - start_prepare
 
         """2. Apply preprocessor"""
         start_preprocess = time.perf_counter()
+        start_preprocess_cpu = time.thread_time()
         if self.batched_cfg_enabled:
             observation = self._prepare_batched_cfg_observation(observation)
         else:
             observation = self.preprocessor(observation)
         self.last_processed_obs: TimedObservation = observation_t
+        preprocessing_cpu_time = time.thread_time() - start_preprocess_cpu
         preprocessing_time = time.perf_counter() - start_preprocess
 
         """3. Get action chunk"""
@@ -1387,7 +1553,13 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
             ),
             cfg_beta=self.config.acp_inference.cfg_beta if self.batched_cfg_enabled else None,
             prepare_ms=prepare_time * 1000,
+            prepare_calling_thread_cpu_ms=prepare_cpu_time * 1000,
+            prepare_non_calling_thread_or_wait_ms=max(prepare_time - prepare_cpu_time, 0) * 1000,
             preprocess_ms=preprocessing_time * 1000,
+            preprocess_calling_thread_cpu_ms=preprocessing_cpu_time * 1000,
+            preprocess_non_calling_thread_or_wait_ms=(
+                max(preprocessing_time - preprocessing_cpu_time, 0) * 1000
+            ),
             model_and_cfg_ms=inference_time * 1000,
             postprocess_and_d2h_ms=postprocessing_time * 1000,
             wall_ms=wall_latency_s * 1000,
@@ -1406,7 +1578,9 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
                     processed_cfg=processed_action_tensor,
                     timings_s={
                         "prepare": prepare_time,
+                        "prepare_cpu": prepare_cpu_time,
                         "preprocess": preprocessing_time,
+                        "preprocess_cpu": preprocessing_cpu_time,
                         "inference": inference_time,
                         "postprocess": postprocessing_time,
                     },

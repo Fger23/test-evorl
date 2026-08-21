@@ -1,0 +1,48 @@
+{
+  "run_name": "20260820T085204.956582Z_1818503",
+  "created_at_utc": "2026-08-20T08:52:04.957Z",
+  "updated_at_utc": "2026-08-20T08:53:09.838Z",
+  "count": 62,
+  "fps": 30.0,
+  "cfg_beta": 1.5,
+  "save_chunks": false,
+  "pending_records": 0,
+  "dropped_records": 0,
+  "writer_error": null,
+  "wall_ms": {
+    "p50": 529.7480151057243,
+    "p95": 701.3972297310829,
+    "p99": 975.0723926629873,
+    "max": 1240.5796693637967
+  },
+  "cuda_ms": {
+    "p50": 499.9988098144531,
+    "p95": 609.4679077148435,
+    "p99": 816.7908947753908,
+    "max": 1078.629150390625
+  },
+  "steady_state_count": 59,
+  "steady_state_wall_ms": {
+    "p50": 527.01854147017,
+    "p95": 694.3388044834137,
+    "p99": 752.5266875512899,
+    "max": 805.3218387067318
+  },
+  "steady_state_cuda_ms": {
+    "p50": 499.8732604980469,
+    "p95": 556.8951171874996,
+    "p99": 628.7572387695313,
+    "max": 649.3861083984375
+  },
+  "recommendation_source": "steady_state",
+  "latency_scope": "server_pipeline_only",
+  "server_compute_D99": 23,
+  "D99": 23,
+  "D99_semantics": "legacy ceil(server pipeline wall p99 * configured fps); not the remote RTC inference_delay",
+  "recommended_precision_horizon": 20,
+  "recommended_smooth_horizon": 20,
+  "rtc_parameter_recommendation": {
+    "available": false,
+    "reason": "Join client actual_delay, executed control rate, queue coverage, and end-to-end latency by request_id before selecting RTC inference_delay/execution_horizon."
+  }
+}

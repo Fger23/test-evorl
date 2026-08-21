@@ -22,6 +22,7 @@ import pytest
 from lerobot.robots.so_follower import (
     SO100Follower,
     SO100FollowerConfig,
+    SOFollowerConfig,
 )
 
 
@@ -97,6 +98,43 @@ def test_get_observation(follower):
 
     for idx, motor in enumerate(follower.bus.motors, 1):
         assert obs[f"{motor}.pos"] == idx
+
+
+def test_get_observation_uses_async_camera_read_by_default(follower):
+    follower.connect()
+    camera = MagicMock()
+    camera.is_connected = True
+    camera.async_read.return_value = "async-frame"
+    follower.cameras = {"wrist": camera}
+
+    obs = follower.get_observation()
+
+    assert obs["wrist"] == "async-frame"
+    camera.async_read.assert_called_once_with()
+    camera.read_latest.assert_not_called()
+
+
+def test_get_observation_can_peek_latest_camera_frame(follower):
+    follower.connect()
+    follower.config.use_latest_camera_frames = True
+    follower.config.camera_latest_max_age_ms = 125
+    camera = MagicMock()
+    camera.is_connected = True
+    camera.read_latest.return_value = "latest-frame"
+    follower.cameras = {"wrist": camera}
+
+    obs = follower.get_observation()
+
+    assert obs["wrist"] == "latest-frame"
+    camera.read_latest.assert_called_once_with(max_age_ms=125)
+    camera.async_read.assert_not_called()
+
+
+@pytest.mark.parametrize("config_cls", [SOFollowerConfig, SO100FollowerConfig])
+@pytest.mark.parametrize("invalid_max_age_ms", [True, False, 0, -1, 1.5, "200", None])
+def test_camera_latest_max_age_must_be_a_positive_integer(config_cls, invalid_max_age_ms):
+    with pytest.raises(ValueError, match="camera_latest_max_age_ms"):
+        config_cls(port="/dev/null", camera_latest_max_age_ms=invalid_max_age_ms)
 
 
 def test_send_action(follower):

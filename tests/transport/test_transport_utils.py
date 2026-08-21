@@ -15,6 +15,7 @@
 # limitations under the License.
 
 import io
+import random
 from multiprocessing import Event, Queue
 from pickle import UnpicklingError
 
@@ -570,3 +571,130 @@ def test_receive_bytes_in_chunks_unknown_state():
 
     with pytest.raises(ValueError, match="Received unknown transfer state"):
         receive_bytes_in_chunks(bad_iterator, output_queue, shutdown_event)
+
+
+@require_package("grpcio", "grpc")
+def test_observation_payload_none_preserves_legacy_bytes_exactly():
+    from lerobot.transport.utils import decode_observation_payload, encode_observation_payload
+
+    raw = b"legacy-pickle-payload"
+    encoded = encode_observation_payload(raw, codec="none")
+    decoded = decode_observation_payload(encoded.data)
+
+    assert encoded.data is raw
+    assert encoded.codec == "none"
+    assert encoded.skipped_reason == "codec_none"
+    assert decoded.data == raw
+    assert decoded.codec == "none"
+    assert decoded.wire_version == 0
+
+
+@require_package("grpcio", "grpc")
+def test_observation_payload_zlib_round_trip_is_lossless():
+    from lerobot.transport.utils import decode_observation_payload, encode_observation_payload
+
+    raw = (b"camera-row-contents" * 16_384) + random.Random(0).randbytes(128)
+    encoded = encode_observation_payload(
+        raw,
+        codec="zlib",
+        zlib_level=1,
+        min_bytes=1,
+        min_savings_ratio=0.05,
+    )
+    decoded = decode_observation_payload(encoded.data)
+
+    assert encoded.codec == "zlib"
+    assert encoded.wire_bytes < encoded.raw_bytes
+    assert decoded.data == raw
+    assert decoded.codec == "zlib"
+    assert decoded.wire_version == 1
+    assert decoded.raw_bytes == len(raw)
+    assert decoded.wire_bytes == len(encoded.data)
+
+
+@require_package("grpcio", "grpc")
+def test_observation_payload_auto_skips_incompressible_data():
+    from lerobot.transport.utils import encode_observation_payload
+
+    raw = random.Random(0).randbytes(32_768)
+    encoded = encode_observation_payload(
+        raw,
+        codec="zlib",
+        zlib_level=1,
+        min_savings_ratio=0.05,
+        require_savings=True,
+    )
+
+    assert encoded.data == raw
+    assert encoded.codec == "none"
+    assert encoded.skipped_reason == "insufficient_savings"
+    assert encoded.compression_ms >= 0
+
+
+@require_package("grpcio", "grpc")
+def test_observation_payload_forced_zlib_does_not_require_savings():
+    from lerobot.transport.utils import decode_observation_payload, encode_observation_payload
+
+    raw = random.Random(1).randbytes(4096)
+    encoded = encode_observation_payload(
+        raw,
+        codec="zlib",
+        zlib_level=1,
+        require_savings=False,
+    )
+
+    assert encoded.codec == "zlib"
+    assert decode_observation_payload(encoded.data).data == raw
+
+
+@require_package("grpcio", "grpc")
+def test_observation_payload_auto_falls_back_when_zlib_errors(monkeypatch):
+    from lerobot.transport import utils as transport_utils
+
+    raw = b"valid-raw-observation"
+
+    def fail_compression(*_args, **_kwargs):
+        raise transport_utils.zlib.error("synthetic compression failure")
+
+    monkeypatch.setattr(transport_utils.zlib, "compress", fail_compression)
+
+    encoded = transport_utils.encode_observation_payload(
+        raw,
+        codec="zlib",
+        require_savings=True,
+    )
+
+    assert encoded.data == raw
+    assert encoded.codec == "none"
+    assert encoded.skipped_reason == "compression_error_fallback"
+    assert encoded.compression_ms >= 0
+
+    with pytest.raises(ValueError, match="Unable to compress"):
+        transport_utils.encode_observation_payload(
+            raw,
+            codec="zlib",
+            require_savings=False,
+        )
+
+
+@require_package("grpcio", "grpc")
+def test_observation_payload_rejects_corruption_and_size_limit():
+    from lerobot.transport.utils import decode_observation_payload, encode_observation_payload
+
+    raw = b"x" * 8192
+    encoded = encode_observation_payload(raw, codec="zlib", require_savings=False).data
+    corrupted = encoded[:-1] + bytes([encoded[-1] ^ 0xFF])
+
+    with pytest.raises(ValueError, match="Invalid zlib|Truncated"):
+        decode_observation_payload(corrupted)
+    with pytest.raises(ValueError, match="exceeding the configured limit"):
+        decode_observation_payload(encoded, max_uncompressed_bytes=len(raw) - 1)
+
+
+@require_package("grpcio", "grpc")
+def test_receive_bytes_in_chunks_enforces_total_size_limit():
+    from lerobot.transport.utils import receive_bytes_in_chunks, send_bytes_in_chunks, services_pb2
+
+    chunks = send_bytes_in_chunks(b"0123456789", services_pb2.Observation)
+    with pytest.raises(ValueError, match="configured limit"):
+        receive_bytes_in_chunks(chunks, None, Event(), max_size_bytes=9)
