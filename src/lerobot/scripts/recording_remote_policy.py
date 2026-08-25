@@ -76,6 +76,9 @@ class RemotePolicyRecordConfig:
 
     # Estimated RTC values are used inside denoising. The response is still
     # cropped with the number of actions actually sent while the RPC ran.
+    # ``None`` leaves CFG selection to the server for backwards compatibility;
+    # the dedicated robot_client always sends True or False.
+    use_cfg: bool | None = None
     rtc_enable: bool = False
     rtc_inference_delay: int = 20
     rtc_execution_horizon: int = 25
@@ -118,6 +121,8 @@ class RemotePolicyRecordConfig:
             )
         if self.obs_queue_timeout_s < 0:
             raise ValueError("`remote_policy.obs_queue_timeout_s` must be non-negative.")
+        if self.use_cfg is not None and not isinstance(self.use_cfg, bool):
+            raise ValueError("`remote_policy.use_cfg` must be true, false, or null.")
 
         if (
             not isinstance(self.rtc_inference_delay, int)
@@ -293,6 +298,7 @@ class RemotePolicyActionClient:
             actions_per_chunk=self.cfg.actions_per_chunk,
             chunk_size_threshold=self.cfg.chunk_size_threshold,
             rpc_timeout_s=self.cfg.obs_queue_timeout_s,
+            use_cfg=self.cfg.use_cfg,
             rtc_enabled=self.cfg.rtc_enable,
             cfg_beta=self.cfg.rtc_cfg_beta,
             inference_delay=self.cfg.rtc_inference_delay,
@@ -311,6 +317,8 @@ class RemotePolicyActionClient:
                 rename_map=self.cfg.rename_map,
                 protocol_version=2 if self.cfg.rtc_enable else 1,
                 return_raw_actions=self.cfg.rtc_enable,
+                use_cfg=self.cfg.use_cfg,
+                action_fps=1 / self.environment_dt,
                 rtc_enabled=self.cfg.rtc_enable,
                 rtc_inference_delay=self.cfg.rtc_inference_delay if self.cfg.rtc_enable else None,
                 rtc_execution_horizon=(self.cfg.rtc_execution_horizon if self.cfg.rtc_enable else None),
@@ -318,7 +326,9 @@ class RemotePolicyActionClient:
                 rtc_prefix_attention_schedule=(
                     self.cfg.rtc_prefix_attention_schedule if self.cfg.rtc_enable else None
                 ),
-                rtc_cfg_beta=self.cfg.rtc_cfg_beta if self.cfg.rtc_enable else None,
+                rtc_cfg_beta=(
+                    self.cfg.rtc_cfg_beta if self.cfg.rtc_enable or self.cfg.use_cfg is True else None
+                ),
             )
             self.stub.SendPolicyInstructions(self.services_pb2.PolicySetup(data=pickle.dumps(policy_config)))
         except Exception as exc:
@@ -343,8 +353,9 @@ class RemotePolicyActionClient:
             setup_ms=(time.perf_counter() - setup_start) * 1000,
         )
         logging.info(
-            "Remote policy recording client connected to %s (RTC=%s, d=%d, H=%d, trace=%s).",
+            "Remote policy recording client connected to %s (CFG=%s, RTC=%s, d=%d, H=%d, trace=%s).",
             self.cfg.server_address,
+            self.cfg.use_cfg,
             self.cfg.rtc_enable,
             self.cfg.rtc_inference_delay,
             self.cfg.rtc_execution_horizon,
@@ -886,6 +897,46 @@ class RemotePolicyActionClient:
             )
         if not payload.rtc_enabled:
             raise RuntimeError("The policy server returned a chunk without RTC enabled.")
+        if self.cfg.use_cfg is not None:
+            response_use_cfg = getattr(payload, "use_cfg", None)
+            response_beta = getattr(payload, "cfg_beta", None)
+            response_schedule = getattr(payload, "prefix_attention_schedule", None)
+            if isinstance(response_schedule, str):
+                with suppress(ValueError):
+                    response_schedule = RTCAttentionSchedule(response_schedule.upper())
+            mismatches = []
+            effective_horizon = self.cfg.rtc_execution_horizon
+            if request.left_over is not None and request.left_over.shape[0] > 0:
+                effective_horizon = min(effective_horizon, int(request.left_over.shape[0]))
+            effective_horizon = min(effective_horizon, self.cfg.actions_per_chunk)
+            effective_delay = min(self.cfg.rtc_inference_delay, effective_horizon)
+            expected = {
+                "use_cfg": self.cfg.use_cfg,
+                "inference_delay": effective_delay,
+                "execution_horizon": effective_horizon,
+                "max_guidance_weight": self.cfg.rtc_max_guidance_weight,
+                "prefix_attention_schedule": self.cfg.rtc_prefix_attention_schedule,
+            }
+            actual = {
+                "use_cfg": response_use_cfg,
+                "inference_delay": getattr(payload, "inference_delay", None),
+                "execution_horizon": getattr(payload, "execution_horizon", None),
+                "max_guidance_weight": getattr(payload, "max_guidance_weight", None),
+                "prefix_attention_schedule": response_schedule,
+            }
+            if self.cfg.use_cfg:
+                expected["cfg_beta"] = self.cfg.rtc_cfg_beta
+                actual["cfg_beta"] = response_beta
+            for field_name, expected_value in expected.items():
+                if actual[field_name] != expected_value:
+                    mismatches.append(
+                        f"{field_name}: client={expected_value!r}, server={actual[field_name]!r}"
+                    )
+            if mismatches:
+                raise RuntimeError(
+                    "The policy server did not honor the client inference contract: "
+                    + "; ".join(mismatches)
+                )
 
         raw_actions = payload.raw_actions
         if not isinstance(raw_actions, torch.Tensor) or raw_actions.ndim != 2:

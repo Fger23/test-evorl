@@ -99,6 +99,7 @@ def test_module_entrypoint_defaults_to_rtc_cfg():
     )
 
     assert config.rtc_enable is True
+    assert config.use_cfg is True
     assert config.chunk_size_threshold == 0.7
     assert config.fps == 30
     assert config.action_dequeue_fps == 15.0
@@ -128,6 +129,7 @@ def test_make_rtc_action_client_maps_protocol_parameters():
 
     try:
         assert client.cfg.rtc_enable is True
+        assert client.cfg.use_cfg is True
         assert client.cfg.aggregate_fn_name == "latest_only"
         assert client.cfg.chunk_size_threshold == 0.7
         assert client.cfg.rtc_inference_delay == 13

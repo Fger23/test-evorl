@@ -1,26 +1,15 @@
 # ============================================================
-# H200 服务端：Pi0.5 batch=2 ACP-CFG + RTC
+# H200 服务端：只开放 ACP/RTC 能力，算法参数由客户端协商
 # ============================================================
 python -m lerobot.async_inference.policy_server \
     --host=0.0.0.0 \
     --port=8099 \
-    --acp_inference.enable=true \
-    --acp_inference.use_cfg=true \
-    --acp_inference.batched_cfg=true \
-    --acp_inference.cfg_beta=1.5 \
-    --acp_inference.rtc.enabled=true \
-    --acp_inference.rtc.inference_delay=13 \
-    --acp_inference.rtc.execution_horizon=35 \
-    --acp_inference.rtc.max_guidance_weight=10.0 \
-    --acp_inference.rtc.prefix_attention_schedule=LINEAR \
-    --acp_inference.rtc.trace_enabled=true \
-    --acp_inference.rtc.trace_output_dir=logs/rtc_trace \
-    --acp_inference.profile=true \
-    --acp_inference.profile_output_dir=outputs/acp_inference_profile
+    --acp_inference.enable=true
 
 
 # ============================================================
 # 机器人客户端：30 Hz 发送指令，15 Hz 消耗模型动作，两点线性插值
+# 如需关闭 CFG，仅把 --use_cfg=true 改成 false；服务端命令不变，β 自动忽略。
 # ============================================================
 python -m lerobot.async_inference.robot_client \
     --robot.type=bi_so_follower \
@@ -40,6 +29,7 @@ python -m lerobot.async_inference.robot_client \
     --fps=30 \
     --action_dequeue_fps=15 \
     --rtc_enable=true \
+    --use_cfg=true \
     --obs_queue_timeout_s=30 \
     --rtc_inference_delay=13 \
     --rtc_execution_horizon=35 \

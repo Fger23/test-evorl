@@ -17,9 +17,11 @@ Monkey-patch the `policy` attribute with a stub so that no real model inference 
 
 from __future__ import annotations
 
+import pickle
 import threading
 import time
 from dataclasses import replace
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -134,8 +136,10 @@ def test_policy_server_acp_config_validation_and_round_trip():
     from lerobot.async_inference.configs import ACPInferenceConfig, ACPRTCConfig, PolicyServerConfig
     from lerobot.configs.types import RTCAttentionSchedule
 
-    with pytest.raises(ValueError, match="requires either batch=2 CFG.*rtc.enabled=true"):
-        PolicyServerConfig(acp_inference=ACPInferenceConfig(enable=True))
+    minimal_server = PolicyServerConfig(acp_inference=ACPInferenceConfig(enable=True))
+    assert minimal_server.acp_inference.enable is True
+    assert minimal_server.acp_inference.use_cfg is False
+    assert minimal_server.acp_inference.rtc.enabled is False
 
     with pytest.raises(ValueError, match="rtc.enabled=true.*acp_inference.enable=true"):
         ACPInferenceConfig(rtc=ACPRTCConfig(enabled=True))
@@ -236,6 +240,206 @@ def test_server_rejects_mismatched_rtc_client_contract(policy_server):
         policy_server._validate_client_rtc_contract(
             replace(matching, rtc_cfg_beta=-123.0, rtc_execution_horizon=30)
         )
+
+
+def test_client_authoritative_runtime_selects_cfg_and_rtc(policy_server):
+    from lerobot.async_inference.configs import ACPInferenceConfig, ACPRTCConfig
+    from lerobot.async_inference.helpers import RemotePolicyConfig
+    from lerobot.configs.types import RTCAttentionSchedule
+
+    policy_server.config.acp_inference = ACPInferenceConfig(
+        enable=True,
+        rtc=ACPRTCConfig(trace_enabled=False),
+    )
+    specs = RemotePolicyConfig(
+        policy_type="pi05",
+        pretrained_name_or_path="dummy/pi05",
+        lerobot_features={},
+        actions_per_chunk=50,
+        protocol_version=2,
+        return_raw_actions=True,
+        use_cfg=True,
+        action_fps=15.0,
+        rtc_enabled=True,
+        rtc_inference_delay=13,
+        rtc_execution_horizon=35,
+        rtc_max_guidance_weight=10.0,
+        rtc_prefix_attention_schedule=RTCAttentionSchedule.LINEAR,
+        rtc_cfg_beta=1.5,
+    )
+
+    runtime = policy_server._build_client_acp_runtime(specs)
+
+    assert runtime is not None
+    assert runtime.use_cfg is True
+    assert runtime.batched_cfg is True
+    assert runtime.cfg_beta == 1.5
+    assert runtime.rtc.enabled is True
+    assert runtime.rtc.inference_delay == 13
+    assert runtime.rtc.execution_horizon == 35
+    assert runtime.rtc.max_guidance_weight == 10.0
+    assert runtime.rtc.prefix_attention_schedule is RTCAttentionSchedule.LINEAR
+    policy_server._validate_client_rtc_contract(specs, acp=runtime)
+
+    policy_server._runtime_acp_inference = runtime
+    assert policy_server.batched_cfg_enabled is True
+    assert policy_server.rtc_enabled is True
+
+
+def test_client_authoritative_cfg_off_keeps_con_only_rtc_and_ignores_beta(policy_server):
+    from lerobot.async_inference.configs import ACPInferenceConfig, ACPRTCConfig
+    from lerobot.async_inference.helpers import RemotePolicyConfig
+    from lerobot.configs.types import RTCAttentionSchedule
+
+    policy_server.config.acp_inference = ACPInferenceConfig(
+        enable=True,
+        cfg_beta=9.0,
+        rtc=ACPRTCConfig(trace_enabled=False),
+    )
+    specs = RemotePolicyConfig(
+        policy_type="pi05",
+        pretrained_name_or_path="dummy/pi05",
+        lerobot_features={},
+        actions_per_chunk=50,
+        protocol_version=2,
+        return_raw_actions=True,
+        use_cfg=False,
+        rtc_enabled=True,
+        rtc_inference_delay=7,
+        rtc_execution_horizon=30,
+        rtc_max_guidance_weight=8.0,
+        rtc_prefix_attention_schedule="EXP",
+        rtc_cfg_beta=-123.0,
+    )
+
+    runtime = policy_server._build_client_acp_runtime(specs)
+
+    assert runtime is not None
+    assert runtime.use_cfg is False
+    assert runtime.batched_cfg is False
+    assert runtime.cfg_beta == 9.0
+    assert runtime.rtc.enabled is True
+    assert runtime.rtc.inference_delay == 7
+    assert runtime.rtc.execution_horizon == 30
+    assert runtime.rtc.max_guidance_weight == 8.0
+    assert runtime.rtc.prefix_attention_schedule is RTCAttentionSchedule.EXP
+
+    policy_server._runtime_acp_inference = runtime
+    assert policy_server.batched_cfg_enabled is False
+    assert policy_server.rtc_enabled is True
+
+
+def test_client_authoritative_runtime_requires_server_capability_gate(policy_server):
+    from lerobot.async_inference.helpers import RemotePolicyConfig
+
+    specs = RemotePolicyConfig(
+        policy_type="pi05",
+        pretrained_name_or_path="dummy/pi05",
+        lerobot_features={},
+        actions_per_chunk=50,
+        protocol_version=2,
+        return_raw_actions=True,
+        use_cfg=False,
+        rtc_enabled=True,
+        rtc_inference_delay=13,
+        rtc_execution_horizon=35,
+        rtc_max_guidance_weight=10.0,
+        rtc_prefix_attention_schedule="LINEAR",
+        rtc_cfg_beta=1.5,
+    )
+
+    with pytest.raises(ValueError, match="acp_inference.enable=true"):
+        policy_server._build_client_acp_runtime(specs)
+
+
+def test_policy_setup_commits_client_runtime_and_ready_preserves_it(policy_server, monkeypatch):
+    from lerobot.async_inference import policy_server as policy_server_module
+    from lerobot.async_inference.configs import ACPInferenceConfig, ACPRTCConfig
+    from lerobot.async_inference.helpers import RemotePolicyConfig
+    from lerobot.configs.types import RTCAttentionSchedule
+
+    class _FakeConfig:
+        chunk_size = 50
+        max_action_dim = 14
+        image_features = {}
+        rtc_config = None
+
+    class _FakeCoreModel:
+        def __init__(self):
+            self.config = _FakeConfig()
+            self.rtc_processor = None
+
+    class _FakePolicy:
+        def __init__(self):
+            self.config = _FakeConfig()
+            self.model = _FakeCoreModel()
+            self.rtc_processor = None
+
+        @classmethod
+        def from_pretrained(cls, _path, device):
+            assert device == "cpu"
+            return cls()
+
+        def to(self, device):
+            assert device == "cpu"
+            return self
+
+        def init_rtc_processor(self):
+            marker = object()
+            self.rtc_processor = marker
+            self.model.rtc_processor = marker
+
+    policy_server.config.acp_inference = ACPInferenceConfig(
+        enable=True,
+        rtc=ACPRTCConfig(trace_enabled=False),
+    )
+    monkeypatch.setattr(policy_server_module, "get_policy_class", lambda _policy_type: _FakePolicy)
+    monkeypatch.setattr(
+        policy_server_module,
+        "make_pre_post_processors",
+        lambda *_args, **_kwargs: (lambda value: value, lambda value: value),
+    )
+    specs = RemotePolicyConfig(
+        policy_type="pi05",
+        pretrained_name_or_path="dummy/pi05",
+        lerobot_features={},
+        actions_per_chunk=50,
+        protocol_version=2,
+        return_raw_actions=True,
+        use_cfg=True,
+        action_fps=15.0,
+        rtc_enabled=True,
+        rtc_inference_delay=13,
+        rtc_execution_horizon=35,
+        rtc_max_guidance_weight=10.0,
+        rtc_prefix_attention_schedule=RTCAttentionSchedule.LINEAR,
+        rtc_cfg_beta=1.5,
+    )
+    context = SimpleNamespace(peer=lambda: "test-client")
+    request = SimpleNamespace(data=pickle.dumps(specs))
+
+    policy_server.SendPolicyInstructions(request, context)
+
+    runtime = policy_server._runtime_acp_inference
+    loaded_policy = policy_server.policy
+    assert runtime is not None
+    assert runtime.use_cfg is True
+    assert runtime.cfg_beta == 1.5
+    assert runtime.rtc.inference_delay == 13
+    assert policy_server.action_fps == 15.0
+    assert policy_server.batched_cfg_enabled is True
+    assert policy_server.rtc_enabled is True
+    assert loaded_policy.config.rtc_config.execution_horizon == 35
+    assert loaded_policy.model.config.rtc_config.execution_horizon == 35
+    timed_actions = policy_server._time_action_chunk(10.0, [torch.zeros(1), torch.zeros(1)], 0)
+    assert timed_actions[1].get_timestamp() == pytest.approx(10.0 + 1 / 15)
+
+    policy_server.Ready(SimpleNamespace(), context)
+
+    assert policy_server._runtime_acp_inference is runtime
+    assert policy_server.policy is loaded_policy
+    assert policy_server.batched_cfg_enabled is True
+    assert policy_server.rtc_enabled is True
 
 
 def test_time_action_chunk(policy_server):
@@ -622,9 +826,13 @@ def test_server_rtc_cfg_v2_envelope_shares_leftover_and_runtime_inputs(policy_se
     assert isinstance(response, RemoteActionChunk)
     assert response.request_id == "request-12"
     assert response.observation_timestep == 12
+    assert response.use_cfg is True
+    assert response.cfg_beta == 1.5
     assert response.rtc_enabled is True
     assert response.inference_delay == 1
     assert response.execution_horizon == 3
+    assert response.max_guidance_weight == 10.0
+    assert response.prefix_attention_schedule is RTCAttentionSchedule.LINEAR
 
     assert len(policy_server.policy.calls) == 1
     model_input, shared_noise, rtc_kwargs = policy_server.policy.calls[0]
@@ -756,9 +964,13 @@ def test_server_single_cond_rtc_v2_envelope_uses_positive_task_and_batch_one(pol
     assert isinstance(response, RemoteActionChunk)
     assert response.request_id == "request-13"
     assert response.observation_timestep == 13
+    assert response.use_cfg is False
+    assert response.cfg_beta is None
     assert response.rtc_enabled is True
     assert response.inference_delay == 1
     assert response.execution_horizon == 3
+    assert response.max_guidance_weight == 10.0
+    assert response.prefix_attention_schedule is RTCAttentionSchedule.LINEAR
 
     assert len(policy_server.preprocessor.inputs) == 1
     assert policy_server.preprocessor.inputs[0]["task"] == "Pick and place\nAdvantage: positive"

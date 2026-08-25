@@ -175,15 +175,9 @@ class PolicyServerConfig:
             and not self.acp_inference.batched_cfg
         ):
             raise ValueError("PolicyServer CFG requires `use_cfg=true` and `batched_cfg=true`.")
-        if (
-            self.acp_inference.enable
-            and not self.acp_inference.use_cfg
-            and not self.acp_inference.rtc.enabled
-        ):
-            raise ValueError(
-                "PolicyServer ACP inference requires either batch=2 CFG "
-                "(`use_cfg=true`, `batched_cfg=true`) or `rtc.enabled=true`."
-            )
+        # ``enable=true`` alone is a capability gate for new robot_client
+        # sessions. The effective CFG/RTC mode can be negotiated later in the
+        # policy setup handshake.
 
     @classmethod
     def from_dict(cls, config_dict: dict) -> "PolicyServerConfig":
@@ -293,6 +287,10 @@ class RobotClientConfig:
     # robot entrypoint. ``rtc_enable=false`` keeps the historical
     # protocol-v1 client available for tests and backwards compatibility.
     rtc_enable: bool = field(default=True, metadata={"help": "Enable protocol-v2 RTC inference"})
+    use_cfg: bool = field(
+        default=True,
+        metadata={"help": "Run batch=2 ACP-CFG; false runs positive-conditioned batch=1 RTC"},
+    )
     obs_queue_timeout_s: float = field(
         default=30.0,
         metadata={"help": "Maximum seconds to wait for a remote RTC action chunk"},
@@ -386,6 +384,8 @@ class RobotClientConfig:
             raise ValueError("obs_queue_timeout_s must be non-negative")
 
         if self.rtc_enable:
+            if not isinstance(self.use_cfg, bool):
+                raise ValueError("use_cfg must be true or false")
             interpolation_ratio = self.fps / self.action_dequeue_fps
             if interpolation_ratio < 1 or not math.isclose(
                 interpolation_ratio, round(interpolation_ratio), rel_tol=0.0, abs_tol=1e-9
@@ -442,6 +442,7 @@ class RobotClientConfig:
             "debug_visualize_queue_size": self.debug_visualize_queue_size,
             "aggregate_fn_name": self.aggregate_fn_name,
             "rtc_enable": self.rtc_enable,
+            "use_cfg": self.use_cfg,
             "obs_queue_timeout_s": self.obs_queue_timeout_s,
             "rtc_inference_delay": self.rtc_inference_delay,
             "rtc_execution_horizon": self.rtc_execution_horizon,

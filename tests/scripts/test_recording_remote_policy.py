@@ -364,3 +364,48 @@ def test_pending_result_rejects_misaligned_processed_action_dimension(rtc_client
 
     with pytest.raises(ValueError, match="not aligned"):
         rtc_client._apply_pending_result()
+
+
+def test_pending_result_rejects_server_that_ignores_client_cfg_contract(rtc_client):
+    _seed_queue(rtc_client)
+    assert rtc_client._submit_if_needed(observation={}, task=None, timestep=0)
+    request = _take_submitted_request(rtc_client)
+    raw = torch.zeros(6, 2)
+    processed = torch.ones(6, 2)
+    response = _make_response(request.request_id, raw, processed)
+    response.use_cfg = False
+    response.cfg_beta = None
+    response.max_guidance_weight = rtc_client.cfg.rtc_max_guidance_weight
+    response.prefix_attention_schedule = rtc_client.cfg.rtc_prefix_attention_schedule
+    rtc_client.cfg.use_cfg = True
+
+    with rtc_client._state_lock:
+        rtc_client._in_flight_request_id = None
+        rtc_client._pending_result = (request, response)
+
+    with pytest.raises(RuntimeError, match="did not honor.*use_cfg"):
+        rtc_client._apply_pending_result()
+
+
+def test_pending_result_accepts_effective_rtc_window_for_short_leftover(rtc_client):
+    raw = torch.arange(4, dtype=torch.float32).reshape(2, 2)
+    processed = raw + 100
+    assert isinstance(rtc_client.action_queue, ActionQueue)
+    rtc_client.action_queue.merge(raw, processed, real_delay=0)
+    assert rtc_client._submit_if_needed(observation={}, task=None, timestep=0)
+    request = _take_submitted_request(rtc_client)
+    assert request.left_over is not None and request.left_over.shape[0] == 2
+
+    response = _make_response(request.request_id, raw + 10, processed + 10)
+    response.use_cfg = False
+    response.cfg_beta = None
+    response.inference_delay = 1
+    response.execution_horizon = 2
+    response.max_guidance_weight = rtc_client.cfg.rtc_max_guidance_weight
+    response.prefix_attention_schedule = rtc_client.cfg.rtc_prefix_attention_schedule
+    rtc_client.cfg.use_cfg = False
+    with rtc_client._state_lock:
+        rtc_client._in_flight_request_id = None
+        rtc_client._pending_result = (request, response)
+
+    assert rtc_client._apply_pending_result()

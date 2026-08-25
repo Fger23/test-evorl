@@ -32,7 +32,7 @@ from lerobot.async_inference.helpers import (
     raw_observation_to_observation,
     resize_robot_observation_image,
 )
-from lerobot.configs.types import FeatureType, PolicyFeature
+from lerobot.configs.types import FeatureType, PolicyFeature, RTCAttentionSchedule
 from lerobot.utils.constants import OBS_IMAGES, OBS_STATE
 
 # ---------------------------------------------------------------------
@@ -150,9 +150,13 @@ def test_rtc_v2_helpers_pickle_round_trip():
         actions=actions,
         raw_actions=raw,
         observation_timestep=7,
+        use_cfg=True,
+        cfg_beta=1.5,
         rtc_enabled=True,
         inference_delay=20,
         execution_horizon=25,
+        max_guidance_weight=10.0,
+        prefix_attention_schedule=RTCAttentionSchedule.LINEAR,
     )
 
     restored_observation = pickle.loads(pickle.dumps(observation))  # nosec B301
@@ -161,7 +165,11 @@ def test_rtc_v2_helpers_pickle_round_trip():
     assert restored_observation.rtc_metadata.request_id == "request-7"
     torch.testing.assert_close(restored_observation.rtc_metadata.prev_chunk_left_over, raw)
     assert restored_response.request_id == "request-7"
+    assert restored_response.use_cfg is True
+    assert restored_response.cfg_beta == 1.5
     assert restored_response.rtc_enabled is True
+    assert restored_response.max_guidance_weight == 10.0
+    assert restored_response.prefix_attention_schedule is RTCAttentionSchedule.LINEAR
     assert [action.get_timestep() for action in restored_response.actions] == [7, 8]
     torch.testing.assert_close(restored_response.raw_actions, raw)
 
@@ -176,6 +184,8 @@ def test_remote_policy_config_defaults_to_legacy_protocol():
 
     assert config.protocol_version == 1
     assert config.return_raw_actions is False
+    assert config.use_cfg is None
+    assert config.action_fps is None
     assert config.rtc_enabled is False
     assert config.rtc_inference_delay is None
     assert config.rtc_execution_horizon is None

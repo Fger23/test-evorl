@@ -666,6 +666,7 @@ def _make_rtc_action_client(cfg: RobotClientConfig, robot: Robot):
         # aggregation is intentionally not part of this path.
         aggregate_fn_name="latest_only",
         obs_queue_timeout_s=cfg.obs_queue_timeout_s,
+        use_cfg=cfg.use_cfg,
         rtc_enable=True,
         rtc_inference_delay=cfg.rtc_inference_delay,
         rtc_execution_horizon=cfg.rtc_execution_horizon,
@@ -799,9 +800,10 @@ def run_rtc_client(cfg: RobotClientConfig) -> None:
         # raw/processed ActionQueue start in the same episode epoch.
         action_client.reset()
         logger.info(
-            "RTC client ready: server=%s, model_actions=%.1fHz, robot_commands=%dHz, "
+            "RTC client ready: server=%s, cfg=%s, model_actions=%.1fHz, robot_commands=%dHz, "
             "d=%d, H=%d, beta=%.3f, threshold=%.3f",
             cfg.server_address,
+            cfg.use_cfg,
             cfg.action_dequeue_fps,
             cfg.fps,
             cfg.rtc_inference_delay,
