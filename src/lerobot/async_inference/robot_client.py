@@ -675,7 +675,60 @@ def _make_rtc_action_client(cfg: RobotClientConfig, robot: Robot):
         rtc_trace_enabled=cfg.rtc_trace_enabled,
         rtc_trace_output_dir=cfg.rtc_trace_output_dir,
     )
-    return RemotePolicyActionClient(cfg=remote_cfg, robot=robot, fps=cfg.fps)
+    # The remote queue contains model actions, not interpolated robot commands.
+    # RTC delays therefore count at the model-action dequeue rate (15 Hz by
+    # default), while ``cfg.fps`` remains the 30 Hz hardware command rate.
+    return RemotePolicyActionClient(cfg=remote_cfg, robot=robot, fps=cfg.action_dequeue_fps)
+
+
+def _action_anchor_from_observation(
+    observation: dict[str, Any], target_action: dict[str, float]
+) -> dict[str, float]:
+    """Use measured joint positions as the first interpolation anchor.
+
+    Camera and auxiliary observation fields are ignored. If a robot does not
+    expose an action key in its observation, falling back to the target keeps
+    that component safe and preserves the previous first-action behavior.
+    """
+
+    anchor: dict[str, float] = {}
+    for key, target_value in target_action.items():
+        value = observation.get(key, target_value)
+        try:
+            scalar = float(value)
+        except (TypeError, ValueError):
+            scalar = float(target_value)
+        anchor[key] = scalar if math.isfinite(scalar) else float(target_value)
+    return anchor
+
+
+def _interpolate_action(
+    start_action: dict[str, float], target_action: dict[str, float], fraction: float
+) -> dict[str, float]:
+    """Linearly interpolate one postprocessed robot action in joint space."""
+
+    if not 0.0 < fraction <= 1.0:
+        raise ValueError(f"Interpolation fraction must be in (0, 1], got {fraction}.")
+    if start_action.keys() != target_action.keys():
+        raise ValueError("Interpolation actions must contain identical feature keys.")
+    return {
+        key: float(start_action[key]) + fraction * (float(target_action[key]) - float(start_action[key]))
+        for key in target_action
+    }
+
+
+def _sent_action_or_command(sent_action: Any, command: dict[str, float]) -> dict[str, float]:
+    """Return the robot-reported command when it is a complete finite action."""
+
+    if not isinstance(sent_action, dict) or sent_action.keys() != command.keys():
+        return dict(command)
+    try:
+        normalized = {key: float(sent_action[key]) for key in command}
+    except (TypeError, ValueError):
+        return dict(command)
+    if not all(math.isfinite(value) for value in normalized.values()):
+        return dict(command)
+    return normalized
 
 
 def _rtc_control_loop(
@@ -685,33 +738,55 @@ def _rtc_control_loop(
     *,
     max_steps: int | None = None,
 ) -> int:
-    """Execute RTC actions and confirm only actions that reached the robot.
+    """Execute 15 Hz RTC actions through a paced, interpolated 30 Hz stream.
 
     ``max_steps`` exists for deterministic unit tests. Production runs until
-    Ctrl+C, matching the historical robot client entrypoint.
+    Ctrl+C, matching the historical robot client entrypoint. ``executed_steps``
+    counts completed model actions, not interpolation commands, so RTC's
+    actual-delay accounting stays in the same units as the action queue.
     """
+    command_period_s = 1.0 / cfg.fps
+    interpolation_steps = round(cfg.fps / cfg.action_dequeue_fps)
     executed_steps = 0
+    last_send_started_at: float | None = None
+    previous_action: dict[str, float] | None = None
+
     while max_steps is None or executed_steps < max_steps:
-        loop_start = time.perf_counter()
         observation = robot.get_observation()
-        action = action_client.get_action(
+        target_action = action_client.get_action(
             observation=observation,
             task=cfg.task,
             timestep=executed_steps,
         )
 
-        # The RTC actual-delay counter advances only after this call succeeds.
-        robot.send_action(action)
+        start_action = previous_action or _action_anchor_from_observation(observation, target_action)
+        final_sent_action = start_action
+        for interpolation_index in range(1, interpolation_steps + 1):
+            fraction = interpolation_index / interpolation_steps
+            command = _interpolate_action(start_action, target_action, fraction)
+
+            # Pace the hardware writes themselves. A long queue/RPC wait makes
+            # the first command eligible immediately, but never causes missed
+            # periods to be replayed as a burst.
+            if last_send_started_at is not None:
+                now = time.perf_counter()
+                precise_sleep(max(last_send_started_at + command_period_s - now, 0.0))
+
+            last_send_started_at = time.perf_counter()
+            sent_action = robot.send_action(command)
+            final_sent_action = _sent_action_or_command(sent_action, command)
+
+        # An interpolated midpoint is not one executed model step. Advance the
+        # queue/RTC counter only after the final target command succeeds.
         action_client.mark_action_executed()
         executed_steps += 1
-
-        precise_sleep(max(cfg.environment_dt - (time.perf_counter() - loop_start), 0.0))
+        previous_action = final_sent_action
 
     return executed_steps
 
 
 def run_rtc_client(cfg: RobotClientConfig) -> None:
-    """Run the dedicated RTC-CFG robot client lifecycle."""
+    """Run the dedicated RTC robot client lifecycle."""
     logger = get_logger("rtc_robot_client")
     robot = make_robot_from_config(cfg.robot)
     action_client = None
@@ -724,8 +799,11 @@ def run_rtc_client(cfg: RobotClientConfig) -> None:
         # raw/processed ActionQueue start in the same episode epoch.
         action_client.reset()
         logger.info(
-            "RTC-CFG client ready: server=%s, d=%d, H=%d, beta=%.3f, threshold=%.3f",
+            "RTC client ready: server=%s, model_actions=%.1fHz, robot_commands=%dHz, "
+            "d=%d, H=%d, beta=%.3f, threshold=%.3f",
             cfg.server_address,
+            cfg.action_dequeue_fps,
+            cfg.fps,
             cfg.rtc_inference_delay,
             cfg.rtc_execution_horizon,
             cfg.rtc_cfg_beta,
@@ -733,13 +811,13 @@ def run_rtc_client(cfg: RobotClientConfig) -> None:
         )
         _rtc_control_loop(cfg, robot, action_client)
     except KeyboardInterrupt:
-        logger.info("RTC-CFG client interrupted by user")
+        logger.info("RTC client interrupted by user")
     finally:
         if action_client is not None:
             action_client.stop()
         if robot.is_connected:
             robot.disconnect()
-        logger.info("RTC-CFG client stopped")
+        logger.info("RTC client stopped")
 
 
 @draccus.wrap()

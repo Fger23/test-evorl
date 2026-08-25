@@ -46,11 +46,11 @@ def get_aggregate_function(name: str) -> Callable[[torch.Tensor, torch.Tensor], 
 
 @dataclass
 class ACPRTCConfig:
-    """Runtime RTC settings for server-side Pi0.5 ACP-CFG inference."""
+    """Runtime RTC settings for server-side Pi0.5 ACP inference."""
 
     enabled: bool = False
-    inference_delay: int = 20
-    execution_horizon: int = 25
+    inference_delay: int = 13
+    execution_horizon: int = 35
     max_guidance_weight: float = 10.0
     prefix_attention_schedule: RTCAttentionSchedule = RTCAttentionSchedule.LINEAR
     trace_enabled: bool = True
@@ -115,11 +115,8 @@ class ACPInferenceConfig:
             raise ValueError("`acp_inference.batched_cfg=true` requires `acp_inference.use_cfg=true`.")
         if self.profile and not self.batched_cfg:
             raise ValueError("`acp_inference.profile=true` requires `acp_inference.batched_cfg=true`.")
-        if self.rtc.enabled and not (self.enable and self.use_cfg and self.batched_cfg):
-            raise ValueError(
-                "`acp_inference.rtc.enabled=true` requires ACP `enable=true`, "
-                "`use_cfg=true`, and `batched_cfg=true`."
-            )
+        if self.rtc.enabled and not self.enable:
+            raise ValueError("`acp_inference.rtc.enabled=true` requires `acp_inference.enable=true`.")
         if not math.isfinite(self.cfg_beta) or self.cfg_beta < 0:
             raise ValueError("`acp_inference.cfg_beta` must be finite and >= 0.")
         if self.profile and not self.profile_output_dir.strip():
@@ -154,8 +151,8 @@ class PolicyServerConfig:
         default=DEFAULT_OBS_QUEUE_TIMEOUT, metadata={"help": "Timeout for observation queue in seconds"}
     )
 
-    # Optional Pi0.5 batch=2 ACP-CFG inference. This is configured on the H200
-    # policy server; the robot client continues to receive one action chunk.
+    # Optional Pi0.5 ACP inference. CFG uses one batch=2 U/C forward; RTC can
+    # also run without CFG as one positive-conditioned batch=1 forward.
     acp_inference: ACPInferenceConfig = field(default_factory=ACPInferenceConfig)
 
     def __post_init__(self):
@@ -172,10 +169,20 @@ class PolicyServerConfig:
         if self.obs_queue_timeout < 0:
             raise ValueError(f"obs_queue_timeout must be non-negative, got {self.obs_queue_timeout}")
 
-        if self.acp_inference.enable and not (self.acp_inference.use_cfg and self.acp_inference.batched_cfg):
+        if (
+            self.acp_inference.enable
+            and self.acp_inference.use_cfg
+            and not self.acp_inference.batched_cfg
+        ):
+            raise ValueError("PolicyServer CFG requires `use_cfg=true` and `batched_cfg=true`.")
+        if (
+            self.acp_inference.enable
+            and not self.acp_inference.use_cfg
+            and not self.acp_inference.rtc.enabled
+        ):
             raise ValueError(
-                "PolicyServer ACP inference currently requires "
-                "`enable=true`, `use_cfg=true`, and `batched_cfg=true`."
+                "PolicyServer ACP inference requires either batch=2 CFG "
+                "(`use_cfg=true`, `batched_cfg=true`) or `rtc.enabled=true`."
             )
 
     @classmethod
@@ -266,6 +273,15 @@ class RobotClientConfig:
     # Control behavior configuration
     chunk_size_threshold: float = field(default=0.7, metadata={"help": "Threshold for chunk size control"})
     fps: int = field(default=DEFAULT_FPS, metadata={"help": "Frames per second"})
+    action_dequeue_fps: float = field(
+        default=15.0,
+        metadata={
+            "help": (
+                "Rate at which RTC model actions are completed; robot commands are linearly "
+                "interpolated and sent at --fps"
+            )
+        },
+    )
 
     # Aggregate function configuration (CLI-compatible)
     aggregate_fn_name: str = field(
@@ -273,16 +289,16 @@ class RobotClientConfig:
         metadata={"help": f"Name of aggregate function to use. Options: {list(AGGREGATE_FUNCTIONS.keys())}"},
     )
 
-    # ``python -m lerobot.async_inference.robot_client`` is the dedicated
-    # RTC-CFG robot entrypoint.  ``rtc_enable=false`` keeps the historical
+    # ``python -m lerobot.async_inference.robot_client`` is the dedicated RTC
+    # robot entrypoint. ``rtc_enable=false`` keeps the historical
     # protocol-v1 client available for tests and backwards compatibility.
-    rtc_enable: bool = field(default=True, metadata={"help": "Enable protocol-v2 RTC-CFG inference"})
+    rtc_enable: bool = field(default=True, metadata={"help": "Enable protocol-v2 RTC inference"})
     obs_queue_timeout_s: float = field(
         default=30.0,
         metadata={"help": "Maximum seconds to wait for a remote RTC action chunk"},
     )
     rtc_inference_delay: int = field(
-        default=21,
+        default=13,
         metadata={"help": "Estimated inference delay in executed action steps"},
     )
     rtc_execution_horizon: int = field(
@@ -356,6 +372,13 @@ class RobotClientConfig:
         if self.fps <= 0:
             raise ValueError(f"fps must be positive, got {self.fps}")
 
+        if (
+            isinstance(self.action_dequeue_fps, bool)
+            or not isinstance(self.action_dequeue_fps, int | float)
+            or not math.isfinite(float(self.action_dequeue_fps))
+            or self.action_dequeue_fps <= 0
+        ):
+            raise ValueError("action_dequeue_fps must be a finite number greater than zero")
         if self.actions_per_chunk <= 0:
             raise ValueError(f"actions_per_chunk must be positive, got {self.actions_per_chunk}")
 
@@ -363,10 +386,18 @@ class RobotClientConfig:
             raise ValueError("obs_queue_timeout_s must be non-negative")
 
         if self.rtc_enable:
+            interpolation_ratio = self.fps / self.action_dequeue_fps
+            if interpolation_ratio < 1 or not math.isclose(
+                interpolation_ratio, round(interpolation_ratio), rel_tol=0.0, abs_tol=1e-9
+            ):
+                raise ValueError(
+                    "fps must be an integer multiple of action_dequeue_fps so interpolation "
+                    "has a fixed number of robot commands per model action"
+                )
             if self.policy_type != "pi05":
-                raise ValueError("RTC-CFG robot_client currently supports only policy_type=pi05")
+                raise ValueError("RTC robot_client currently supports only policy_type=pi05")
             if self.obs_queue_timeout_s == 0:
-                raise ValueError("RTC-CFG requires obs_queue_timeout_s to be positive")
+                raise ValueError("RTC requires obs_queue_timeout_s to be positive")
             if (
                 not isinstance(self.rtc_inference_delay, int)
                 or isinstance(self.rtc_inference_delay, bool)
@@ -405,6 +436,7 @@ class RobotClientConfig:
             "client_device": self.client_device,
             "chunk_size_threshold": self.chunk_size_threshold,
             "fps": self.fps,
+            "action_dequeue_fps": self.action_dequeue_fps,
             "actions_per_chunk": self.actions_per_chunk,
             "task": self.task,
             "debug_visualize_queue_size": self.debug_visualize_queue_size,

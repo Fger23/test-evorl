@@ -100,7 +100,9 @@ def test_module_entrypoint_defaults_to_rtc_cfg():
 
     assert config.rtc_enable is True
     assert config.chunk_size_threshold == 0.7
-    assert config.rtc_inference_delay == 21
+    assert config.fps == 30
+    assert config.action_dequeue_fps == 15.0
+    assert config.rtc_inference_delay == 13
     assert config.rtc_execution_horizon == 35
     assert config.rtc_cfg_beta == 1.5
     assert config.obs_queue_timeout_s == 30.0
@@ -128,15 +130,16 @@ def test_make_rtc_action_client_maps_protocol_parameters():
         assert client.cfg.rtc_enable is True
         assert client.cfg.aggregate_fn_name == "latest_only"
         assert client.cfg.chunk_size_threshold == 0.7
-        assert client.cfg.rtc_inference_delay == 21
+        assert client.cfg.rtc_inference_delay == 13
         assert client.cfg.rtc_execution_horizon == 35
         assert client.cfg.rtc_cfg_beta == 1.5
+        assert client.environment_dt == pytest.approx(1 / 15)
         assert isinstance(client.action_queue, ActionQueue)
     finally:
         client.stop()
 
 
-def test_rtc_control_loop_confirms_only_successfully_sent_actions(monkeypatch):
+def test_rtc_control_loop_confirms_only_completed_model_actions(monkeypatch):
     from lerobot.async_inference import robot_client as robot_client_module
 
     class FakeRobot:
@@ -144,12 +147,13 @@ def test_rtc_control_loop_confirms_only_successfully_sent_actions(monkeypatch):
             self.sent = []
 
         def get_observation(self):
-            return {"state": len(self.sent)}
+            return {"joint_0.pos": 0.0}
 
         def send_action(self, action):
-            if len(self.sent) == 1:
+            if len(self.sent) == 3:
                 raise ConnectionError("robot write failed")
             self.sent.append(action)
+            return action
 
     class FakeRTCClient:
         def __init__(self):
@@ -163,7 +167,7 @@ def test_rtc_control_loop_confirms_only_successfully_sent_actions(monkeypatch):
         def mark_action_executed(self):
             self.confirmed += 1
 
-    config = SimpleNamespace(task="task", environment_dt=0.0)
+    config = SimpleNamespace(task="task", fps=30, action_dequeue_fps=15)
     robot = FakeRobot()
     client = FakeRTCClient()
     monkeypatch.setattr(robot_client_module, "precise_sleep", lambda _: None)
@@ -173,6 +177,129 @@ def test_rtc_control_loop_confirms_only_successfully_sent_actions(monkeypatch):
 
     assert client.request_timesteps == [0, 1]
     assert client.confirmed == 1
+
+
+def test_rtc_control_loop_interpolates_15hz_actions_at_30hz(monkeypatch):
+    from lerobot.async_inference import robot_client as robot_client_module
+
+    class FakeRobot:
+        def __init__(self):
+            self.sent = []
+
+        def get_observation(self):
+            return {"joint_0.pos": 0.0}
+
+        def send_action(self, action):
+            self.sent.append(dict(action))
+            return action
+
+    class FakeRTCClient:
+        def __init__(self):
+            self.targets = iter((10.0, 20.0))
+            self.timesteps = []
+            self.confirmed = 0
+
+        def get_action(self, *, observation, task, timestep):
+            self.timesteps.append(timestep)
+            return {"joint_0.pos": next(self.targets)}
+
+        def mark_action_executed(self):
+            self.confirmed += 1
+
+    config = SimpleNamespace(task="task", fps=30, action_dequeue_fps=15)
+    robot = FakeRobot()
+    client = FakeRTCClient()
+    monkeypatch.setattr(robot_client_module, "precise_sleep", lambda _: None)
+
+    assert robot_client_module._rtc_control_loop(config, robot, client, max_steps=2) == 2
+
+    assert [action["joint_0.pos"] for action in robot.sent] == [5.0, 10.0, 15.0, 20.0]
+    assert client.timesteps == [0, 1]
+    assert client.confirmed == 2
+
+
+def test_rtc_control_loop_never_replays_missed_periods_as_a_burst(monkeypatch):
+    from lerobot.async_inference import robot_client as robot_client_module
+
+    clock = [0.0]
+    send_times = []
+
+    def perf_counter():
+        return clock[0]
+
+    def precise_sleep(seconds):
+        clock[0] += seconds
+
+    class FakeRobot:
+        def get_observation(self):
+            return {"joint_0.pos": 0.0}
+
+        def send_action(self, action):
+            send_times.append(clock[0])
+            # A real bus write is not free. Pacing is start-to-start so this
+            # time does not unnecessarily lower the requested command rate.
+            clock[0] += 0.005
+            return action
+
+    class FakeRTCClient:
+        def __init__(self):
+            self.calls = 0
+
+        def get_action(self, *, observation, task, timestep):
+            self.calls += 1
+            if self.calls == 2:
+                # Simulate a recurrent queue wait after commands have already
+                # been sent. Recovery may be immediate, but never catch-up.
+                clock[0] += 1.0
+            return {"joint_0.pos": float(self.calls)}
+
+        def mark_action_executed(self):
+            return None
+
+    monkeypatch.setattr(robot_client_module.time, "perf_counter", perf_counter)
+    monkeypatch.setattr(robot_client_module, "precise_sleep", precise_sleep)
+    config = SimpleNamespace(task="task", fps=30, action_dequeue_fps=15)
+
+    robot_client_module._rtc_control_loop(config, FakeRobot(), FakeRTCClient(), max_steps=2)
+
+    assert len(send_times) == 4
+    intervals = [
+        later - earlier for earlier, later in zip(send_times[:-1], send_times[1:], strict=True)
+    ]
+    assert all(interval >= 1 / 30 - 1e-12 for interval in intervals)
+
+
+def test_legacy_client_does_not_require_an_interpolation_ratio():
+    from lerobot.async_inference.configs import RobotClientConfig
+    from tests.mocks.mock_robot import MockRobotConfig
+
+    config = RobotClientConfig(
+        robot=MockRobotConfig(),
+        policy_type="test",
+        pretrained_name_or_path="test",
+        actions_per_chunk=20,
+        fps=20,
+        rtc_enable=False,
+    )
+
+    assert config.fps == 20
+    assert config.action_dequeue_fps == 15.0
+
+
+@pytest.mark.parametrize("action_dequeue_fps", [0, -1, 20, 31])
+def test_rtc_interpolation_rate_validation(action_dequeue_fps):
+    from lerobot.async_inference.configs import RobotClientConfig
+    from tests.mocks.mock_robot import MockRobotConfig
+
+    with pytest.raises(ValueError, match="action_dequeue_fps|integer multiple"):
+        RobotClientConfig(
+            robot=MockRobotConfig(),
+            policy_type="pi05",
+            pretrained_name_or_path="test",
+            actions_per_chunk=50,
+            fps=30,
+            action_dequeue_fps=action_dequeue_fps,
+        )
 
 
 # -----------------------------------------------------------------------------

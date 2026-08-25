@@ -1,0 +1,50 @@
+# ============================================================
+# H200 服务端：Pi0.5 batch=2 ACP-CFG + RTC
+# ============================================================
+python -m lerobot.async_inference.policy_server \
+    --host=0.0.0.0 \
+    --port=8099 \
+    --acp_inference.enable=true \
+    --acp_inference.use_cfg=true \
+    --acp_inference.batched_cfg=true \
+    --acp_inference.cfg_beta=1.5 \
+    --acp_inference.rtc.enabled=true \
+    --acp_inference.rtc.inference_delay=13 \
+    --acp_inference.rtc.execution_horizon=35 \
+    --acp_inference.rtc.max_guidance_weight=10.0 \
+    --acp_inference.rtc.prefix_attention_schedule=LINEAR \
+    --acp_inference.rtc.trace_enabled=true \
+    --acp_inference.rtc.trace_output_dir=logs/rtc_trace \
+    --acp_inference.profile=true \
+    --acp_inference.profile_output_dir=outputs/acp_inference_profile
+
+
+# ============================================================
+# 机器人客户端：30 Hz 发送指令，15 Hz 消耗模型动作，两点线性插值
+# ============================================================
+python -m lerobot.async_inference.robot_client \
+    --robot.type=bi_so_follower \
+    --robot.left_arm_config.port=/dev/ttyACM0 \
+    --robot.right_arm_config.port=/dev/ttyACM1 \
+    --robot.id=bimanual_follower \
+    --robot.left_arm_config.cameras="{fixed: {type: intelrealsense, serial_number_or_name: '260322276426', width: 640, height: 480, fps: 30}, wrist: {type: opencv, index_or_path: /dev/video2, width: 640, height: 480, fps: 30, fourcc: MJPG}}" \
+    --robot.right_arm_config.cameras="{wrist: {type: opencv, index_or_path: /dev/video0, width: 640, height: 480, fps: 30, fourcc: MJPG}}" \
+    --server_address=10.61.5.8:8099 \
+    --policy_type=pi05 \
+    --pretrained_name_or_path=/nfs/lerobot/s101/models/evo/so101/policy/banknote_binding_iteration_1_pi05/checkpoints/last/pretrained_model \
+    --policy_device=cuda:0 \
+    --client_device=cpu \
+    --actions_per_chunk=50 \
+    --task="Pick up the banknotes from the desktop, straighten them out, and then place them into the banknote binding machine." \
+    --chunk_size_threshold=0.7 \
+    --fps=30 \
+    --action_dequeue_fps=15 \
+    --rtc_enable=true \
+    --obs_queue_timeout_s=30 \
+    --rtc_inference_delay=13 \
+    --rtc_execution_horizon=35 \
+    --rtc_max_guidance_weight=10.0 \
+    --rtc_prefix_attention_schedule=LINEAR \
+    --rtc_cfg_beta=1.5 \
+    --rtc_trace_enabled=true \
+    --rtc_trace_output_dir=logs/rtc_trace

@@ -146,12 +146,13 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
 
     @property
     def rtc_enabled(self) -> bool:
-        return self.batched_cfg_enabled and self.config.acp_inference.rtc.enabled
+        acp = self.config.acp_inference
+        return acp.enable and acp.rtc.enabled
 
     @property
     def return_remote_action_chunk(self) -> bool:
         return (
-            self.batched_cfg_enabled
+            (self.batched_cfg_enabled or self.rtc_enabled)
             and self._client_protocol_version >= 2
             and self._client_return_raw_actions
         )
@@ -189,8 +190,12 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
             "rtc_execution_horizon": rtc.execution_horizon,
             "rtc_max_guidance_weight": rtc.max_guidance_weight,
             "rtc_prefix_attention_schedule": rtc.prefix_attention_schedule,
-            "rtc_cfg_beta": self.config.acp_inference.cfg_beta,
         }
+        # beta is part of the contract only when U/C CFG blending is active.
+        # The CFG-off path runs one positive-conditioned branch, so beta has no
+        # effect and must not prevent an otherwise valid RTC session.
+        if self.batched_cfg_enabled:
+            expected["rtc_cfg_beta"] = self.config.acp_inference.cfg_beta
         mismatches = []
         for field_name, expected_value in expected.items():
             actual_value = getattr(policy_specs, field_name, None)
@@ -219,14 +224,14 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
             return
 
         if self.policy_type != "pi05":
-            raise ValueError("Server-side RTC-CFG inference is supported only for Pi0.5.")
+            raise ValueError("Server-side RTC inference is supported only for Pi0.5.")
         if not (
             self._client_protocol_version >= 2
             and self._client_return_raw_actions
             and self._client_rtc_enabled
         ):
             raise ValueError(
-                "RTC-CFG requires a protocol-v2 client with `return_raw_actions=true` and `rtc_enabled=true`."
+                "RTC requires a protocol-v2 client with `return_raw_actions=true` and `rtc_enabled=true`."
             )
         if not hasattr(self.policy, "init_rtc_processor"):
             raise TypeError("The loaded Pi0.5 policy does not expose `init_rtc_processor()`.")
@@ -387,8 +392,8 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
                 f"Policy type {policy_specs.policy_type} not supported. "
                 f"Supported policies: {SUPPORTED_POLICIES}"
             )
-        if self.batched_cfg_enabled and policy_specs.policy_type != "pi05":
-            raise ValueError("Server-side batched ACP-CFG inference is supported only for Pi0.5.")
+        if (self.batched_cfg_enabled or self.rtc_enabled) and policy_specs.policy_type != "pi05":
+            raise ValueError("Server-side ACP-CFG/RTC inference is supported only for Pi0.5.")
 
         # getattr preserves compatibility with RemotePolicyConfig objects
         # pickled by version-1 clients before these capability fields existed.
@@ -843,6 +848,28 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         batched_observation["task"] = [task, build_acp_tagged_task(task, is_positive=True)]
         return self.preprocessor(batched_observation)
 
+    def _prepare_single_cond_rtc_observation(self, observation: Observation) -> dict[str, Any]:
+        """Build and preprocess one ACP positive-conditioned observation."""
+        if self.preprocessor is None:
+            raise RuntimeError("Policy preprocessor is not initialized.")
+
+        task_value = observation.get("task", "")
+        if task_value is None:
+            task = ""
+        elif isinstance(task_value, str):
+            task = task_value
+        elif isinstance(task_value, list) and len(task_value) == 1 and isinstance(task_value[0], str):
+            task = task_value[0]
+        else:
+            raise ValueError(
+                "Single-branch RTC expects one task string before preprocessing, "
+                f"got {type(task_value).__name__}."
+            )
+
+        conditioned_observation = dict(observation)
+        conditioned_observation["task"] = build_acp_tagged_task(task, is_positive=True)
+        return self.preprocessor(conditioned_observation)
+
     def _prepare_rtc_inputs(
         self,
         metadata: RTCInferenceMetadata | None,
@@ -850,8 +877,11 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         chunk_size: int,
         max_action_dim: int,
         device: torch.device,
+        batch_size: int = 2,
     ) -> tuple[torch.Tensor | None, int, int]:
-        """Canonicalize one raw leftover and share it across the U/C rows."""
+        """Canonicalize one raw leftover and copy it across model rows."""
+        if batch_size <= 0:
+            raise ValueError("RTC batch_size must be positive.")
         rtc = self.config.acp_inference.rtc
         requested_delay = (
             metadata.inference_delay
@@ -908,7 +938,7 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         if leftover_length == 0:
             return None, min(requested_delay, chunk_size), min(requested_horizon, chunk_size)
 
-        shared_leftover = leftover.unsqueeze(0).repeat(2, 1, 1)
+        shared_leftover = leftover.unsqueeze(0).repeat(batch_size, 1, 1)
         effective_horizon = min(requested_horizon, leftover_length, chunk_size)
         effective_delay = min(requested_delay, effective_horizon)
         return shared_leftover, effective_delay, effective_horizon
@@ -1001,19 +1031,92 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         }
         return raw_cfg, artifacts, cuda_latency_ms
 
+    def _get_single_cond_rtc_action_chunk(
+        self,
+        observation: dict[str, Any],
+        rtc_metadata: RTCInferenceMetadata | None,
+    ) -> tuple[torch.Tensor, dict[str, Any], float | None]:
+        """Run one Pi0.5 positive-conditioned batch=1 call with RTC."""
+        if self.policy is None or self.actions_per_chunk is None or self.device is None:
+            raise RuntimeError("PolicyServer must receive policy instructions before inference.")
+        if not self.rtc_enabled:
+            raise RuntimeError("Single-branch RTC inference requires RTC to be enabled.")
+
+        chunk_size = int(self.policy.config.chunk_size)
+        max_action_dim = int(self.policy.config.max_action_dim)
+        device = torch.device(self.device)
+        noise = torch.normal(
+            mean=0.0,
+            std=1.0,
+            size=(1, chunk_size, max_action_dim),
+            dtype=torch.float32,
+            device=device,
+        )
+        rtc_leftover, rtc_delay, rtc_horizon = self._prepare_rtc_inputs(
+            rtc_metadata,
+            chunk_size=chunk_size,
+            max_action_dim=max_action_dim,
+            device=device,
+            batch_size=1,
+        )
+
+        cuda_start = cuda_end = None
+        if self._cuda_timing_enabled(device):
+            cuda_start = torch.cuda.Event(enable_timing=True)
+            cuda_end = torch.cuda.Event(enable_timing=True)
+            cuda_start.record(torch.cuda.current_stream(device))
+
+        raw_cond = self.policy.predict_action_chunk(
+            observation,
+            noise=noise,
+            prev_chunk_left_over=rtc_leftover,
+            inference_delay=rtc_delay,
+            execution_horizon=rtc_horizon,
+        )
+
+        if cuda_end is not None:
+            cuda_end.record(torch.cuda.current_stream(device))
+        cuda_latency_ms = None
+        if raw_cond.ndim != 3 or raw_cond.shape[0] != 1:
+            raise ValueError(
+                "Single-branch RTC requires Pi0.5 to return [1, T, A], "
+                f"got {tuple(raw_cond.shape)}."
+            )
+        if not bool(torch.isfinite(raw_cond).all()):
+            raise FloatingPointError("Single-branch RTC produced a non-finite raw action chunk.")
+        if cuda_end is not None:
+            cuda_latency_ms = cuda_start.elapsed_time(cuda_end)
+
+        execution_steps = min(int(self.actions_per_chunk), int(raw_cond.shape[1]))
+        if execution_steps <= 0:
+            raise ValueError("`actions_per_chunk` must select at least one Pi0.5 action.")
+        raw_cond = raw_cond[:, :execution_steps]
+        artifacts = {
+            "noise": noise,
+            "cond_raw": raw_cond,
+            # Keep the transport/profile-neutral output key used by the
+            # existing response path. In CFG-off mode this is C_raw itself.
+            "cfg_raw": raw_cond,
+            "rtc_leftover": rtc_leftover,
+            "rtc_inference_delay": rtc_delay,
+            "rtc_execution_horizon": rtc_horizon,
+        }
+        return raw_cond, artifacts, cuda_latency_ms
+
     def _postprocess_action_chunk(self, action_tensor: torch.Tensor) -> torch.Tensor:
         """Postprocess a chunk while preserving the legacy path for non-CFG policies."""
         if self.postprocessor is None:
             raise RuntimeError("Policy postprocessor is not initialized.")
 
-        if self.batched_cfg_enabled:
+        if self.batched_cfg_enabled or self.rtc_enabled:
             processed = self.postprocessor(action_tensor)
             if processed.ndim != 3 or processed.shape[0] != 1:
                 raise ValueError(
-                    f"Batched ACP-CFG postprocessing must preserve [1, T, A], got {tuple(processed.shape)}."
+                    "RTC/CFG chunk postprocessing must preserve [1, T, A], "
+                    f"got {tuple(processed.shape)}."
                 )
             if not bool(torch.isfinite(processed).all()):
-                raise FloatingPointError("Batched ACP-CFG produced a non-finite processed action chunk.")
+                raise FloatingPointError("RTC/CFG produced a non-finite processed action chunk.")
             return processed
 
         # Preserve the original server behavior for every policy when ACP-CFG
@@ -1140,6 +1243,8 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         start_preprocess = time.perf_counter()
         if self.batched_cfg_enabled:
             observation = self._prepare_batched_cfg_observation(observation)
+        elif self.rtc_enabled:
+            observation = self._prepare_single_cond_rtc_observation(observation)
         else:
             observation = self.preprocessor(observation)
         self.last_processed_obs: TimedObservation = observation_t
@@ -1156,6 +1261,16 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
             if self.rtc_enabled and (rtc_metadata is None or not rtc_metadata.request_id):
                 raise ValueError("RTC-CFG observations require non-empty request metadata and request_id.")
             action_tensor, acp_artifacts, cuda_latency_ms = self._get_batched_cfg_action_chunk(
+                observation,
+                rtc_metadata=rtc_metadata,
+            )
+        elif self.rtc_enabled:
+            rtc_metadata = getattr(observation_t, "rtc_metadata", None)
+            if rtc_metadata is not None and not isinstance(rtc_metadata, RTCInferenceMetadata):
+                raise TypeError("TimedObservation.rtc_metadata must be RTCInferenceMetadata or None.")
+            if rtc_metadata is None or not rtc_metadata.request_id:
+                raise ValueError("RTC observations require non-empty request metadata and request_id.")
+            action_tensor, acp_artifacts, cuda_latency_ms = self._get_single_cond_rtc_action_chunk(
                 observation,
                 rtc_metadata=rtc_metadata,
             )
@@ -1261,7 +1376,7 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
 
         if self.return_remote_action_chunk:
             if acp_artifacts is None:
-                raise RuntimeError("Raw ACP-CFG actions are unavailable for a protocol-v2 response.")
+                raise RuntimeError("Raw RTC/CFG actions are unavailable for a protocol-v2 response.")
             rtc_metadata = getattr(observation_t, "rtc_metadata", None)
             request_id = (
                 rtc_metadata.request_id
