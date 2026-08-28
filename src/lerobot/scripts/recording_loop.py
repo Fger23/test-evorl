@@ -44,7 +44,7 @@ from lerobot.scripts.recording_hil import (
     _capture_policy_runtime_state,
     _predict_policy_action_with_acp_inference,
 )
-from lerobot.scripts.recording_remote_policy_main import RemotePolicyActionClient
+from lerobot.scripts.recording_remote_policy import RemotePolicyActionClient
 from lerobot.teleoperators import Teleoperator, koch_leader, omx_leader, so_leader
 from lerobot.teleoperators.keyboard.teleop_keyboard import KeyboardTeleop
 from lerobot.utils.constants import ACTION, OBS_STR
@@ -419,6 +419,12 @@ def record_loop(
                 "robot.send_action",
                 lambda robot_action_to_send=robot_action_to_send: robot.send_action(robot_action_to_send),
             )
+
+        # RTC's real inference delay is the number of policy actions that were
+        # successfully sent while a chunk request was running. Confirm only
+        # after send_action returns; a queue pop alone is not robot execution.
+        if remote_policy_client is not None and selected_from_policy:
+            remote_policy_client.mark_action_executed()
 
         # Write to dataset
         if dataset is not None:

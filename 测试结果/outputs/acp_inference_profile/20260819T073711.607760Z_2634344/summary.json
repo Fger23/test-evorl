@@ -1,0 +1,38 @@
+{
+  "run_name": "20260819T073711.607760Z_2634344",
+  "created_at_utc": "2026-08-19T07:37:11.609Z",
+  "updated_at_utc": "2026-08-19T07:37:11.609Z",
+  "count": 0,
+  "fps": 30.0,
+  "cfg_beta": 1.0,
+  "save_chunks": false,
+  "wall_ms": {
+    "p50": null,
+    "p95": null,
+    "p99": null,
+    "max": null
+  },
+  "cuda_ms": {
+    "p50": null,
+    "p95": null,
+    "p99": null,
+    "max": null
+  },
+  "steady_state_count": 0,
+  "steady_state_wall_ms": {
+    "p50": null,
+    "p95": null,
+    "p99": null,
+    "max": null
+  },
+  "steady_state_cuda_ms": {
+    "p50": null,
+    "p95": null,
+    "p99": null,
+    "max": null
+  },
+  "recommendation_source": "unavailable",
+  "D99": null,
+  "recommended_precision_horizon": null,
+  "recommended_smooth_horizon": null
+}

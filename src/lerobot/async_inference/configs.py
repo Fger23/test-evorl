@@ -46,20 +46,20 @@ def get_aggregate_function(name: str) -> Callable[[torch.Tensor, torch.Tensor], 
 
 @dataclass
 class ACPRTCConfig:
-    """Runtime RTC settings for server-side Pi0.5 ACP inference."""
+    """Runtime RTC settings for server-side Pi0.5 ACP-CFG inference."""
 
     enabled: bool = False
-    inference_delay: int = 13
-    execution_horizon: int = 35
+    inference_delay: int = 20
+    execution_horizon: int = 25
     max_guidance_weight: float = 10.0
     prefix_attention_schedule: RTCAttentionSchedule = RTCAttentionSchedule.LINEAR
-    trace_enabled: bool = True
-    trace_output_dir: str = "logs/rtc_trace"
 
     def __post_init__(self) -> None:
         if isinstance(self.prefix_attention_schedule, str):
             try:
-                self.prefix_attention_schedule = RTCAttentionSchedule(self.prefix_attention_schedule.upper())
+                self.prefix_attention_schedule = RTCAttentionSchedule(
+                    self.prefix_attention_schedule.upper()
+                )
             except ValueError as exc:
                 choices = ", ".join(schedule.value for schedule in RTCAttentionSchedule)
                 raise ValueError(
@@ -83,8 +83,6 @@ class ACPRTCConfig:
             )
         if not math.isfinite(self.max_guidance_weight) or self.max_guidance_weight <= 0:
             raise ValueError("`acp_inference.rtc.max_guidance_weight` must be finite and > 0.")
-        if self.trace_enabled and not self.trace_output_dir.strip():
-            raise ValueError("`acp_inference.rtc.trace_output_dir` must be non-empty.")
 
 
 @dataclass
@@ -115,8 +113,11 @@ class ACPInferenceConfig:
             raise ValueError("`acp_inference.batched_cfg=true` requires `acp_inference.use_cfg=true`.")
         if self.profile and not self.batched_cfg:
             raise ValueError("`acp_inference.profile=true` requires `acp_inference.batched_cfg=true`.")
-        if self.rtc.enabled and not self.enable:
-            raise ValueError("`acp_inference.rtc.enabled=true` requires `acp_inference.enable=true`.")
+        if self.rtc.enabled and not (self.enable and self.use_cfg and self.batched_cfg):
+            raise ValueError(
+                "`acp_inference.rtc.enabled=true` requires ACP `enable=true`, "
+                "`use_cfg=true`, and `batched_cfg=true`."
+            )
         if not math.isfinite(self.cfg_beta) or self.cfg_beta < 0:
             raise ValueError("`acp_inference.cfg_beta` must be finite and >= 0.")
         if self.profile and not self.profile_output_dir.strip():
@@ -151,8 +152,8 @@ class PolicyServerConfig:
         default=DEFAULT_OBS_QUEUE_TIMEOUT, metadata={"help": "Timeout for observation queue in seconds"}
     )
 
-    # Optional Pi0.5 ACP inference. CFG uses one batch=2 U/C forward; RTC can
-    # also run without CFG as one positive-conditioned batch=1 forward.
+    # Optional Pi0.5 batch=2 ACP-CFG inference. This is configured on the H200
+    # policy server; the robot client continues to receive one action chunk.
     acp_inference: ACPInferenceConfig = field(default_factory=ACPInferenceConfig)
 
     def __post_init__(self):
@@ -169,15 +170,13 @@ class PolicyServerConfig:
         if self.obs_queue_timeout < 0:
             raise ValueError(f"obs_queue_timeout must be non-negative, got {self.obs_queue_timeout}")
 
-        if (
-            self.acp_inference.enable
-            and self.acp_inference.use_cfg
-            and not self.acp_inference.batched_cfg
+        if self.acp_inference.enable and not (
+            self.acp_inference.use_cfg and self.acp_inference.batched_cfg
         ):
-            raise ValueError("PolicyServer CFG requires `use_cfg=true` and `batched_cfg=true`.")
-        # ``enable=true`` alone is a capability gate for new robot_client
-        # sessions. The effective CFG/RTC mode can be negotiated later in the
-        # policy setup handshake.
+            raise ValueError(
+                "PolicyServer ACP inference currently requires "
+                "`enable=true`, `use_cfg=true`, and `batched_cfg=true`."
+            )
 
     @classmethod
     def from_dict(cls, config_dict: dict) -> "PolicyServerConfig":
@@ -217,9 +216,9 @@ class PolicyServerConfig:
                     "inference_delay": self.acp_inference.rtc.inference_delay,
                     "execution_horizon": self.acp_inference.rtc.execution_horizon,
                     "max_guidance_weight": self.acp_inference.rtc.max_guidance_weight,
-                    "prefix_attention_schedule": (self.acp_inference.rtc.prefix_attention_schedule.value),
-                    "trace_enabled": self.acp_inference.rtc.trace_enabled,
-                    "trace_output_dir": self.acp_inference.rtc.trace_output_dir,
+                    "prefix_attention_schedule": (
+                        self.acp_inference.rtc.prefix_attention_schedule.value
+                    ),
                 },
                 "profile": self.acp_inference.profile,
                 "profile_output_dir": self.acp_inference.profile_output_dir,
@@ -265,57 +264,13 @@ class RobotClientConfig:
     )
 
     # Control behavior configuration
-    chunk_size_threshold: float = field(default=0.7, metadata={"help": "Threshold for chunk size control"})
+    chunk_size_threshold: float = field(default=0.5, metadata={"help": "Threshold for chunk size control"})
     fps: int = field(default=DEFAULT_FPS, metadata={"help": "Frames per second"})
-    action_dequeue_fps: float = field(
-        default=15.0,
-        metadata={
-            "help": (
-                "Rate at which RTC model actions are completed; robot commands are linearly "
-                "interpolated and sent at --fps"
-            )
-        },
-    )
 
     # Aggregate function configuration (CLI-compatible)
     aggregate_fn_name: str = field(
         default="weighted_average",
         metadata={"help": f"Name of aggregate function to use. Options: {list(AGGREGATE_FUNCTIONS.keys())}"},
-    )
-
-    # ``python -m lerobot.async_inference.robot_client`` is the dedicated RTC
-    # robot entrypoint. ``rtc_enable=false`` keeps the historical
-    # protocol-v1 client available for tests and backwards compatibility.
-    rtc_enable: bool = field(default=True, metadata={"help": "Enable protocol-v2 RTC inference"})
-    use_cfg: bool = field(
-        default=True,
-        metadata={"help": "Run batch=2 ACP-CFG; false runs positive-conditioned batch=1 RTC"},
-    )
-    obs_queue_timeout_s: float = field(
-        default=30.0,
-        metadata={"help": "Maximum seconds to wait for a remote RTC action chunk"},
-    )
-    rtc_inference_delay: int = field(
-        default=13,
-        metadata={"help": "Estimated inference delay in executed action steps"},
-    )
-    rtc_execution_horizon: int = field(
-        default=35,
-        metadata={"help": "RTC prefix execution horizon in action steps"},
-    )
-    rtc_max_guidance_weight: float = field(
-        default=10.0,
-        metadata={"help": "Maximum RTC prefix-attention guidance weight"},
-    )
-    rtc_prefix_attention_schedule: RTCAttentionSchedule = field(
-        default=RTCAttentionSchedule.LINEAR,
-        metadata={"help": "RTC prefix-attention schedule (ZEROS, ONES, LINEAR or EXP)"},
-    )
-    rtc_cfg_beta: float = field(default=1.5, metadata={"help": "ACP-CFG guidance coefficient"})
-    rtc_trace_enabled: bool = field(default=True, metadata={"help": "Write RTC diagnostic JSONL"})
-    rtc_trace_output_dir: str = field(
-        default="logs/rtc_trace",
-        metadata={"help": "Directory for RTC diagnostic JSONL"},
     )
 
     # Debug configuration
@@ -340,15 +295,6 @@ class RobotClientConfig:
 
     def __post_init__(self):
         """Validate configuration after initialization."""
-        if isinstance(self.rtc_prefix_attention_schedule, str):
-            try:
-                self.rtc_prefix_attention_schedule = RTCAttentionSchedule(
-                    self.rtc_prefix_attention_schedule.upper()
-                )
-            except ValueError as exc:
-                choices = ", ".join(schedule.value for schedule in RTCAttentionSchedule)
-                raise ValueError(f"rtc_prefix_attention_schedule must be one of: {choices}") from exc
-
         if not self.server_address:
             raise ValueError("server_address cannot be empty")
 
@@ -370,54 +316,8 @@ class RobotClientConfig:
         if self.fps <= 0:
             raise ValueError(f"fps must be positive, got {self.fps}")
 
-        if (
-            isinstance(self.action_dequeue_fps, bool)
-            or not isinstance(self.action_dequeue_fps, int | float)
-            or not math.isfinite(float(self.action_dequeue_fps))
-            or self.action_dequeue_fps <= 0
-        ):
-            raise ValueError("action_dequeue_fps must be a finite number greater than zero")
         if self.actions_per_chunk <= 0:
             raise ValueError(f"actions_per_chunk must be positive, got {self.actions_per_chunk}")
-
-        if self.obs_queue_timeout_s < 0:
-            raise ValueError("obs_queue_timeout_s must be non-negative")
-
-        if self.rtc_enable:
-            if not isinstance(self.use_cfg, bool):
-                raise ValueError("use_cfg must be true or false")
-            interpolation_ratio = self.fps / self.action_dequeue_fps
-            if interpolation_ratio < 1 or not math.isclose(
-                interpolation_ratio, round(interpolation_ratio), rel_tol=0.0, abs_tol=1e-9
-            ):
-                raise ValueError(
-                    "fps must be an integer multiple of action_dequeue_fps so interpolation "
-                    "has a fixed number of robot commands per model action"
-                )
-            if self.policy_type != "pi05":
-                raise ValueError("RTC robot_client currently supports only policy_type=pi05")
-            if self.obs_queue_timeout_s == 0:
-                raise ValueError("RTC requires obs_queue_timeout_s to be positive")
-            if (
-                not isinstance(self.rtc_inference_delay, int)
-                or isinstance(self.rtc_inference_delay, bool)
-                or self.rtc_inference_delay < 0
-            ):
-                raise ValueError("rtc_inference_delay must be a non-negative integer")
-            if (
-                not isinstance(self.rtc_execution_horizon, int)
-                or isinstance(self.rtc_execution_horizon, bool)
-                or self.rtc_execution_horizon <= self.rtc_inference_delay
-            ):
-                raise ValueError("rtc_execution_horizon must be an integer larger than rtc_inference_delay")
-            if self.rtc_execution_horizon > self.actions_per_chunk:
-                raise ValueError("rtc_execution_horizon cannot exceed actions_per_chunk")
-            if not math.isfinite(self.rtc_max_guidance_weight) or self.rtc_max_guidance_weight <= 0:
-                raise ValueError("rtc_max_guidance_weight must be finite and positive")
-            if not math.isfinite(self.rtc_cfg_beta) or self.rtc_cfg_beta < 0:
-                raise ValueError("rtc_cfg_beta must be finite and non-negative")
-            if self.rtc_trace_enabled and not self.rtc_trace_output_dir.strip():
-                raise ValueError("rtc_trace_output_dir must be non-empty when tracing is enabled")
 
         self.aggregate_fn = get_aggregate_function(self.aggregate_fn_name)
 
@@ -436,19 +336,8 @@ class RobotClientConfig:
             "client_device": self.client_device,
             "chunk_size_threshold": self.chunk_size_threshold,
             "fps": self.fps,
-            "action_dequeue_fps": self.action_dequeue_fps,
             "actions_per_chunk": self.actions_per_chunk,
             "task": self.task,
             "debug_visualize_queue_size": self.debug_visualize_queue_size,
             "aggregate_fn_name": self.aggregate_fn_name,
-            "rtc_enable": self.rtc_enable,
-            "use_cfg": self.use_cfg,
-            "obs_queue_timeout_s": self.obs_queue_timeout_s,
-            "rtc_inference_delay": self.rtc_inference_delay,
-            "rtc_execution_horizon": self.rtc_execution_horizon,
-            "rtc_max_guidance_weight": self.rtc_max_guidance_weight,
-            "rtc_prefix_attention_schedule": self.rtc_prefix_attention_schedule.value,
-            "rtc_cfg_beta": self.rtc_cfg_beta,
-            "rtc_trace_enabled": self.rtc_trace_enabled,
-            "rtc_trace_output_dir": self.rtc_trace_output_dir,
         }

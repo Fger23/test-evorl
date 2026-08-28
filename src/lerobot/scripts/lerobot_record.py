@@ -108,10 +108,7 @@ from lerobot.scripts.recording_hil import (
     _predict_policy_action_with_acp_inference,  # noqa: F401
 )
 from lerobot.scripts.recording_loop import record_loop
-from lerobot.scripts.recording_remote_policy_main import (
-    RemotePolicyActionClient,
-    RemotePolicyRecordConfig,
-)
+from lerobot.scripts.recording_remote_policy import RemotePolicyActionClient, RemotePolicyRecordConfig
 from lerobot.teleoperators import (  # noqa: F401
     TeleoperatorConfig,
     bi_openarm_leader,
@@ -130,6 +127,7 @@ from lerobot.teleoperators import (  # noqa: F401
 from lerobot.utils.constants import ACTION
 from lerobot.utils.control_utils import (
     init_keyboard_listener,
+    is_headless,
     sanity_check_bimanual_piper_pair,
     sanity_check_dataset_name,
     sanity_check_dataset_robot_compatibility,

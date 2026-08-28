@@ -43,7 +43,7 @@ pytest.importorskip("grpc")
 # -----------------------------------------------------------------------------
 
 
-def test_async_inference_e2e(monkeypatch, tmp_path):
+def test_async_inference_e2e(monkeypatch):
     """Tests the full asynchronous inference pipeline."""
     # Import grpc-dependent modules inside the test function
     import grpc
@@ -139,7 +139,6 @@ def test_async_inference_e2e(monkeypatch, tmp_path):
         policy_type="test",
         pretrained_name_or_path="test",
         actions_per_chunk=20,
-        rtc_enable=False,
     )
 
     client = RobotClient(client_config)
