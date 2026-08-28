@@ -16,15 +16,18 @@
 
 from __future__ import annotations
 
+import pickle  # nosec
 import threading
 import time
 from queue import Queue
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 import torch
 
 from lerobot.async_inference.helpers import RemoteActionChunk, TimedAction
+from lerobot.configs.types import RTCAttentionSchedule
 from lerobot.policies.rtc.action_queue import ActionQueue
 from lerobot.policies.rtc.configuration_rtc import RTCConfig
 from lerobot.scripts.recording_remote_policy import RemotePolicyActionClient, RemotePolicyRecordConfig
@@ -41,6 +44,7 @@ def rtc_client() -> RemotePolicyActionClient:
         actions_per_chunk=6,
         chunk_size_threshold=1.0,
         obs_queue_timeout_s=0.1,
+        use_cfg=False,
         rtc_enable=True,
         rtc_inference_delay=1,
         rtc_execution_horizon=3,
@@ -96,9 +100,13 @@ def _make_response(
         actions=actions,
         raw_actions=raw.clone(),
         observation_timestep=0,
+        use_cfg=False,
+        cfg_beta=None,
         rtc_enabled=True,
         inference_delay=1,
         execution_horizon=3,
+        max_guidance_weight=10.0,
+        prefix_attention_schedule=RTCAttentionSchedule.LINEAR,
     )
 
 
@@ -107,6 +115,55 @@ def _take_submitted_request(client: RemotePolicyActionClient):
     client._request_queue.task_done()
     assert request is not None
     return request
+
+
+def test_recording_client_cfg_off_negotiates_v2_con_only_rtc(monkeypatch):
+    """The lerobot_record remote client must explicitly request CFG-off RTC."""
+    from lerobot.async_inference import helpers
+    from lerobot.scripts import recording_remote_policy as remote_policy_module
+
+    cfg = RemotePolicyRecordConfig(
+        enable=True,
+        server_address="unused:9999",
+        policy_type="pi05",
+        pretrained_name_or_path="dummy/pi05",
+        actions_per_chunk=50,
+        use_cfg=False,
+        rtc_enable=True,
+        rtc_inference_delay=21,
+        rtc_execution_horizon=35,
+        rtc_cfg_beta=1.5,
+    )
+    client = RemotePolicyActionClient.__new__(RemotePolicyActionClient)
+    client.cfg = cfg
+    client.robot = SimpleNamespace()
+    client.environment_dt = 1 / 30
+    client.stub = MagicMock()
+    client.services_pb2 = SimpleNamespace(
+        Empty=lambda: SimpleNamespace(),
+        PolicySetup=lambda *, data: SimpleNamespace(data=data),
+    )
+    client._started = False
+    fake_thread = MagicMock()
+
+    monkeypatch.setattr(helpers, "map_robot_keys_to_lerobot_features", lambda _robot: {})
+    monkeypatch.setattr(
+        remote_policy_module,
+        "threading",
+        SimpleNamespace(Thread=lambda **_kwargs: fake_thread),
+    )
+
+    client.start()
+
+    setup = client.stub.SendPolicyInstructions.call_args.args[0]
+    policy_config = pickle.loads(setup.data)  # nosec
+    assert policy_config.protocol_version == 2
+    assert policy_config.return_raw_actions is True
+    assert policy_config.use_cfg is False
+    assert policy_config.rtc_enabled is True
+    assert policy_config.rtc_inference_delay == 21
+    assert policy_config.rtc_execution_horizon == 35
+    fake_thread.start.assert_called_once_with()
 
 
 def test_submit_uses_one_in_flight_request_and_raw_snapshot(rtc_client):
@@ -296,4 +353,23 @@ def test_pending_result_rejects_misaligned_processed_action_dimension(rtc_client
         rtc_client._pending_result = (request, response)
 
     with pytest.raises(ValueError, match="not aligned"):
+        rtc_client._apply_pending_result()
+
+
+def test_pending_result_rejects_server_that_ignores_cfg_off_contract(rtc_client):
+    """A client asking for C-only RTC must never silently accept CFG output."""
+    _seed_queue(rtc_client)
+    assert rtc_client._submit_if_needed(observation={}, task=None, timestep=0)
+    request = _take_submitted_request(rtc_client)
+    raw = torch.zeros(6, 2)
+    processed = torch.ones(6, 2)
+    response = _make_response(request.request_id, raw, processed)
+    response.use_cfg = True
+    response.cfg_beta = 1.5
+
+    with rtc_client._state_lock:
+        rtc_client._in_flight_request_id = None
+        rtc_client._pending_result = (request, response)
+
+    with pytest.raises(RuntimeError, match="did not honor.*use_cfg"):
         rtc_client._apply_pending_result()

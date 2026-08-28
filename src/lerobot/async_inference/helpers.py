@@ -253,9 +253,13 @@ class RemoteActionChunk:
     actions: list[TimedAction]
     raw_actions: torch.Tensor
     observation_timestep: int
+    use_cfg: bool | None = None
+    cfg_beta: float | None = None
     rtc_enabled: bool = False
     inference_delay: int | None = None
     execution_horizon: int | None = None
+    max_guidance_weight: float | None = None
+    prefix_attention_schedule: RTCAttentionSchedule | None = None
 
     def __post_init__(self) -> None:
         if self.raw_actions.ndim != 2:
@@ -309,6 +313,10 @@ class RemotePolicyConfig:
     # explicitly negotiate an aligned raw/processed RemoteActionChunk envelope.
     protocol_version: int = 1
     return_raw_actions: bool = False
+    # None preserves legacy server-owned mode selection. New RTC clients send
+    # an explicit bool so one server command supports CFG on and CFG off.
+    use_cfg: bool | None = None
+    action_fps: float | None = None
     rtc_enabled: bool = False
     rtc_inference_delay: int | None = None
     rtc_execution_horizon: int | None = None

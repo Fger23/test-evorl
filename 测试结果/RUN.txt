@@ -1,36 +1,38 @@
 # ============================================================
-# 671abf3 完整覆盖版启动命令
+# RTC / CFG 启动命令
 #
-# 注意：
-# 1. 先启动 H200 服务端，看到服务开始监听后，再启动机器人客户端。
-# 2. 这个版本不是“客户端主导参数”版；两端的 d/H/weight/schedule/beta 必须完全一致。
-# 3. 这个版本的 RTC 客户端入口是 lerobot_record，不是 async_inference.robot_client。
-# 4. 启动前请确认左腕相机当前确实是 /dev/video2；/dev/videoN 可能在重启后变化。
+# 使用顺序：
+# 1. 先在 H200 上启动“服务器”。
+# 2. 再在机器人电脑上，从下面四种客户端模式中选择一种启动。
+# 3. 同一时间只启动一个客户端，避免两个进程同时占用机械臂串口和相机。
+# 4. 启动前确认 /dev/ttyACM*、/dev/video* 与实际设备一致。
+#
+# 固定参数：
+# - 机器人控制频率：30 Hz
+# - RTC：inference_delay=21，execution_horizon=35
+# - RTC guidance weight=10.0，schedule=LINEAR
+# - beta：所有客户端命令均显式填写为 1.5
+# - CFG=false 时 beta 不参与计算；保留参数只是为了让命令配置完整、统一。
 # ============================================================
 
 
 # ============================================================
-# 一、H200 服务端
+# 一、H200 服务器
+#
+# 服务器只开启 ACP/RTC 能力；推理模式和 RTC 参数由客户端提供。
 # ============================================================
 python -m lerobot.async_inference.policy_server \
     --host=0.0.0.0 \
     --port=8090 \
-    --fps=30 \
-    --obs_queue_timeout=30 \
-    --acp_inference.enable=true \
-    --acp_inference.use_cfg=true \
-    --acp_inference.batched_cfg=true \
-    --acp_inference.cfg_beta=1.5 \
-    --acp_inference.rtc.enabled=true \
-    --acp_inference.rtc.inference_delay=21 \
-    --acp_inference.rtc.execution_horizon=35 \
-    --acp_inference.rtc.max_guidance_weight=10.0 \
-    --acp_inference.rtc.prefix_attention_schedule=LINEAR \
-    --acp_inference.profile=false
+    --acp_inference.enable=true
 
 
 # ============================================================
-# 二、机器人客户端（30 Hz，RTC-CFG batch=2）
+# 二、Record 模式：CFG 关闭，C-only RTC
+#
+# 推理：batch=1，只计算 task + Advantage: positive。
+# 队列：保存 C_raw / C_processed，下一次 leftover 来自 C_raw。
+# beta=1.5 显式填写，但 CFG=false 时不会参与计算。
 # ============================================================
 python -m lerobot.scripts.lerobot_record \
     --robot.type=bi_so_follower \
@@ -44,23 +46,107 @@ python -m lerobot.scripts.lerobot_record \
     --remote_policy.policy_type=pi05 \
     --remote_policy.pretrained_name_or_path=/nfs/lerobot/s101/models/evo/so101/policy/banknote_binding_iteration_1_pi05/checkpoints/last/pretrained_model \
     --remote_policy.policy_device=cuda:0 \
-    --remote_policy.client_device=cpu \
     --remote_policy.actions_per_chunk=50 \
     --remote_policy.obs_queue_timeout_s=30 \
     --remote_policy.chunk_size_threshold=0.7 \
-    --remote_policy.aggregate_fn_name=latest_only \
     --remote_policy.rtc_enable=true \
+    --remote_policy.use_cfg=false \
     --remote_policy.rtc_inference_delay=21 \
     --remote_policy.rtc_execution_horizon=35 \
-    --remote_policy.rtc_max_guidance_weight=10.0 \
-    --remote_policy.rtc_prefix_attention_schedule=LINEAR \
     --remote_policy.rtc_cfg_beta=1.5 \
-    --display_data=false \
     --dataset.repo_id=local/tmp \
     --dataset.single_task="Pick up the banknotes from the desktop, straighten them out, and then place them into the banknote binding machine." \
-    --dataset.fps=30 \
     --dataset.video=false \
     --dataset.push_to_hub=false \
     --dataset.num_episodes=10 \
     --dataset.episode_time_s=3600 \
     --dataset.reset_time_s=15
+
+
+# ============================================================
+# 三、Record 模式：CFG 开启，batch=2，beta=1.5
+#
+# 推理：同一次 batch=2 计算 U/C，RTC 分别修正两行，随后：
+# A_raw = U_raw + 1.5 * (C_raw - U_raw)
+# ============================================================
+python -m lerobot.scripts.lerobot_record \
+    --robot.type=bi_so_follower \
+    --robot.left_arm_config.port=/dev/ttyACM0 \
+    --robot.right_arm_config.port=/dev/ttyACM1 \
+    --robot.id=bimanual_follower \
+    --robot.left_arm_config.cameras="{fixed: {type: intelrealsense, serial_number_or_name: '260322276426', width: 640, height: 480, fps: 30}, wrist: {type: opencv, index_or_path: /dev/video2, width: 640, height: 480, fps: 30, fourcc: MJPG}}" \
+    --robot.right_arm_config.cameras="{wrist: {type: opencv, index_or_path: /dev/video0, width: 640, height: 480, fps: 30, fourcc: MJPG}}" \
+    --remote_policy.enable=true \
+    --remote_policy.server_address=10.61.5.8:8090 \
+    --remote_policy.policy_type=pi05 \
+    --remote_policy.pretrained_name_or_path=/nfs/lerobot/s101/models/evo/so101/policy/banknote_binding_iteration_1_pi05/checkpoints/last/pretrained_model \
+    --remote_policy.policy_device=cuda:0 \
+    --remote_policy.actions_per_chunk=50 \
+    --remote_policy.obs_queue_timeout_s=30 \
+    --remote_policy.chunk_size_threshold=0.7 \
+    --remote_policy.rtc_enable=true \
+    --remote_policy.use_cfg=true \
+    --remote_policy.rtc_inference_delay=21 \
+    --remote_policy.rtc_execution_horizon=35 \
+    --remote_policy.rtc_cfg_beta=1.5 \
+    --dataset.repo_id=local/tmp \
+    --dataset.single_task="Pick up the banknotes from the desktop, straighten them out, and then place them into the banknote binding machine." \
+    --dataset.video=false \
+    --dataset.push_to_hub=false \
+    --dataset.num_episodes=10 \
+    --dataset.episode_time_s=3600 \
+    --dataset.reset_time_s=15
+
+
+# ============================================================
+# 四、普通 robot_client 模式：CFG 关闭，C-only RTC
+#
+# 不创建数据集，只执行远程策略动作。
+# beta=1.5 显式填写，但 CFG=false 时不会参与计算。
+# ============================================================
+python -m lerobot.async_inference.robot_client \
+    --robot.type=bi_so_follower \
+    --robot.left_arm_config.port=/dev/ttyACM0 \
+    --robot.right_arm_config.port=/dev/ttyACM1 \
+    --robot.id=bimanual_follower \
+    --robot.left_arm_config.cameras="{fixed: {type: intelrealsense, serial_number_or_name: '260322276426', width: 640, height: 480, fps: 30}, wrist: {type: opencv, index_or_path: /dev/video2, width: 640, height: 480, fps: 30, fourcc: MJPG}}" \
+    --robot.right_arm_config.cameras="{wrist: {type: opencv, index_or_path: /dev/video0, width: 640, height: 480, fps: 30, fourcc: MJPG}}" \
+    --server_address=10.61.5.8:8090 \
+    --policy_type=pi05 \
+    --pretrained_name_or_path=/nfs/lerobot/s101/models/evo/so101/policy/banknote_binding_iteration_1_pi05/checkpoints/last/pretrained_model \
+    --policy_device=cuda:0 \
+    --actions_per_chunk=50 \
+    --task="Pick up the banknotes from the desktop, straighten them out, and then place them into the banknote binding machine." \
+    --chunk_size_threshold=0.7 \
+    --rtc_enable=true \
+    --use_cfg=false \
+    --rtc_inference_delay=21 \
+    --rtc_execution_horizon=35 \
+    --rtc_cfg_beta=1.5
+
+
+# ============================================================
+# 五、robot_client CFG 模式：batch=2，beta=1.5
+#
+# 不创建数据集，只执行远程策略动作。
+# 推理后使用 A_raw = U_raw + 1.5 * (C_raw - U_raw)。
+# ============================================================
+python -m lerobot.async_inference.robot_client \
+    --robot.type=bi_so_follower \
+    --robot.left_arm_config.port=/dev/ttyACM0 \
+    --robot.right_arm_config.port=/dev/ttyACM1 \
+    --robot.id=bimanual_follower \
+    --robot.left_arm_config.cameras="{fixed: {type: intelrealsense, serial_number_or_name: '260322276426', width: 640, height: 480, fps: 30}, wrist: {type: opencv, index_or_path: /dev/video2, width: 640, height: 480, fps: 30, fourcc: MJPG}}" \
+    --robot.right_arm_config.cameras="{wrist: {type: opencv, index_or_path: /dev/video0, width: 640, height: 480, fps: 30, fourcc: MJPG}}" \
+    --server_address=10.61.5.8:8090 \
+    --policy_type=pi05 \
+    --pretrained_name_or_path=/nfs/lerobot/s101/models/evo/so101/policy/banknote_binding_iteration_1_pi05/checkpoints/last/pretrained_model \
+    --policy_device=cuda:0 \
+    --actions_per_chunk=50 \
+    --task="Pick up the banknotes from the desktop, straighten them out, and then place them into the banknote binding machine." \
+    --chunk_size_threshold=0.7 \
+    --rtc_enable=true \
+    --use_cfg=true \
+    --rtc_inference_delay=21 \
+    --rtc_execution_horizon=35 \
+    --rtc_cfg_beta=1.5

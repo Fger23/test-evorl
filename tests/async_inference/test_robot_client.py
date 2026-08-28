@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import time
 from queue import Queue
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -51,6 +52,7 @@ def robot_client():
         policy_type="test",
         pretrained_name_or_path="test",
         actions_per_chunk=20,
+        rtc_enable=False,
     )
 
     client = RobotClient(test_config)
@@ -87,6 +89,84 @@ def _make_actions(start_ts: float, start_t: int, count: int):
 # -----------------------------------------------------------------------------
 # Tests
 # -----------------------------------------------------------------------------
+
+
+def test_robot_client_rtc_cfg_off_maps_to_recording_client_at_30hz():
+    from lerobot.async_inference.configs import RobotClientConfig
+    from lerobot.async_inference.robot_client import _make_rtc_action_client
+    from lerobot.policies.rtc.action_queue import ActionQueue
+    from tests.mocks.mock_robot import MockRobotConfig
+
+    config = RobotClientConfig(
+        robot=MockRobotConfig(),
+        server_address="localhost:9999",
+        policy_type="pi05",
+        pretrained_name_or_path="test",
+        actions_per_chunk=50,
+        fps=30,
+        rtc_enable=True,
+        use_cfg=False,
+        rtc_inference_delay=21,
+        rtc_execution_horizon=35,
+        rtc_cfg_beta=1.5,
+    )
+    robot = SimpleNamespace(action_features={"joint_0.pos": object()})
+    client = _make_rtc_action_client(config, robot)
+
+    try:
+        assert client.cfg.rtc_enable is True
+        assert client.cfg.use_cfg is False
+        assert client.cfg.aggregate_fn_name == "latest_only"
+        assert client.environment_dt == pytest.approx(1 / 30)
+        assert isinstance(client.action_queue, ActionQueue)
+    finally:
+        client.stop()
+
+
+def test_rtc_control_loop_is_one_to_one_and_failed_send_does_not_count(monkeypatch):
+    """One 30 Hz model action produces one command; a failed write is never confirmed."""
+    from lerobot.async_inference import robot_client as robot_client_module
+
+    class FakeRobot:
+        def __init__(self):
+            self.attempts = 0
+            self.sent = []
+
+        def get_observation(self):
+            return {"state": self.attempts}
+
+        def send_action(self, action):
+            self.attempts += 1
+            if self.attempts == 2:
+                raise ConnectionError("robot write failed")
+            self.sent.append(action)
+
+    class FakeRTCClient:
+        def __init__(self):
+            self.request_timesteps = []
+            self.confirmed = 0
+
+        def get_action(self, *, observation, task, timestep):
+            self.request_timesteps.append(timestep)
+            return {"joint_0.pos": float(timestep)}
+
+        def mark_action_executed(self):
+            self.confirmed += 1
+
+    config = SimpleNamespace(task="task", environment_dt=1 / 30)
+    robot = FakeRobot()
+    client = FakeRTCClient()
+    sleeps = []
+    monkeypatch.setattr(robot_client_module, "precise_sleep", sleeps.append)
+
+    with pytest.raises(ConnectionError, match="robot write failed"):
+        robot_client_module._rtc_control_loop(config, robot, client, max_steps=3)
+
+    assert robot.attempts == 2
+    assert len(robot.sent) == 1
+    assert client.request_timesteps == [0, 1]
+    assert client.confirmed == 1
+    assert len(sleeps) == 1
 
 
 def test_update_action_queue_discards_stale(robot_client):
