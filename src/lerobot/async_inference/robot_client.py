@@ -647,7 +647,7 @@ class RobotClient:
 
 
 def _make_rtc_action_client(cfg: RobotClientConfig, robot: Robot):
-    """Build the shared protocol-v2 RTC action client for this entrypoint."""
+    """Build the shared CFG/RTC action client for this entrypoint."""
     from lerobot.scripts.recording_remote_policy import (
         RemotePolicyActionClient,
         RemotePolicyRecordConfig,
@@ -662,12 +662,12 @@ def _make_rtc_action_client(cfg: RobotClientConfig, robot: Robot):
         client_device=cfg.client_device,
         actions_per_chunk=cfg.actions_per_chunk,
         chunk_size_threshold=cfg.chunk_size_threshold,
-        # RTC atomically installs one aligned raw/processed chunk. Overlap
-        # aggregation belongs only to the protocol-v1 path.
+        # RTC atomically installs one aligned raw/processed chunk. When RTC is
+        # disabled, this client transparently uses its protocol-v1 queue.
         aggregate_fn_name="latest_only",
         obs_queue_timeout_s=cfg.obs_queue_timeout_s,
         use_cfg=cfg.use_cfg,
-        rtc_enable=True,
+        rtc_enable=cfg.rtc_enable,
         rtc_inference_delay=cfg.rtc_inference_delay,
         rtc_execution_horizon=cfg.rtc_execution_horizon,
         rtc_max_guidance_weight=cfg.rtc_max_guidance_weight,
@@ -710,7 +710,7 @@ def _rtc_control_loop(
 
 
 def run_rtc_client(cfg: RobotClientConfig) -> None:
-    """Run the dedicated 30 Hz RTC robot-client lifecycle."""
+    """Run the 30 Hz client-authoritative CFG/RTC lifecycle."""
     logger = get_logger("rtc_robot_client")
     robot = make_robot_from_config(cfg.robot)
     action_client = None
@@ -723,9 +723,11 @@ def run_rtc_client(cfg: RobotClientConfig) -> None:
         # ActionQueue in the same episode epoch.
         action_client.reset()
         logger.info(
-            "RTC client ready: server=%s, cfg=%s, fps=%d, d=%d, H=%d, beta=%s, threshold=%.3f",
+            "Remote action client ready: server=%s, cfg=%s, rtc=%s, fps=%d, "
+            "d=%d, H=%d, beta=%s, threshold=%.3f",
             cfg.server_address,
             cfg.use_cfg,
+            cfg.rtc_enable,
             cfg.fps,
             cfg.rtc_inference_delay,
             cfg.rtc_execution_horizon,
@@ -750,7 +752,10 @@ def async_client(cfg: RobotClientConfig):
     if cfg.robot.type not in SUPPORTED_ROBOTS:
         raise ValueError(f"Robot {cfg.robot.type} not yet supported!")
 
-    if cfg.rtc_enable:
+    # Use the shared client whenever RTC or client-controlled CFG is enabled.
+    # This keeps the two switches independent: CFG can remain enabled while
+    # RTC is disabled. With both switches false, retain the historical client.
+    if cfg.rtc_enable or cfg.use_cfg:
         run_rtc_client(cfg)
         return
 

@@ -123,6 +123,32 @@ def test_robot_client_rtc_cfg_off_maps_to_recording_client_at_30hz():
         client.stop()
 
 
+def test_robot_client_cfg_can_run_without_rtc():
+    from lerobot.async_inference.configs import RobotClientConfig
+    from lerobot.async_inference.robot_client import _make_rtc_action_client
+    from tests.mocks.mock_robot import MockRobotConfig
+
+    config = RobotClientConfig(
+        robot=MockRobotConfig(),
+        server_address="localhost:9999",
+        policy_type="pi05",
+        pretrained_name_or_path="test",
+        actions_per_chunk=50,
+        rtc_enable=False,
+        use_cfg=True,
+        rtc_cfg_beta=1.5,
+    )
+    robot = SimpleNamespace(action_features={"joint_0.pos": object()})
+    client = _make_rtc_action_client(config, robot)
+
+    try:
+        assert client.cfg.rtc_enable is False
+        assert client.cfg.use_cfg is True
+        assert isinstance(client.action_queue, list)
+    finally:
+        client.stop()
+
+
 def test_rtc_control_loop_is_one_to_one_and_failed_send_does_not_count(monkeypatch):
     """One 30 Hz model action produces one command; a failed write is never confirmed."""
     from lerobot.async_inference import robot_client as robot_client_module

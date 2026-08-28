@@ -15,6 +15,33 @@
 # - CFG=false 时 beta 不参与计算；保留参数只是为了让命令配置完整、统一。
 # ============================================================
 
+# RTC 开关：
+#
+# Record 模式开启 RTC：
+#     --remote_policy.rtc_enable=true \
+#     --remote_policy.rtc_inference_delay=21 \
+#     --remote_policy.rtc_execution_horizon=35 \
+#
+# Record 模式关闭 RTC（用这一行替换上面三行）：
+#     --remote_policy.rtc_enable=false \
+#
+# robot_client 开启 RTC：
+#     --rtc_enable=true \
+#     --rtc_inference_delay=21 \
+#     --rtc_execution_horizon=35 \
+#
+# robot_client 关闭 RTC（用这一行替换上面三行）：
+#     --rtc_enable=false \
+#
+# CFG 和 RTC 可以独立组合：
+# - CFG=false, RTC=true ：C-only + RTC
+# - CFG=true,  RTC=true ：batch=2 CFG + RTC
+# - CFG=true,  RTC=false：batch=2 CFG，不使用 RTC
+# - CFG=false, RTC=false：普通单分支推理，不使用 CFG/RTC
+#
+# RTC=false 时 inference_delay/execution_horizon 不生效，应从命令中删除。
+# beta 始终显式保留为 1.5；CFG=false 时 beta 不生效。
+
 
 # ============================================================
 # 一、H200 服务器
