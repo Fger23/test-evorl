@@ -688,19 +688,59 @@ def _rtc_control_loop(
 
     ``max_steps`` exists for deterministic unit tests. Production runs until
     Ctrl+C. The actual-delay counter advances only after the corresponding
-    command has reached ``robot.send_action`` successfully.
+    command has reached ``robot.send_action`` successfully. Observation capture
+    is lazy: the remote action client invokes ``robot.get_observation`` only at
+    the chunk low-water mark, instead of loading both arms and every camera at
+    the 30 Hz command rate.
     """
     executed_steps = 0
+    last_send_started_at: float | None = None
     while max_steps is None or executed_steps < max_steps:
         loop_start = time.perf_counter()
-        observation = robot.get_observation()
         action = action_client.get_action(
-            observation=observation,
+            observation=robot.get_observation,
             task=cfg.task,
             timestep=executed_steps,
         )
 
-        robot.send_action(action)
+        # Never catch up after a slow observation/RPC by issuing back-to-back
+        # serial writes. A transient write failure retries the same idempotent
+        # position target with backoff; it does not consume or confirm another
+        # action. This also avoids tearing down every camera/arm for one packet.
+        write_failures = 0
+        write_retry_deadline: float | None = None
+        while True:
+            if last_send_started_at is not None:
+                send_wait_s = last_send_started_at + cfg.environment_dt - time.perf_counter()
+                if send_wait_s > 0:
+                    precise_sleep(send_wait_s)
+
+            send_started_at = time.perf_counter()
+            last_send_started_at = send_started_at
+            try:
+                robot.send_action(action)
+                if write_failures:
+                    logging.warning(
+                        "robot.send_action recovered after %d %s.",
+                        write_failures,
+                        "retry" if write_failures == 1 else "retries",
+                    )
+                break
+            except ConnectionError as error:
+                write_failures += 1
+                if write_retry_deadline is None:
+                    write_retry_deadline = send_started_at + 2.0
+                    logging.warning(
+                        "robot.send_action failed with a transient communication error; "
+                        "retrying the same action for up to 2.0s: %s",
+                        error,
+                    )
+                remaining_s = write_retry_deadline - time.perf_counter()
+                if remaining_s <= 0:
+                    raise
+                retry_s = min(0.1 * (2 ** min(write_failures - 1, 2)), 0.5, remaining_s)
+                precise_sleep(retry_s)
+
         action_client.mark_action_executed()
         executed_steps += 1
 

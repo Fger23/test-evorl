@@ -29,6 +29,7 @@ import math
 import pickle  # nosec
 import threading
 import time
+from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import dataclass, field
 from queue import Empty, Full, Queue
@@ -165,6 +166,19 @@ class _InferenceRequest:
     queue_size_at_submit: int
 
 
+@dataclass(frozen=True)
+class _InferenceReservation:
+    """Request metadata captured atomically before hardware observation I/O."""
+
+    request_id: str
+    episode_epoch: int
+    task: str | None
+    timestep: int
+    left_over: torch.Tensor | None
+    executed_steps_at_submit: int
+    queue_size_at_submit: int
+
+
 class RemotePolicyActionClient:
     """Remote action source with one background chunk worker.
 
@@ -225,6 +239,9 @@ class RemotePolicyActionClient:
         self._request_sequence = 0
         self._executed_steps = 0
         self._awaiting_execution_confirmation = False
+        self._observation_failure_count = 0
+        self._observation_retry_not_before = 0.0
+        self._last_observation_error_log_at = 0.0
         self._started = False
 
     @property
@@ -319,6 +336,9 @@ class RemotePolicyActionClient:
             self._active_rpc_request_id = None
             self._executed_steps = 0
             self._awaiting_execution_confirmation = False
+            self._observation_failure_count = 0
+            self._observation_retry_not_before = 0.0
+            self._last_observation_error_log_at = 0.0
             self.latest_action_timestep = -1
             self.latest_action = None
             if self.cfg.rtc_enable:
@@ -388,12 +408,24 @@ class RemotePolicyActionClient:
             return True
         return queue_size / self.cfg.actions_per_chunk <= self.cfg.chunk_size_threshold
 
-    def _submit_if_needed(self, observation: dict, task: str | None, timestep: int) -> bool:
+    def _reserve_request_if_needed(
+        self,
+        *,
+        lazy_observation: bool,
+        task: str | None,
+        timestep: int,
+    ) -> _InferenceReservation | None:
+        """Atomically reserve the sole request slot without doing hardware I/O."""
+
         with self._state_lock:
             if self._stop_event.is_set() or not self._ready_to_send_observation():
-                return False
+                return None
             if self._in_flight_request_id is not None or self._pending_result is not None:
-                return False
+                return None
+            if lazy_observation and time.perf_counter() < getattr(
+                self, "_observation_retry_not_before", 0.0
+            ):
+                return None
 
             left_over = None
             queue_size = self._queue_size()
@@ -405,19 +437,121 @@ class RemotePolicyActionClient:
 
             self._request_sequence += 1
             request_id = f"{self._episode_epoch}:{self._request_sequence}"
-            request = _InferenceRequest(
+            reservation = _InferenceReservation(
                 request_id=request_id,
                 episode_epoch=self._episode_epoch,
-                observation=copy.deepcopy(observation),
                 task=task,
                 timestep=max(timestep, 0),
                 left_over=left_over,
                 executed_steps_at_submit=self._executed_steps,
                 queue_size_at_submit=queue_size,
             )
+            # Reserving before observation capture prevents another control
+            # thread from reading the same cameras/motor buses for a duplicate
+            # request. The potentially slow hardware read happens outside this
+            # lock so reset/stop and the RPC worker remain responsive.
             self._in_flight_request_id = request_id
-            self._worker_error = None
             self._pending_event.clear()
+            return reservation
+
+    def _release_failed_observation_reservation(
+        self,
+        reservation: _InferenceReservation,
+        error: Exception,
+    ) -> None:
+        with self._state_lock:
+            if (
+                reservation.episode_epoch != self._episode_epoch
+                or self._in_flight_request_id != reservation.request_id
+            ):
+                return
+
+            self._in_flight_request_id = None
+            failure_count = getattr(self, "_observation_failure_count", 0) + 1
+            self._observation_failure_count = failure_count
+            retry_s = min(0.1 * (2 ** min(failure_count - 1, 3)), 1.0)
+            now = time.perf_counter()
+            self._observation_retry_not_before = now + retry_s
+
+            last_log_at = getattr(self, "_last_observation_error_log_at", 0.0)
+            if failure_count == 1 or now - last_log_at >= 2.0:
+                logging.warning(
+                    "Robot observation failed; keeping queued actions and retrying in %.2fs "
+                    "(consecutive failures=%d): %s",
+                    retry_s,
+                    failure_count,
+                    error,
+                )
+                self._last_observation_error_log_at = now
+
+    def _release_aborted_reservation(self, reservation: _InferenceReservation) -> None:
+        with self._state_lock:
+            if self._in_flight_request_id == reservation.request_id:
+                self._in_flight_request_id = None
+
+    def _finish_observation_capture(self) -> None:
+        with self._state_lock:
+            failure_count = getattr(self, "_observation_failure_count", 0)
+            if failure_count:
+                logging.info("Robot observation recovered after %d consecutive failure(s).", failure_count)
+            self._observation_failure_count = 0
+            self._observation_retry_not_before = 0.0
+
+    def _submit_if_needed(
+        self,
+        observation: dict[str, Any] | Callable[[], dict[str, Any]],
+        task: str | None,
+        timestep: int,
+    ) -> bool:
+        """Submit once at the low-water mark, resolving lazy observations only then."""
+
+        lazy_observation = callable(observation)
+        reservation = self._reserve_request_if_needed(
+            lazy_observation=lazy_observation,
+            task=task,
+            timestep=timestep,
+        )
+        if reservation is None:
+            return False
+
+        if lazy_observation:
+            try:
+                captured_observation = observation()
+            except (OSError, RuntimeError) as error:
+                self._release_failed_observation_reservation(reservation, error)
+                return False
+            except BaseException:
+                self._release_aborted_reservation(reservation)
+                raise
+        else:
+            captured_observation = observation
+        try:
+            captured_observation = copy.deepcopy(captured_observation)
+        except BaseException:
+            self._release_aborted_reservation(reservation)
+            raise
+
+        request = _InferenceRequest(
+            request_id=reservation.request_id,
+            episode_epoch=reservation.episode_epoch,
+            observation=captured_observation,
+            task=reservation.task,
+            timestep=reservation.timestep,
+            left_over=reservation.left_over,
+            executed_steps_at_submit=reservation.executed_steps_at_submit,
+            queue_size_at_submit=reservation.queue_size_at_submit,
+        )
+
+        with self._state_lock:
+            if (
+                self._stop_event.is_set()
+                or reservation.episode_epoch != self._episode_epoch
+                or self._in_flight_request_id != reservation.request_id
+            ):
+                return False
+            if lazy_observation:
+                self._finish_observation_capture()
+            self._worker_error = None
             try:
                 self._request_queue.put_nowait(request)
             except Full as exc:
@@ -736,12 +870,19 @@ class RemotePolicyActionClient:
             )
         return {key: action_tensor[i].item() for i, key in enumerate(self.robot.action_features)}
 
-    def get_action(self, observation: dict, task: str | None, timestep: int) -> RobotAction:
+    def get_action(
+        self,
+        observation: dict[str, Any] | Callable[[], dict[str, Any]],
+        task: str | None,
+        timestep: int,
+    ) -> RobotAction:
         """Return one processed action and refill asynchronously at low water mark.
 
         The first chunk is a synchronous bootstrap because there is no safe
         action to execute yet. Once primed, this method only blocks if the queue
-        genuinely underruns.
+        genuinely underruns. ``robot_client`` supplies a callable observation so
+        motors and cameras are read only when a new request is actually reserved;
+        recording mode can continue supplying its already-captured dictionary.
         """
         if not self._started:
             raise RuntimeError("RemotePolicyActionClient.start() must be called before get_action().")

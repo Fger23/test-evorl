@@ -213,6 +213,113 @@ def test_first_request_has_no_leftover(rtc_client):
     assert request.executed_steps_at_submit == 0
 
 
+def test_lazy_observation_is_captured_only_for_a_reserved_request(rtc_client):
+    """Motor/camera I/O must follow chunk requests, not the 30 Hz action loop."""
+
+    _seed_queue(rtc_client)
+    rtc_client.cfg.chunk_size_threshold = 0.5
+    observation_provider = MagicMock(return_value={"state": [1.0, 2.0]})
+
+    # A full queue needs no request, so the callable must remain untouched.
+    assert not rtc_client._submit_if_needed(
+        observation=observation_provider,
+        task="test",
+        timestep=0,
+    )
+    observation_provider.assert_not_called()
+
+    # At the low-water mark exactly one caller reserves and captures a request.
+    for _ in range(3):
+        assert rtc_client._pop_action() is not None
+        rtc_client.mark_action_executed()
+    assert rtc_client._submit_if_needed(
+        observation=observation_provider,
+        task="test",
+        timestep=3,
+    )
+    observation_provider.assert_called_once_with()
+    request = _take_submitted_request(rtc_client)
+    assert request.observation == {"state": [1.0, 2.0]}
+
+    # The in-flight reservation prevents duplicate hardware capture.
+    assert not rtc_client._submit_if_needed(
+        observation=observation_provider,
+        task="test",
+        timestep=4,
+    )
+    observation_provider.assert_called_once_with()
+
+
+def test_lazy_observation_failure_keeps_queue_and_backs_off(rtc_client):
+    """One bad camera/serial read must not tear down otherwise safe queued motion."""
+
+    _, processed = _seed_queue(rtc_client)
+    observation_provider = MagicMock(side_effect=ConnectionError("bad status packet"))
+
+    assert not rtc_client._submit_if_needed(
+        observation=observation_provider,
+        task="test",
+        timestep=0,
+    )
+    assert rtc_client._in_flight_request_id is None
+    assert rtc_client._observation_failure_count == 1
+    assert torch.equal(rtc_client._pop_action(), processed[0])
+    rtc_client.mark_action_executed()
+
+    # Immediate retry is suppressed so a failing USB device is not hammered.
+    assert not rtc_client._submit_if_needed(
+        observation=observation_provider,
+        task="test",
+        timestep=1,
+    )
+    observation_provider.assert_called_once_with()
+
+    rtc_client._observation_retry_not_before = 0.0
+    observation_provider.side_effect = None
+    observation_provider.return_value = {"state": [3.0, 4.0]}
+    assert rtc_client._submit_if_needed(
+        observation=observation_provider,
+        task="test",
+        timestep=1,
+    )
+    assert rtc_client._observation_failure_count == 0
+
+
+def test_reset_during_lazy_observation_drops_reserved_request(rtc_client):
+    """A slow camera read cannot resurrect a request from an older episode."""
+
+    capture_started = threading.Event()
+    release_capture = threading.Event()
+    results = []
+
+    def observation_provider():
+        capture_started.set()
+        assert release_capture.wait(timeout=2)
+        return {"state": [1.0, 2.0]}
+
+    submit_thread = threading.Thread(
+        target=lambda: results.append(
+            rtc_client._submit_if_needed(
+                observation=observation_provider,
+                task="test",
+                timestep=0,
+            )
+        )
+    )
+    submit_thread.start()
+    assert capture_started.wait(timeout=2)
+
+    rtc_client._started = False  # Keep this state-machine test off the network.
+    rtc_client.reset()
+    release_capture.set()
+    submit_thread.join(timeout=2)
+
+    assert not submit_thread.is_alive()
+    assert results == [False]
+    assert rtc_client._in_flight_request_id is None
+    assert rtc_client._request_queue.empty()
+
+
 def test_pending_chunk_is_cropped_by_confirmed_executed_steps(rtc_client):
     old_raw, old_processed = _seed_queue(rtc_client)
     assert rtc_client._submit_if_needed(observation={}, task="test", timestep=0)

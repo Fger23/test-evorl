@@ -149,20 +149,24 @@ def test_robot_client_cfg_can_run_without_rtc():
         client.stop()
 
 
-def test_rtc_control_loop_is_one_to_one_and_failed_send_does_not_count(monkeypatch):
-    """One 30 Hz model action produces one command; a failed write is never confirmed."""
+def test_rtc_control_loop_is_one_to_one_and_retries_same_failed_action(monkeypatch):
+    """A failed write is paced, retried in place and confirmed only after success."""
     from lerobot.async_inference import robot_client as robot_client_module
 
     class FakeRobot:
         def __init__(self):
             self.attempts = 0
             self.sent = []
+            self.observation_calls = 0
+            self.send_times = []
 
         def get_observation(self):
+            self.observation_calls += 1
             return {"state": self.attempts}
 
         def send_action(self, action):
             self.attempts += 1
+            self.send_times.append(clock[0])
             if self.attempts == 2:
                 raise ConnectionError("robot write failed")
             self.sent.append(action)
@@ -171,9 +175,13 @@ def test_rtc_control_loop_is_one_to_one_and_failed_send_does_not_count(monkeypat
         def __init__(self):
             self.request_timesteps = []
             self.confirmed = 0
+            self.observations = []
 
         def get_action(self, *, observation, task, timestep):
             self.request_timesteps.append(timestep)
+            assert callable(observation)
+            if timestep == 0:
+                self.observations.append(observation())
             return {"joint_0.pos": float(timestep)}
 
         def mark_action_executed(self):
@@ -183,16 +191,32 @@ def test_rtc_control_loop_is_one_to_one_and_failed_send_does_not_count(monkeypat
     robot = FakeRobot()
     client = FakeRTCClient()
     sleeps = []
-    monkeypatch.setattr(robot_client_module, "precise_sleep", sleeps.append)
+    clock = [0.0]
 
-    with pytest.raises(ConnectionError, match="robot write failed"):
-        robot_client_module._rtc_control_loop(config, robot, client, max_steps=3)
+    def fake_sleep(delay_s):
+        sleeps.append(delay_s)
+        clock[0] += delay_s
 
-    assert robot.attempts == 2
-    assert len(robot.sent) == 1
-    assert client.request_timesteps == [0, 1]
-    assert client.confirmed == 1
-    assert len(sleeps) == 1
+    monkeypatch.setattr(robot_client_module.time, "perf_counter", lambda: clock[0])
+    monkeypatch.setattr(robot_client_module, "precise_sleep", fake_sleep)
+
+    assert robot_client_module._rtc_control_loop(config, robot, client, max_steps=3) == 3
+
+    assert robot.attempts == 4
+    assert robot.sent == [
+        {"joint_0.pos": 0.0},
+        {"joint_0.pos": 1.0},
+        {"joint_0.pos": 2.0},
+    ]
+    assert client.request_timesteps == [0, 1, 2]
+    assert client.confirmed == 3
+    assert robot.observation_calls == 1
+    assert client.observations == [{"state": 0}]
+    assert all(
+        later - earlier >= config.environment_dt - 1e-9
+        for earlier, later in zip(robot.send_times, robot.send_times[1:], strict=False)
+    )
+    assert any(delay >= 0.1 for delay in sleeps)
 
 
 def test_update_action_queue_discards_stale(robot_client):
