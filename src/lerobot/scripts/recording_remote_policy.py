@@ -40,6 +40,7 @@ import torch
 from lerobot.configs.types import RTCAttentionSchedule
 from lerobot.policies.rtc.action_queue import ActionQueue
 from lerobot.policies.rtc.configuration_rtc import RTCConfig
+from lerobot.utils.errors import DeviceNotConnectedError
 
 if TYPE_CHECKING:
     from lerobot.async_inference.helpers import TimedAction
@@ -242,6 +243,8 @@ class RemotePolicyActionClient:
         self._observation_failure_count = 0
         self._observation_retry_not_before = 0.0
         self._last_observation_error_log_at = 0.0
+        self._rpc_failure_count = 0
+        self._rpc_retry_not_before = 0.0
         self._started = False
 
     @property
@@ -255,7 +258,8 @@ class RemotePolicyActionClient:
 
         from lerobot.async_inference.helpers import RemotePolicyConfig, map_robot_keys_to_lerobot_features
 
-        self.stub.Ready(self.services_pb2.Empty())
+        rpc_timeout = self._control_rpc_timeout_s()
+        self.stub.Ready(self.services_pb2.Empty(), timeout=rpc_timeout)
         policy_config = RemotePolicyConfig(
             policy_type=self.cfg.policy_type,
             pretrained_name_or_path=self.cfg.pretrained_name_or_path,
@@ -280,7 +284,13 @@ class RemotePolicyActionClient:
                 self.cfg.rtc_cfg_beta if self.cfg.rtc_enable or self.cfg.use_cfg is True else None
             ),
         )
-        self.stub.SendPolicyInstructions(self.services_pb2.PolicySetup(data=pickle.dumps(policy_config)))
+        self.stub.SendPolicyInstructions(
+            self.services_pb2.PolicySetup(data=pickle.dumps(policy_config)),
+            # Loading a Pi0.5 checkpoint from network storage can take much
+            # longer than one action-chunk round trip, but it must still have a
+            # finite upper bound so startup cannot hang forever.
+            timeout=self._policy_setup_rpc_timeout_s(),
+        )
 
         self._worker_thread = threading.Thread(
             target=self._chunk_worker,
@@ -339,6 +349,8 @@ class RemotePolicyActionClient:
             self._observation_failure_count = 0
             self._observation_retry_not_before = 0.0
             self._last_observation_error_log_at = 0.0
+            self._rpc_failure_count = 0
+            self._rpc_retry_not_before = 0.0
             self.latest_action_timestep = -1
             self.latest_action = None
             if self.cfg.rtc_enable:
@@ -356,7 +368,20 @@ class RemotePolicyActionClient:
         # Reset server deduplication and policy episode state. An older active
         # RPC may still finish, but its epoch/request id prevents installation.
         if self._started:
-            self.stub.Ready(self.services_pb2.Empty())
+            self.stub.Ready(
+                self.services_pb2.Empty(),
+                timeout=self._control_rpc_timeout_s(),
+            )
+
+    def _control_rpc_timeout_s(self) -> float:
+        """Return a finite deadline for setup/reset control-plane RPCs."""
+
+        return max(self.cfg.obs_queue_timeout_s, 5.0)
+
+    def _policy_setup_rpc_timeout_s(self) -> float:
+        """Allow slow checkpoint loading without permitting an infinite startup wait."""
+
+        return max(self.cfg.obs_queue_timeout_s, 300.0)
 
     def mark_action_executed(self) -> None:
         """Confirm that the action returned by ``get_action`` reached the robot.
@@ -420,11 +445,16 @@ class RemotePolicyActionClient:
         with self._state_lock:
             if self._stop_event.is_set() or not self._ready_to_send_observation():
                 return None
-            if self._in_flight_request_id is not None or self._pending_result is not None:
-                return None
-            if lazy_observation and time.perf_counter() < getattr(
-                self, "_observation_retry_not_before", 0.0
+            if (
+                self._in_flight_request_id is not None
+                or self._pending_result is not None
+                or self._worker_error is not None
             ):
+                return None
+            now = time.perf_counter()
+            if now < self._rpc_retry_not_before:
+                return None
+            if lazy_observation and now < self._observation_retry_not_before:
                 return None
 
             left_over = None
@@ -458,13 +488,15 @@ class RemotePolicyActionClient:
         self,
         reservation: _InferenceReservation,
         error: Exception,
-    ) -> None:
+    ) -> bool:
+        """Release a failed lazy capture and report whether it is now fatal."""
+
         with self._state_lock:
             if (
                 reservation.episode_epoch != self._episode_epoch
                 or self._in_flight_request_id != reservation.request_id
             ):
-                return
+                return False
 
             self._in_flight_request_id = None
             failure_count = getattr(self, "_observation_failure_count", 0) + 1
@@ -472,17 +504,21 @@ class RemotePolicyActionClient:
             retry_s = min(0.1 * (2 ** min(failure_count - 1, 3)), 1.0)
             now = time.perf_counter()
             self._observation_retry_not_before = now + retry_s
+            reached_failure_limit = failure_count >= 3
 
             last_log_at = getattr(self, "_last_observation_error_log_at", 0.0)
-            if failure_count == 1 or now - last_log_at >= 2.0:
-                logging.warning(
-                    "Robot observation failed; keeping queued actions and retrying in %.2fs "
-                    "(consecutive failures=%d): %s",
-                    retry_s,
+            if failure_count == 1 or reached_failure_limit or now - last_log_at >= 2.0:
+                log = logging.error if reached_failure_limit else logging.warning
+                log(
+                    "Robot observation failed%s (consecutive failures=%d): %s",
+                    "; aborting after the safety limit"
+                    if reached_failure_limit
+                    else f"; keeping queued actions and retrying in {retry_s:.2f}s",
                     failure_count,
                     error,
                 )
                 self._last_observation_error_log_at = now
+            return reached_failure_limit
 
     def _release_aborted_reservation(self, reservation: _InferenceReservation) -> None:
         with self._state_lock:
@@ -517,8 +553,14 @@ class RemotePolicyActionClient:
         if lazy_observation:
             try:
                 captured_observation = observation()
-            except (OSError, RuntimeError) as error:
-                self._release_failed_observation_reservation(reservation, error)
+            except DeviceNotConnectedError:
+                # A disconnected device requires an explicit reconnect; repeated
+                # reads only add bus pressure and cannot repair this state.
+                self._release_aborted_reservation(reservation)
+                raise
+            except OSError as error:
+                if self._release_failed_observation_reservation(reservation, error):
+                    raise
                 return False
             except BaseException:
                 self._release_aborted_reservation(reservation)
@@ -551,7 +593,6 @@ class RemotePolicyActionClient:
                 return False
             if lazy_observation:
                 self._finish_observation_capture()
-            self._worker_error = None
             try:
                 self._request_queue.put_nowait(request)
             except Full as exc:
@@ -657,6 +698,8 @@ class RemotePolicyActionClient:
                     ):
                         self._pending_result = (request, response)
                         self._in_flight_request_id = None
+                        self._rpc_failure_count = 0
+                        self._rpc_retry_not_before = 0.0
                         self._pending_event.set()
             except Exception as exc:
                 if request is not None:
@@ -692,6 +735,8 @@ class RemotePolicyActionClient:
             if not isinstance(payload, list):
                 raise TypeError(f"Expected a list of TimedAction, got {type(payload).__name__}.")
             with self._state_lock:
+                if request.episode_epoch != self._episode_epoch:
+                    return False
                 self._merge_legacy_actions(payload)
             return True
 
@@ -803,6 +848,12 @@ class RemotePolicyActionClient:
             if self._pending_result is None:
                 self._pending_event.clear()
             queue_empty = self._queue_size() == 0
+            if worker_error is not None and not queue_empty:
+                self._rpc_failure_count += 1
+                retry_s = min(0.1 * (2 ** min(self._rpc_failure_count - 1, 4)), 1.0)
+                self._rpc_retry_not_before = time.perf_counter() + retry_s
+            else:
+                retry_s = 0.0
         if worker_error is None:
             return
         request, error = worker_error
@@ -811,9 +862,10 @@ class RemotePolicyActionClient:
         if queue_empty:
             raise RuntimeError(f"Remote policy request {request.request_id} failed.") from error
         logging.warning(
-            "Remote policy request %s failed while %d queued actions remain; retrying at low water mark: %s",
+            "Remote policy request %s failed while %d queued actions remain; retrying in %.2fs: %s",
             request.request_id,
             self._queue_size(),
+            retry_s,
             error,
         )
 
@@ -875,6 +927,8 @@ class RemotePolicyActionClient:
         observation: dict[str, Any] | Callable[[], dict[str, Any]],
         task: str | None,
         timestep: int,
+        *,
+        defer_refill_until_after_execution: bool = False,
     ) -> RobotAction:
         """Return one processed action and refill asynchronously at low water mark.
 
@@ -883,6 +937,12 @@ class RemotePolicyActionClient:
         genuinely underruns. ``robot_client`` supplies a callable observation so
         motors and cameras are read only when a new request is actually reserved;
         recording mode can continue supplying its already-captured dictionary.
+
+        When ``defer_refill_until_after_execution`` is true, a non-empty queue is
+        popped without reserving a refill first. The caller must confirm the send
+        and then call :meth:`submit_observation_if_needed`, so the observation,
+        raw leftover and executed-step counter all describe the post-execution
+        state. An empty queue still bootstraps synchronously here.
         """
         if not self._started:
             raise RuntimeError("RemotePolicyActionClient.start() must be called before get_action().")
@@ -897,7 +957,10 @@ class RemotePolicyActionClient:
         while True:
             self._apply_pending_result()
             self._raise_or_log_worker_error()
-            self._submit_if_needed(observation=observation, task=task, timestep=timestep)
+            with self._state_lock:
+                queue_empty = self._queue_size() == 0
+            if not defer_refill_until_after_execution or queue_empty:
+                self._submit_if_needed(observation=observation, task=task, timestep=timestep)
 
             action_tensor = self._pop_action()
             if action_tensor is not None:
@@ -909,3 +972,25 @@ class RemotePolicyActionClient:
                     "Remote RTC action queue underrun: no fresh action arrived before the safety timeout."
                 )
             self._pending_event.wait(timeout=min(remaining, 0.05))
+
+    def submit_observation_if_needed(
+        self,
+        observation: dict[str, Any] | Callable[[], dict[str, Any]],
+        task: str | None,
+        timestep: int,
+    ) -> bool:
+        """Submit a low-water refill after the last returned action was sent."""
+
+        if not self._started:
+            raise RuntimeError(
+                "RemotePolicyActionClient.start() must be called before submitting observations."
+            )
+        if self.cfg.rtc_enable and self._awaiting_execution_confirmation:
+            raise RuntimeError(
+                "Confirm the previous remote RTC action with mark_action_executed() before "
+                "submitting its post-execution observation."
+            )
+
+        self._apply_pending_result()
+        self._raise_or_log_worker_error()
+        return self._submit_if_needed(observation=observation, task=task, timestep=timestep)

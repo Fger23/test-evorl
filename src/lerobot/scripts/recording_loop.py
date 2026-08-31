@@ -48,6 +48,7 @@ from lerobot.scripts.recording_remote_policy import RemotePolicyActionClient
 from lerobot.teleoperators import Teleoperator, koch_leader, omx_leader, so_leader
 from lerobot.teleoperators.keyboard.teleop_keyboard import KeyboardTeleop
 from lerobot.utils.constants import ACTION, OBS_STR
+from lerobot.utils.errors import DeviceNotConnectedError
 from lerobot.utils.recording_annotations import resolve_collector_policy_id
 from lerobot.utils.robot_utils import precise_sleep
 from lerobot.utils.utils import get_safe_torch_device
@@ -220,12 +221,18 @@ def record_loop(
         # Start in S0: policy drives both arms, teleop arm should accept feedback commands.
         set_teleop_manual_control(False)
 
-    def run_with_connection_retry(action_name: str, fn: Callable[[], T]) -> T:
+    def run_with_connection_retry(
+        action_name: str,
+        fn: Callable[[], T],
+        *,
+        retry_if: Callable[[Exception], bool] | None = None,
+        exponential_backoff: bool = False,
+    ) -> T:
         timeout_s = max(communication_retry_timeout_s, 0.0)
         interval_s = max(communication_retry_interval_s, 0.0)
         deadline_t = time.perf_counter() + timeout_s
         attempts = 0
-        first_error: ConnectionError | None = None
+        first_error: Exception | None = None
 
         while True:
             attempts += 1
@@ -240,7 +247,11 @@ def record_loop(
                         elapsed_s,
                     )
                 return result
-            except ConnectionError as error:
+            except Exception as error:
+                retryable = retry_if(error) if retry_if is not None else isinstance(error, ConnectionError)
+                if not retryable:
+                    raise
+
                 if first_error is None:
                     first_error = error
                     logging.warning(
@@ -257,8 +268,31 @@ def record_loop(
                 if remaining_s <= 0.0:
                     raise
 
-                sleep_s = interval_s if interval_s > 0.0 else remaining_s
+                if exponential_backoff:
+                    # Observation failures often originate from a temporarily
+                    # busy USB/serial bus. Back off instead of immediately
+                    # hammering every camera and both arms again. Capping the
+                    # exponent keeps enough attempts inside the existing total
+                    # communication timeout.
+                    base_interval_s = interval_s if interval_s > 0.0 else 0.01
+                    sleep_s = min(base_interval_s * (2 ** min(attempts - 1, 4)), 1.0)
+                else:
+                    sleep_s = interval_s if interval_s > 0.0 else remaining_s
                 time.sleep(min(sleep_s, remaining_s))
+
+                # Do not start a new hardware transaction once the total retry
+                # budget has expired. This bounds the retry loop even when the
+                # final backoff consumes all remaining time.
+                if exponential_backoff and time.perf_counter() >= deadline_t:
+                    raise
+
+    def is_transient_observation_error(error: Exception) -> bool:
+        # DeviceNotConnectedError inherits ConnectionError, but represents a
+        # persistent disconnected state and must fail fast. RuntimeError also
+        # covers dead camera reader threads and is deliberately not retried.
+        return isinstance(error, (ConnectionError, TimeoutError)) and not isinstance(
+            error, DeviceNotConnectedError
+        )
 
     timestamp = 0 # 从录制开始到当前帧累计运行秒数
     step_idx = 0
@@ -303,7 +337,12 @@ def record_loop(
                 logging.info("Intervention toggle ignored because policy+teleop are not both active.")
 
         # Get robot observation
-        obs = robot.get_observation()
+        obs = run_with_connection_retry(
+            "robot.get_observation",
+            robot.get_observation,
+            retry_if=is_transient_observation_error,
+            exponential_backoff=True,
+        )
 
         # Applies a pipeline to the raw robot observation, default is IdentityProcessor
         obs_processed = robot_observation_processor(obs)

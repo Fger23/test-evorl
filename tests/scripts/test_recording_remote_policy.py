@@ -31,6 +31,7 @@ from lerobot.configs.types import RTCAttentionSchedule
 from lerobot.policies.rtc.action_queue import ActionQueue
 from lerobot.policies.rtc.configuration_rtc import RTCConfig
 from lerobot.scripts.recording_remote_policy import RemotePolicyActionClient, RemotePolicyRecordConfig
+from lerobot.utils.errors import DeviceNotConnectedError
 
 
 @pytest.fixture
@@ -54,9 +55,7 @@ def rtc_client() -> RemotePolicyActionClient:
     client.cfg = cfg
     client.robot = SimpleNamespace(action_features={"joint_0": object(), "joint_1": object()})
     client.environment_dt = 1 / 30
-    client.action_queue = ActionQueue(
-        RTCConfig(enabled=True, execution_horizon=cfg.rtc_execution_horizon)
-    )
+    client.action_queue = ActionQueue(RTCConfig(enabled=True, execution_horizon=cfg.rtc_execution_horizon))
     client.latest_action_timestep = -1
     client.latest_action = None
     client.aggregate_fn = lambda _old, new: new
@@ -74,6 +73,11 @@ def rtc_client() -> RemotePolicyActionClient:
     client._request_sequence = 0
     client._executed_steps = 0
     client._awaiting_execution_confirmation = False
+    client._observation_failure_count = 0
+    client._observation_retry_not_before = 0.0
+    client._last_observation_error_log_at = 0.0
+    client._rpc_failure_count = 0
+    client._rpc_retry_not_before = 0.0
     client._started = True
     return client
 
@@ -163,6 +167,11 @@ def test_recording_client_cfg_off_negotiates_v2_con_only_rtc(monkeypatch):
     assert policy_config.rtc_enabled is True
     assert policy_config.rtc_inference_delay == 21
     assert policy_config.rtc_execution_horizon == 35
+    client.stub.Ready.assert_called_once()
+    assert client.stub.Ready.call_args.kwargs == {"timeout": max(cfg.obs_queue_timeout_s, 5.0)}
+    assert client.stub.SendPolicyInstructions.call_args.kwargs == {
+        "timeout": max(cfg.obs_queue_timeout_s, 300.0)
+    }
     fake_thread.start.assert_called_once_with()
 
 
@@ -176,9 +185,7 @@ def test_submit_uses_one_in_flight_request_and_raw_snapshot(rtc_client):
     def submit() -> None:
         barrier.wait()
         try:
-            result = rtc_client._submit_if_needed(
-                observation={"state": [0.0, 1.0]}, task="test", timestep=5
-            )
+            result = rtc_client._submit_if_needed(observation={"state": [0.0, 1.0]}, task="test", timestep=5)
             with results_lock:
                 results.append(result)
         except BaseException as exc:
@@ -285,6 +292,164 @@ def test_lazy_observation_failure_keeps_queue_and_backs_off(rtc_client):
     assert rtc_client._observation_failure_count == 0
 
 
+def test_lazy_observation_third_oserror_is_fatal(rtc_client):
+    """A persistent hardware failure must stop before blindly draining the chunk."""
+
+    _seed_queue(rtc_client)
+    observation_provider = MagicMock(side_effect=ConnectionError("bad status packet"))
+
+    for _ in range(2):
+        assert not rtc_client._submit_if_needed(
+            observation=observation_provider,
+            task="test",
+            timestep=0,
+        )
+        rtc_client._observation_retry_not_before = 0.0
+
+    with pytest.raises(ConnectionError, match="bad status packet"):
+        rtc_client._submit_if_needed(
+            observation=observation_provider,
+            task="test",
+            timestep=0,
+        )
+
+    assert rtc_client._observation_failure_count == 3
+    assert rtc_client._in_flight_request_id is None
+    assert isinstance(rtc_client.action_queue, ActionQueue)
+    assert rtc_client.action_queue.qsize() == 6
+
+
+def test_lazy_observation_runtime_error_is_not_retried(rtc_client):
+    _seed_queue(rtc_client)
+    observation_provider = MagicMock(side_effect=RuntimeError("programming error"))
+
+    with pytest.raises(RuntimeError, match="programming error"):
+        rtc_client._submit_if_needed(
+            observation=observation_provider,
+            task="test",
+            timestep=0,
+        )
+
+    assert rtc_client._observation_failure_count == 0
+    assert rtc_client._in_flight_request_id is None
+
+
+def test_lazy_observation_disconnected_device_is_not_retried(rtc_client):
+    _seed_queue(rtc_client)
+    observation_provider = MagicMock(side_effect=DeviceNotConnectedError("camera disconnected"))
+
+    with pytest.raises(DeviceNotConnectedError, match="camera disconnected"):
+        rtc_client._submit_if_needed(
+            observation=observation_provider,
+            task="test",
+            timestep=0,
+        )
+
+    observation_provider.assert_called_once_with()
+    assert rtc_client._observation_failure_count == 0
+    assert rtc_client._in_flight_request_id is None
+
+
+def test_unhandled_worker_error_blocks_reservation_and_is_not_overwritten(rtc_client, monkeypatch):
+    """A worker failure arriving between error polling and submit must remain observable."""
+
+    _seed_queue(rtc_client)
+    failed_request = SimpleNamespace(request_id="0:failed", episode_epoch=0)
+    error = ConnectionError("server unavailable")
+    rtc_client._worker_error = (failed_request, error)
+    observation_provider = MagicMock(return_value={"state": [1.0, 2.0]})
+
+    assert not rtc_client._submit_if_needed(
+        observation=observation_provider,
+        task="test",
+        timestep=0,
+    )
+    observation_provider.assert_not_called()
+    assert rtc_client._worker_error == (failed_request, error)
+
+    monkeypatch.setattr(time, "perf_counter", lambda: 10.0)
+    rtc_client._raise_or_log_worker_error()
+    assert rtc_client._worker_error is None
+    assert rtc_client._rpc_failure_count == 1
+    assert rtc_client._rpc_retry_not_before == pytest.approx(10.1)
+    assert not rtc_client._submit_if_needed(
+        observation=observation_provider,
+        task="test",
+        timestep=0,
+    )
+    observation_provider.assert_not_called()
+
+
+def test_rpc_failure_backoff_is_exponential_and_capped(rtc_client, monkeypatch):
+    _seed_queue(rtc_client)
+    monkeypatch.setattr(time, "perf_counter", lambda: 20.0)
+
+    expected_delays = [0.1, 0.2, 0.4, 0.8, 1.0, 1.0]
+    for index, expected_delay in enumerate(expected_delays):
+        request = SimpleNamespace(request_id=f"0:{index}", episode_epoch=0)
+        rtc_client._worker_error = (request, ConnectionError("server unavailable"))
+        rtc_client._raise_or_log_worker_error()
+        assert rtc_client._rpc_failure_count == index + 1
+        assert rtc_client._rpc_retry_not_before == pytest.approx(20.0 + expected_delay)
+
+
+def test_successful_worker_response_resets_rpc_backoff(rtc_client, monkeypatch):
+    _seed_queue(rtc_client)
+    assert rtc_client._submit_if_needed(observation={}, task="test", timestep=0)
+    rtc_client._rpc_failure_count = 4
+    rtc_client._rpc_retry_not_before = time.perf_counter() + 10.0
+    response = object()
+
+    monkeypatch.setattr(rtc_client, "_send_observation", lambda _request: None)
+    monkeypatch.setattr(rtc_client, "_receive_actions", lambda _request: response)
+    worker = threading.Thread(target=rtc_client._chunk_worker)
+    worker.start()
+
+    assert rtc_client._pending_event.wait(timeout=2)
+    rtc_client._stop_event.set()
+    worker.join(timeout=2)
+
+    assert not worker.is_alive()
+    assert rtc_client._rpc_failure_count == 0
+    assert rtc_client._rpc_retry_not_before == 0.0
+    assert rtc_client._pending_result is not None
+    assert rtc_client._pending_result[1] is response
+
+
+def test_deferred_refill_snapshots_post_execution_state(rtc_client):
+    raw, processed = _seed_queue(rtc_client)
+    observation_provider = MagicMock(return_value={"state": [3.0, 4.0]})
+
+    action = rtc_client.get_action(
+        observation=observation_provider,
+        task="test",
+        timestep=0,
+        defer_refill_until_after_execution=True,
+    )
+    assert action == {"joint_0": processed[0, 0].item(), "joint_1": processed[0, 1].item()}
+    observation_provider.assert_not_called()
+
+    with pytest.raises(RuntimeError, match="Confirm the previous remote RTC action"):
+        rtc_client.submit_observation_if_needed(
+            observation=observation_provider,
+            task="test",
+            timestep=1,
+        )
+
+    rtc_client.mark_action_executed()
+    assert rtc_client.submit_observation_if_needed(
+        observation=observation_provider,
+        task="test",
+        timestep=1,
+    )
+    observation_provider.assert_called_once_with()
+
+    request = _take_submitted_request(rtc_client)
+    assert request.executed_steps_at_submit == 1
+    assert request.queue_size_at_submit == 5
+    assert torch.equal(request.left_over, raw[1:])
+
+
 def test_reset_during_lazy_observation_drops_reserved_request(rtc_client):
     """A slow camera read cannot resurrect a request from an older episode."""
 
@@ -366,6 +531,38 @@ def test_stale_epoch_response_does_not_replace_current_queue(rtc_client):
     assert torch.equal(rtc_client.action_queue.get(), old_processed[0])
 
 
+def test_legacy_merge_rechecks_epoch_after_reacquiring_state_lock(rtc_client):
+    """A reset between decode and merge must not resurrect legacy actions."""
+
+    rtc_client.cfg.rtc_enable = False
+    rtc_client.action_queue = []
+    assert rtc_client._submit_if_needed(observation={}, task=None, timestep=0)
+    request = _take_submitted_request(rtc_client)
+    incoming = [TimedAction(timestamp=0.0, timestep=0, action=torch.tensor([1.0, 2.0]))]
+    rtc_client._in_flight_request_id = None
+    rtc_client._pending_result = (request, incoming)
+
+    base_lock = threading.RLock()
+
+    class _ResetBeforeSecondLock:
+        def __init__(self):
+            self.enter_count = 0
+
+        def __enter__(self):
+            self.enter_count += 1
+            if self.enter_count == 2:
+                rtc_client._episode_epoch += 1
+            return base_lock.__enter__()
+
+        def __exit__(self, exc_type, exc_value, traceback):
+            return base_lock.__exit__(exc_type, exc_value, traceback)
+
+    rtc_client._state_lock = _ResetBeforeSecondLock()
+
+    assert not rtc_client._apply_pending_result()
+    assert rtc_client.action_queue == []
+
+
 def test_reset_cancels_active_rpc_and_clears_queue(rtc_client):
     class _BlockedFuture:
         def __init__(self):
@@ -426,6 +623,16 @@ def test_reset_cancels_active_rpc_and_clears_queue(rtc_client):
     assert rtc_client._in_flight_request_id is None
     assert isinstance(rtc_client.action_queue, ActionQueue)
     assert rtc_client.action_queue.empty()
+
+
+def test_reset_ready_rpc_has_finite_timeout(rtc_client):
+    rtc_client.stub = MagicMock()
+    rtc_client.services_pb2 = SimpleNamespace(Empty=lambda: SimpleNamespace())
+
+    rtc_client.reset()
+
+    rtc_client.stub.Ready.assert_called_once()
+    assert rtc_client.stub.Ready.call_args.kwargs == {"timeout": max(rtc_client.cfg.obs_queue_timeout_s, 5.0)}
 
 
 def test_previous_action_requires_execution_confirmation(rtc_client):

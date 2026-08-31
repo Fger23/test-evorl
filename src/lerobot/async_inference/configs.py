@@ -274,10 +274,12 @@ class RobotClientConfig:
     # The dedicated robot_client RTC path reuses the same raw/processed queue
     # implementation as lerobot_record. It still sends one command per loop at
     # ``fps``; no secondary dequeue rate or interpolation is involved.
-    rtc_enable: bool = field(default=True, metadata={"help": "Enable protocol-v2 RTC inference"})
+    rtc_enable: bool = field(default=False, metadata={"help": "Enable protocol-v2 RTC inference"})
     use_cfg: bool = field(
-        default=True,
-        metadata={"help": "Use batch=2 ACP-CFG; false uses positive-conditioned batch=1 RTC"},
+        default=False,
+        metadata={
+            "help": "Enable batch=2 ACP-CFG; false uses one positive-conditioned branch when RTC is enabled"
+        },
     )
     obs_queue_timeout_s: float = field(
         default=30.0,

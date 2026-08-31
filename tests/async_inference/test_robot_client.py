@@ -91,6 +91,21 @@ def _make_actions(start_ts: float, start_t: int, count: int):
 # -----------------------------------------------------------------------------
 
 
+def test_robot_client_defaults_preserve_main_compatibility():
+    from lerobot.async_inference.configs import RobotClientConfig
+    from tests.mocks.mock_robot import MockRobotConfig
+
+    config = RobotClientConfig(
+        robot=MockRobotConfig(),
+        policy_type="pi05",
+        pretrained_name_or_path="test",
+        actions_per_chunk=50,
+    )
+
+    assert config.rtc_enable is False
+    assert config.use_cfg is False
+
+
 def test_robot_client_rtc_cfg_off_maps_to_recording_client_at_30hz():
     from lerobot.async_inference.configs import RobotClientConfig
     from lerobot.async_inference.robot_client import _make_rtc_action_client
@@ -136,6 +151,7 @@ def test_robot_client_cfg_can_run_without_rtc():
         actions_per_chunk=50,
         rtc_enable=False,
         use_cfg=True,
+        aggregate_fn_name="weighted_average",
         rtc_cfg_beta=1.5,
     )
     robot = SimpleNamespace(action_features={"joint_0.pos": object()})
@@ -144,14 +160,17 @@ def test_robot_client_cfg_can_run_without_rtc():
     try:
         assert client.cfg.rtc_enable is False
         assert client.cfg.use_cfg is True
+        assert client.cfg.aggregate_fn_name == "weighted_average"
         assert isinstance(client.action_queue, list)
     finally:
         client.stop()
 
 
-def test_rtc_control_loop_is_one_to_one_and_retries_same_failed_action(monkeypatch):
-    """A failed write is paced, retried in place and confirmed only after success."""
+def test_rtc_control_loop_refills_after_send_and_retries_same_failed_action(monkeypatch):
+    """Refill observes post-send state; a failed write is retried and confirmed once."""
     from lerobot.async_inference import robot_client as robot_client_module
+
+    events = []
 
     class FakeRobot:
         def __init__(self):
@@ -162,6 +181,7 @@ def test_rtc_control_loop_is_one_to_one_and_retries_same_failed_action(monkeypat
 
         def get_observation(self):
             self.observation_calls += 1
+            events.append(("observation", len(self.sent)))
             return {"state": self.attempts}
 
         def send_action(self, action):
@@ -170,16 +190,20 @@ def test_rtc_control_loop_is_one_to_one_and_retries_same_failed_action(monkeypat
             if self.attempts == 2:
                 raise ConnectionError("robot write failed")
             self.sent.append(action)
+            events.append(("send", action["joint_0.pos"]))
 
     class FakeRTCClient:
         def __init__(self):
             self.request_timesteps = []
             self.confirmed = 0
             self.observations = []
+            self.submit_timesteps = []
+            self.submit_confirmation_counts = []
 
-        def get_action(self, *, observation, task, timestep):
+        def get_action(self, *, observation, task, timestep, defer_refill_until_after_execution):
             self.request_timesteps.append(timestep)
             assert callable(observation)
+            assert defer_refill_until_after_execution is True
             if timestep == 0:
                 self.observations.append(observation())
             return {"joint_0.pos": float(timestep)}
@@ -187,7 +211,24 @@ def test_rtc_control_loop_is_one_to_one_and_retries_same_failed_action(monkeypat
         def mark_action_executed(self):
             self.confirmed += 1
 
-    config = SimpleNamespace(task="task", environment_dt=1 / 30)
+        def submit_observation_if_needed(self, observation, task, timestep):
+            assert callable(observation)
+            assert task == "task"
+            self.submit_timesteps.append(timestep)
+            self.submit_confirmation_counts.append(self.confirmed)
+            if timestep == 1:
+                self.observations.append(observation())
+
+    arm_config = SimpleNamespace(max_relative_target=None)
+    config = SimpleNamespace(
+        task="task",
+        environment_dt=1 / 30,
+        robot=SimpleNamespace(
+            type="bi_so_follower",
+            left_arm_config=arm_config,
+            right_arm_config=arm_config,
+        ),
+    )
     robot = FakeRobot()
     client = FakeRTCClient()
     sleeps = []
@@ -210,13 +251,69 @@ def test_rtc_control_loop_is_one_to_one_and_retries_same_failed_action(monkeypat
     ]
     assert client.request_timesteps == [0, 1, 2]
     assert client.confirmed == 3
-    assert robot.observation_calls == 1
-    assert client.observations == [{"state": 0}]
+    assert client.submit_timesteps == [1, 2, 3]
+    assert client.submit_confirmation_counts == [1, 2, 3]
+    assert robot.observation_calls == 2
+    assert client.observations == [{"state": 0}, {"state": 1}]
+    assert events[:3] == [
+        ("observation", 0),
+        ("send", 0.0),
+        ("observation", 1),
+    ]
     assert all(
         later - earlier >= config.environment_dt - 1e-9
         for earlier, later in zip(robot.send_times, robot.send_times[1:], strict=False)
     )
     assert any(delay >= 0.1 for delay in sleeps)
+
+
+def test_rtc_control_loop_does_not_retry_unsafe_bimanual_relative_action():
+    from lerobot.async_inference import robot_client as robot_client_module
+
+    class FakeRobot:
+        def __init__(self):
+            self.attempts = 0
+
+        def get_observation(self):
+            return {"state": 0}
+
+        def send_action(self, action):
+            self.attempts += 1
+            raise ConnectionError("right arm write failed after left arm may have moved")
+
+    class FakeRTCClient:
+        def __init__(self):
+            self.confirmed = 0
+            self.submissions = 0
+
+        def get_action(self, *, observation, task, timestep, defer_refill_until_after_execution):
+            assert defer_refill_until_after_execution is True
+            return {"joint_0.pos": 1.0}
+
+        def mark_action_executed(self):
+            self.confirmed += 1
+
+        def submit_observation_if_needed(self, observation, task, timestep):
+            self.submissions += 1
+
+    config = SimpleNamespace(
+        task="task",
+        environment_dt=1 / 30,
+        robot=SimpleNamespace(
+            type="bi_so_follower",
+            left_arm_config=SimpleNamespace(max_relative_target=5.0),
+            right_arm_config=SimpleNamespace(max_relative_target=None),
+        ),
+    )
+    robot = FakeRobot()
+    client = FakeRTCClient()
+
+    with pytest.raises(ConnectionError, match="right arm write failed"):
+        robot_client_module._rtc_control_loop(config, robot, client, max_steps=1)
+
+    assert robot.attempts == 1
+    assert client.confirmed == 0
+    assert client.submissions == 0
 
 
 def test_update_action_queue_discards_stale(robot_client):

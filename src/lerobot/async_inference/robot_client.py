@@ -662,9 +662,11 @@ def _make_rtc_action_client(cfg: RobotClientConfig, robot: Robot):
         client_device=cfg.client_device,
         actions_per_chunk=cfg.actions_per_chunk,
         chunk_size_threshold=cfg.chunk_size_threshold,
-        # RTC atomically installs one aligned raw/processed chunk. When RTC is
-        # disabled, this client transparently uses its protocol-v1 queue.
-        aggregate_fn_name="latest_only",
+        # RTC atomically installs one aligned raw/processed chunk and therefore
+        # must never overlap-aggregate it. CFG without RTC still uses the
+        # protocol-v1 queue, so preserve the aggregation policy selected by the
+        # client just like the historical robot_client path.
+        aggregate_fn_name="latest_only" if cfg.rtc_enable else cfg.aggregate_fn_name,
         obs_queue_timeout_s=cfg.obs_queue_timeout_s,
         use_cfg=cfg.use_cfg,
         rtc_enable=cfg.rtc_enable,
@@ -675,6 +677,30 @@ def _make_rtc_action_client(cfg: RobotClientConfig, robot: Robot):
         rtc_cfg_beta=cfg.rtc_cfg_beta,
     )
     return RemotePolicyActionClient(cfg=remote_cfg, robot=robot, fps=cfg.fps)
+
+
+def _whole_action_write_retry_is_safe(cfg: RobotClientConfig) -> bool:
+    """Whether replaying a failed whole-robot action is safe for this config.
+
+    ``BiSOFollower.send_action`` writes the left arm before the right arm. If
+    either arm uses ``max_relative_target``, a right-arm failure followed by a
+    whole-action retry may re-read the already-moving left arm and apply another
+    relative safety step. Absolute targets (the default) remain idempotent.
+    """
+
+    robot_cfg = getattr(cfg, "robot", None)
+    if getattr(robot_cfg, "type", None) != "bi_so_follower":
+        return True
+
+    left_arm_cfg = getattr(robot_cfg, "left_arm_config", None)
+    right_arm_cfg = getattr(robot_cfg, "right_arm_config", None)
+    return (
+        left_arm_cfg is not None
+        and right_arm_cfg is not None
+        and all(
+            getattr(arm_cfg, "max_relative_target", None) is None for arm_cfg in (left_arm_cfg, right_arm_cfg)
+        )
+    )
 
 
 def _rtc_control_loop(
@@ -695,12 +721,14 @@ def _rtc_control_loop(
     """
     executed_steps = 0
     last_send_started_at: float | None = None
+    retry_whole_action = _whole_action_write_retry_is_safe(cfg)
     while max_steps is None or executed_steps < max_steps:
         loop_start = time.perf_counter()
         action = action_client.get_action(
             observation=robot.get_observation,
             task=cfg.task,
             timestep=executed_steps,
+            defer_refill_until_after_execution=True,
         )
 
         # Never catch up after a slow observation/RPC by issuing back-to-back
@@ -728,6 +756,12 @@ def _rtc_control_loop(
                 break
             except ConnectionError as error:
                 write_failures += 1
+                if not retry_whole_action:
+                    logging.error(
+                        "robot.send_action failed for a bi_so_follower with max_relative_target enabled; "
+                        "not retrying the whole bimanual action because one arm may already have moved."
+                    )
+                    raise
                 if write_retry_deadline is None:
                     write_retry_deadline = send_started_at + 2.0
                     logging.warning(
@@ -743,6 +777,7 @@ def _rtc_control_loop(
 
         action_client.mark_action_executed()
         executed_steps += 1
+        action_client.submit_observation_if_needed(robot.get_observation, cfg.task, executed_steps)
 
         precise_sleep(max(cfg.environment_dt - (time.perf_counter() - loop_start), 0.0))
 

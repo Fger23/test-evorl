@@ -49,6 +49,7 @@ from lerobot.scripts.lerobot_record import (
 )
 from lerobot.scripts.lerobot_replay import DatasetReplayConfig, ReplayConfig, replay
 from lerobot.scripts.lerobot_teleoperate import TeleoperateConfig, teleoperate
+from lerobot.utils.errors import DeviceNotConnectedError
 from lerobot.utils.recording_annotations import EPISODE_SUCCESS
 from tests.fixtures.constants import DUMMY_REPO_ID
 from tests.mocks.mock_robot import MockRobot, MockRobotConfig
@@ -290,6 +291,121 @@ def test_record_loop_sets_leader_manual_control_during_reset():
             robot.disconnect()
 
     assert teleop.manual_control_calls == [True]
+
+
+def _run_observation_only_record_loop(
+    robot,
+    events: dict,
+    *,
+    retry_timeout_s: float,
+    retry_interval_s: float,
+) -> None:
+    record_loop(
+        robot=robot,
+        events=events,
+        fps=30,
+        teleop_action_processor=lambda x: x[0],
+        robot_action_processor=lambda x: x[0],
+        robot_observation_processor=lambda x: x,
+        control_time_s=1,
+        communication_retry_timeout_s=retry_timeout_s,
+        communication_retry_interval_s=retry_interval_s,
+    )
+
+
+def test_record_loop_observation_recovers_from_transient_connection_error():
+    events = {"exit_early": False, "toggle_intervention": False}
+    robot = MagicMock()
+    robot.action_features = {"joint.pos": object()}
+
+    def get_observation():
+        if robot.get_observation.call_count == 1:
+            raise ConnectionError("[TxRxResult] Incorrect status packet!")
+        events["exit_early"] = True
+        return {"joint.pos": 0.0}
+
+    robot.get_observation.side_effect = get_observation
+    with patch("lerobot.scripts.recording_loop.time.sleep") as sleep:
+        _run_observation_only_record_loop(
+            robot,
+            events,
+            retry_timeout_s=0.1,
+            retry_interval_s=0.01,
+        )
+
+    assert robot.get_observation.call_count == 2
+    sleep.assert_called_once_with(pytest.approx(0.01))
+
+
+def test_record_loop_observation_runtime_error_fails_without_retry():
+    events = {"exit_early": False, "toggle_intervention": False}
+    robot = MagicMock()
+    robot.action_features = {"joint.pos": object()}
+    robot.get_observation.side_effect = RuntimeError("camera read thread is not running")
+
+    with (
+        patch("lerobot.scripts.recording_loop.time.sleep") as sleep,
+        pytest.raises(RuntimeError, match="camera read thread is not running"),
+    ):
+        _run_observation_only_record_loop(
+            robot,
+            events,
+            retry_timeout_s=1.0,
+            retry_interval_s=0.01,
+        )
+
+    robot.get_observation.assert_called_once_with()
+    sleep.assert_not_called()
+
+
+def test_record_loop_observation_disconnected_device_fails_without_retry():
+    events = {"exit_early": False, "toggle_intervention": False}
+    robot = MagicMock()
+    robot.action_features = {"joint.pos": object()}
+    robot.get_observation.side_effect = DeviceNotConnectedError("camera disconnected")
+
+    with (
+        patch("lerobot.scripts.recording_loop.time.sleep") as sleep,
+        pytest.raises(DeviceNotConnectedError, match="camera disconnected"),
+    ):
+        _run_observation_only_record_loop(
+            robot,
+            events,
+            retry_timeout_s=1.0,
+            retry_interval_s=0.01,
+        )
+
+    robot.get_observation.assert_called_once_with()
+    sleep.assert_not_called()
+
+
+def test_record_loop_observation_connection_error_stops_at_retry_timeout():
+    events = {"exit_early": False, "toggle_intervention": False}
+    robot = MagicMock()
+    robot.action_features = {"joint.pos": object()}
+    robot.get_observation.side_effect = ConnectionError("persistent incorrect status packet")
+    clock = [0.0]
+    sleeps: list[float] = []
+
+    def fake_sleep(delay_s: float) -> None:
+        sleeps.append(delay_s)
+        clock[0] += delay_s
+
+    with (
+        patch("lerobot.scripts.recording_loop.time.perf_counter", side_effect=lambda: clock[0]),
+        patch("lerobot.scripts.recording_loop.time.sleep", side_effect=fake_sleep),
+        pytest.raises(ConnectionError, match="persistent incorrect status packet"),
+    ):
+        _run_observation_only_record_loop(
+            robot,
+            events,
+            retry_timeout_s=0.031,
+            retry_interval_s=0.01,
+        )
+
+    assert robot.get_observation.call_count == 3
+    assert sleeps == pytest.approx([0.01, 0.02, 0.001])
+    assert clock[0] == pytest.approx(0.031)
 
 
 def test_save_and_load_failure_reset_pose(tmp_path):
