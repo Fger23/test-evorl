@@ -495,21 +495,24 @@ python -m lerobot.async_inference.policy_server \
   --obs_queue_timeout=5
 ```
 
-Then run the headless profiling client in a second terminal. It builds synthetic observations from the checkpoint
-features, discards every returned action, waits for three unrecorded warm-up requests, shows a 10-minute terminal
-countdown, and writes the distribution to `d.txt`:
+Then run the headless profiling client in a second terminal. It uses the repository's existing `AsyncInference`
+gRPC protocol and the same `RemotePolicyConfig`, `TimedObservation`, chunked observation upload, and action response
+types as `RobotClient`, but replaces robot observations with synthetic checkpoint-shaped inputs and never executes
+the returned actions. It waits for three unrecorded warm-up requests, shows a 10-minute terminal countdown, and
+writes the distribution to `d.txt`:
 
 ```bash
 lerobot-rtc-test-d \
-  --policy-path=<PI05_CHECKPOINT_OR_OUTPUT_DIR> \
-  --server-address=127.0.0.1:8090 \
-  --gpu-id=7 \
+  --pretrained_name_or_path=<PI05_CHECKPOINT_OR_OUTPUT_DIR> \
+  --server_address=127.0.0.1:8090 \
+  --policy_device=cuda:7 \
   --duration-s=600 \
   --fps=30 \
   --output=d.txt
 ```
 
-`--gpu-id=7` is sent to the server as `device=cuda:7`, so model loading and inference run on server GPU 7. If the
+`--policy_device=cuda:7` is sent in the existing policy setup message, so model loading and inference run on server
+GPU 7. The hyphenated aliases `--policy-path`, `--server-address`, and `--policy-device` are also accepted. If the
 server is on another machine, replace `127.0.0.1` with its IP address. The server remains running after the client
 finishes and can be stopped with Ctrl+C.
 

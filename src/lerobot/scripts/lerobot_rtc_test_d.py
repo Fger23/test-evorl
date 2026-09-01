@@ -430,8 +430,6 @@ def run_integrated_headless_profile(
     limits: RTCPolicyLimits,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Profile a private or external server without constructing a Robot."""
-    if args.gpu_id is None or args.gpu_id < 0:
-        raise ValueError("Headless profiling requires --gpu-id=<non-negative physical GPU index>.")
     if limits.config_path is None:
         raise ValueError("Headless profiling could not resolve the policy config path.")
     if args.fps <= 0:
@@ -444,6 +442,26 @@ def run_integrated_headless_profile(
     )
 
     external_server = args.server_address is not None
+    if args.gpu_id is not None and args.gpu_id < 0:
+        raise ValueError(f"gpu-id must be non-negative, got {args.gpu_id}.")
+    if external_server:
+        if args.policy_device is not None:
+            device = args.policy_device.strip()
+            if not device:
+                raise ValueError("policy-device cannot be empty.")
+        elif args.gpu_id is not None:
+            device = f"cuda:{args.gpu_id}"
+        else:
+            raise ValueError(
+                "External-server profiling requires --policy-device (for example cuda:7) or --gpu-id."
+            )
+    else:
+        if args.policy_device is not None:
+            raise ValueError("--policy-device is for --server-address mode; private mode uses --gpu-id.")
+        if args.gpu_id is None:
+            raise ValueError("Private-server profiling requires --gpu-id=<physical GPU index>.")
+        device = "cuda"
+
     host = "127.0.0.1"
     server_address = args.server_address.strip() if external_server else f"{host}:{args.server_port}"
     server_port = _server_port_from_address(server_address)
@@ -460,14 +478,12 @@ def run_integrated_headless_profile(
     server_log = None
     server_process: subprocess.Popen | None = None
     if external_server:
-        device = f"cuda:{args.gpu_id}"
         print(
             f"Connecting to PI0.5 server at {server_address}; requesting {device}. "
             "Robot actions are disabled."
         )
     else:
         _ensure_tcp_port_available(host, args.server_port)
-        device = "cuda"
         server_log_path = args.server_log.expanduser()
         server_log_path.parent.mkdir(parents=True, exist_ok=True)
         server_command = [
@@ -596,6 +612,8 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--policy-path",
+        "--pretrained_name_or_path",
+        dest="policy_path",
         help="Local config/checkpoint/output directory or Hugging Face policy id.",
     )
     parser.add_argument(
@@ -612,12 +630,23 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--server-address",
+        "--server_address",
+        dest="server_address",
         default=None,
         help="Connect to an already running server, e.g. 127.0.0.1:8090; GPU is then requested as cuda:<gpu-id>.",
+    )
+    parser.add_argument(
+        "--policy-device",
+        "--policy_device",
+        dest="policy_device",
+        default=None,
+        help="Device requested from an external policy server, matching RobotClientConfig (e.g. cuda:7).",
     )
     parser.add_argument("--fps", type=int, default=30, help="Controller frequency (default: 30).")
     parser.add_argument(
         "--actions-per-chunk",
+        "--actions_per_chunk",
+        dest="actions_per_chunk",
         type=int,
         default=None,
         help="Returned actions per request; defaults to checkpoint chunk_size.",
@@ -838,8 +867,14 @@ def format_text_report(report: dict[str, Any]) -> str:
     ]
     profile = report.get("profile")
     if profile is not None:
+        if profile.get("server_mode") == "external":
+            device_line = (
+                f"  policy device / server: {profile['requested_device']} / {profile['server_address']}"
+            )
+        else:
+            device_line = f"  physical GPU / server: {profile['gpu_id']} / {profile['server_address']}"
         lines[3:3] = [
-            f"  GPU / server: {profile['gpu_id']} / {profile['server_address']}",
+            device_line,
             f"  requested duration / fps: {profile['duration_s']:g}s / {profile['fps']} Hz",
             f"  robot actions sent: {profile['robot_actions_sent']}",
             (

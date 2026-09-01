@@ -1,19 +1,50 @@
-python -m pip install -e . --no-deps
+# RTC d profiling (Linux / Bash)
+#
+# This uses LeRobot's existing AsyncInference gRPC protocol.
+# It does not connect to a robot and never executes returned actions.
 
-$env:CUDA_DEVICE_ORDER = "PCI_BUS_ID"
-Remove-Item Env:CUDA_VISIBLE_DEVICES -ErrorAction SilentlyContinue
+# ============================================================
+# Terminal 1: H200 policy server
+# ============================================================
 
-python -m lerobot.async_inference.policy_server `
-  --host=0.0.0.0 `
-  --port=8090 `
-  --fps=30 `
-  --inference_latency=0 `
+cd ~/Evo-RL
+
+export CUDA_DEVICE_ORDER=PCI_BUS_ID
+unset CUDA_VISIBLE_DEVICES
+
+PYTHONPATH="$PWD/src" python -m lerobot.async_inference.policy_server \
+  --host=0.0.0.0 \
+  --port=8090 \
+  --fps=30 \
+  --inference_latency=0 \
   --obs_queue_timeout=5
 
-  lerobot-rtc-test-d `
-  --policy-path="你的PI05检查点绝对路径" `
-  --server-address=127.0.0.1:8090 `
-  --gpu-id=7 `
-  --duration-s=600 `
-  --fps=30 `
+# Expected log:
+# PolicyServer started on 0.0.0.0:8090
+
+
+# ============================================================
+# Terminal 2: headless profiling client
+# ============================================================
+
+cd ~/code/Evo-RL
+
+# Replace these two values before running.
+# PI05_POLICY must be accessible to both the client and server.
+export RTC_SERVER_IP="REPLACE_WITH_H200_SERVER_IP"
+export PI05_POLICY="REPLACE_WITH_PI05_CHECKPOINT_OR_HF_REPO"
+
+# Optional connectivity check:
+nc -vz "$RTC_SERVER_IP" 8090
+
+PYTHONPATH="$PWD/src" python -m lerobot.scripts.lerobot_rtc_test_d \
+  --pretrained_name_or_path="$PI05_POLICY" \
+  --server_address="$RTC_SERVER_IP:8090" \
+  --policy_device=cuda:7 \
+  --duration-s=600 \
+  --fps=30 \
   --output=d.txt
+
+# The 10-minute timer starts after model loading and 3 warm-up requests.
+# The final distribution is written to: ./d.txt
+# Stop the server with Ctrl+C after profiling finishes.

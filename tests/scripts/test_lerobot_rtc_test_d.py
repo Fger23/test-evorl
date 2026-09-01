@@ -197,12 +197,12 @@ def test_one_command_headless_mode_defaults_to_d_txt(tmp_path, monkeypatch, caps
 
     assert exit_code == 0
     assert "saved report" in output
-    assert "GPU / server: 7 / 127.0.0.1:8090" in report_text
+    assert "physical GPU / server: 7 / 127.0.0.1:8090" in report_text
     assert "robot actions sent: False" in report_text
     assert "d=6: 1" in report_text
 
 
-def test_external_server_mode_accepts_client_selected_gpu(tmp_path, monkeypatch):
+def test_external_server_mode_accepts_existing_client_parameter_names(tmp_path, monkeypatch):
     config_path = tmp_path / "config.json"
     config_path.write_text(
         json.dumps({"type": "pi05", "chunk_size": 50, "input_features": {}}),
@@ -211,11 +211,12 @@ def test_external_server_mode_accepts_client_selected_gpu(tmp_path, monkeypatch)
 
     def fake_integrated_profile(args, limits):
         assert args.server_address == "127.0.0.1:8090"
-        assert args.gpu_id == 7
+        assert args.gpu_id is None
+        assert args.policy_device == "cuda:7"
         return (
             [{"source": "headless_grpc_profile", "d": 6, "latency_ms": 200.0}],
             {
-                "gpu_id": 7,
+                "gpu_id": None,
                 "server_address": args.server_address,
                 "server_port": 8090,
                 "server_mode": "external",
@@ -238,9 +239,9 @@ def test_external_server_mode_accepts_client_selected_gpu(tmp_path, monkeypatch)
 
     exit_code = rtc_cli.main(
         [
-            f"--policy-path={tmp_path}",
-            "--server-address=127.0.0.1:8090",
-            "--gpu-id=7",
+            f"--pretrained_name_or_path={tmp_path}",
+            "--server_address=127.0.0.1:8090",
+            "--policy_device=cuda:7",
         ]
     )
 
