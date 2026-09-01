@@ -222,11 +222,11 @@ class FeetechMotorsBus(SerialMotorsBus):
         for motor in self.motors:
             # By default, Feetech motors have a 500µs delay response time (corresponding to a value of 250 on
             # the 'Return_Delay_Time' address). We ensure this is reduced to the minimum of 2µs (value of 0).
-            self.write("Return_Delay_Time", motor, return_delay_time)
+            self.write("Return_Delay_Time", motor, return_delay_time, num_retry=3)
             # Set 'Maximum_Acceleration' to 254 to speedup acceleration and deceleration of the motors.
             if self.protocol_version == 0:
-                self.write("Maximum_Acceleration", motor, maximum_acceleration)
-            self.write("Acceleration", motor, acceleration)
+                self.write("Maximum_Acceleration", motor, maximum_acceleration, num_retry=3)
+            self.write("Acceleration", motor, acceleration, num_retry=3)
 
     @property
     def is_calibrated(self) -> bool:
