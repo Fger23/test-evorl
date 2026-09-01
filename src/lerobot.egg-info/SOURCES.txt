@@ -16,6 +16,7 @@ src/lerobot/async_inference/constants.py
 src/lerobot/async_inference/helpers.py
 src/lerobot/async_inference/policy_server.py
 src/lerobot/async_inference/robot_client.py
+src/lerobot/async_inference/rtc_d_profiler.py
 src/lerobot/cameras/__init__.py
 src/lerobot/cameras/camera.py
 src/lerobot/cameras/configs.py
@@ -132,6 +133,7 @@ src/lerobot/policies/rtc/action_queue.py
 src/lerobot/policies/rtc/configuration_rtc.py
 src/lerobot/policies/rtc/debug_tracker.py
 src/lerobot/policies/rtc/debug_visualizer.py
+src/lerobot/policies/rtc/delay_telemetry.py
 src/lerobot/policies/rtc/latency_tracker.py
 src/lerobot/policies/rtc/modeling_rtc.py
 src/lerobot/policies/sac/configuration_sac.py
@@ -270,10 +272,12 @@ src/lerobot/scripts/lerobot_info.py
 src/lerobot/scripts/lerobot_patch_hil_dataset_schema.py
 src/lerobot/scripts/lerobot_record.py
 src/lerobot/scripts/lerobot_replay.py
+src/lerobot/scripts/lerobot_rtc_test_d.py
 src/lerobot/scripts/lerobot_setup_can.py
 src/lerobot/scripts/lerobot_setup_motors.py
 src/lerobot/scripts/lerobot_teleoperate.py
 src/lerobot/scripts/lerobot_train.py
+src/lerobot/scripts/lerobot_train_trc.py
 src/lerobot/scripts/lerobot_train_tokenizer.py
 src/lerobot/scripts/lerobot_value_infer.py
 src/lerobot/scripts/lerobot_value_train.py

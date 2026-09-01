@@ -458,6 +458,90 @@ lerobot-train \
 
 `--acp.indicator_dropout_prob` controls tag drop rate in task text; `0.3` helps learn both tagged and untagged conditions.
 
+For PI05 training that combines the same ACP prompt conditioning with Training-Time RTC, use the dedicated
+entrypoint and set the maximum expected inference delay in controller steps:
+
+```bash
+lerobot-train-trc \
+  --dataset.repo_id=<HF_USERNAME_OR_ORG>/<DATASET_NAME> \
+  --policy.type=pi05 \
+  --policy.pretrained_path=<PI05_PRETRAINED_PATH> \
+  --policy.rtc_training_max_delay=10 \
+  --policy.device=cuda \
+  --policy.dtype=bfloat16 \
+  --batch_size=8 \
+  --steps=30000 \
+  --acp.enable=true \
+  --acp.indicator_field=complementary_info.acp_indicator_<TAG> \
+  --acp.indicator_dropout_prob=0.3 \
+  --output_dir=outputs/train/<RUN_NAME> \
+  --job_name=<RUN_NAME>
+```
+
+`lerobot-train-trc` requires PI05, ACP, and `0 < rtc_training_max_delay < chunk_size`. For every example,
+it samples a clean action-prefix length from `0..rtc_training_max_delay`, assigns timestep zero to that prefix,
+and computes flow-matching loss only on the remaining postfix. ACP tagging still runs first and reaches the
+unchanged PI05 prompt tokenizer.
+
+Before choosing `rtc_training_max_delay`, start the inference server in the first terminal. Do not set
+`CUDA_VISIBLE_DEVICES` in this two-process mode: the profiling client will explicitly request `cuda:7`:
+
+```bash
+python -m lerobot.async_inference.policy_server \
+  --host=0.0.0.0 \
+  --port=8090 \
+  --fps=30 \
+  --inference_latency=0 \
+  --obs_queue_timeout=5
+```
+
+Then run the headless profiling client in a second terminal. It builds synthetic observations from the checkpoint
+features, discards every returned action, waits for three unrecorded warm-up requests, shows a 10-minute terminal
+countdown, and writes the distribution to `d.txt`:
+
+```bash
+lerobot-rtc-test-d \
+  --policy-path=<PI05_CHECKPOINT_OR_OUTPUT_DIR> \
+  --server-address=127.0.0.1:8090 \
+  --gpu-id=7 \
+  --duration-s=600 \
+  --fps=30 \
+  --output=d.txt
+```
+
+`--gpu-id=7` is sent to the server as `device=cuda:7`, so model loading and inference run on server GPU 7. If the
+server is on another machine, replace `127.0.0.1` with its IP address. The server remains running after the client
+finishes and can be stopped with Ctrl+C.
+
+Alternatively, the original one-command mode can start and stop a private local server automatically. In that mode,
+GPU 7 is isolated for the child server and appears there as `cuda:0`:
+
+```bash
+lerobot-rtc-test-d \
+  --policy-path=<PI05_CHECKPOINT_OR_OUTPUT_DIR> \
+  --gpu-id=7 \
+  --server-port=8090 \
+  --duration-s=600 \
+  --fps=30 \
+  --warmup-steps=3 \
+  --recommend-percentile=99 \
+  --safety-margin-steps=2 \
+  --output=d.txt
+```
+
+Model loading and warm-up happen before the 600-second timer. Each subsequent full
+serialization/preprocessing/inference/postprocessing round trip contributes one sample, where
+`d = ceil(end_to_end_latency_seconds * fps)`. No `Robot` is constructed and `robot.send_action()` is never called.
+In one-command mode the private server log is written to `d_server.log`; `d.txt` contains the histogram,
+p50/p90/p95/p99/p99.9/max, existing-checkpoint overflow rate, and suggested training `D`.
+
+For offline replay, pass measured values directly without opening a listener:
+
+```bash
+lerobot-rtc-test-d --chunk-size=50 --control-hz=30 --latency-ms 180 210 305 --json
+lerobot-rtc-test-d --chunk-size=50 --delay-steps 5 6 7 9 --json
+```
+
 Important checks:
 
 - `--acp.indicator_field` must exist in the dataset and be **binary (`0/1`)**.

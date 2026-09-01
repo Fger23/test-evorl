@@ -147,6 +147,10 @@ class RobotClientConfig:
     debug_visualize_queue_size: bool = field(
         default=False, metadata={"help": "Visualize the action queue size"}
     )
+    rtc_d_monitor_address: str = field(
+        default="",
+        metadata={"help": "Optional non-blocking RTC d telemetry destination in HOST:PORT form"},
+    )
 
     @property
     def environment_dt(self) -> float:
@@ -179,6 +183,11 @@ class RobotClientConfig:
         if self.actions_per_chunk <= 0:
             raise ValueError(f"actions_per_chunk must be positive, got {self.actions_per_chunk}")
 
+        if self.rtc_d_monitor_address:
+            from lerobot.policies.rtc.delay_telemetry import parse_udp_address
+
+            parse_udp_address(self.rtc_d_monitor_address)
+
         self.aggregate_fn = get_aggregate_function(self.aggregate_fn_name)
 
     @classmethod
@@ -199,5 +208,6 @@ class RobotClientConfig:
             "actions_per_chunk": self.actions_per_chunk,
             "task": self.task,
             "debug_visualize_queue_size": self.debug_visualize_queue_size,
+            "rtc_d_monitor_address": self.rtc_d_monitor_address,
             "aggregate_fn_name": self.aggregate_fn_name,
         }

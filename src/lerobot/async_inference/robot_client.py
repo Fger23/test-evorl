@@ -49,6 +49,7 @@ import torch
 
 from lerobot.cameras.opencv.configuration_opencv import OpenCVCameraConfig  # noqa: F401
 from lerobot.cameras.realsense.configuration_realsense import RealSenseCameraConfig  # noqa: F401
+from lerobot.policies.rtc.delay_telemetry import RTCDelayTelemetrySender
 from lerobot.robots import (  # noqa: F401
     Robot,
     RobotConfig,
@@ -122,6 +123,16 @@ class RobotClient:
         self.latest_action = -1
         self.action_chunk_size = -1
 
+        self.rtc_d_telemetry = (
+            RTCDelayTelemetrySender(
+                config.rtc_d_monitor_address,
+                control_hz=config.fps,
+                source="async_robot_client",
+            )
+            if config.rtc_d_monitor_address
+            else None
+        )
+
         self._chunk_size_threshold = config.chunk_size_threshold
 
         self.action_queue = Queue()
@@ -180,6 +191,8 @@ class RobotClient:
         self.logger.debug("Robot disconnected")
 
         self.channel.close()
+        if self.rtc_d_telemetry is not None:
+            self.rtc_d_telemetry.close()
         self.logger.debug("Client stopped, channel closed")
 
     def send_observation(
@@ -304,6 +317,17 @@ class RobotClient:
                     self.logger.debug(f"Actions kept on device: {client_device}")
 
                 self.action_chunk_size = max(self.action_chunk_size, len(timed_actions))
+
+                if timed_actions and self.rtc_d_telemetry is not None:
+                    with self.latest_action_lock:
+                        latest_action = self.latest_action
+                    self.rtc_d_telemetry.emit(
+                        observation_timestamp=timed_actions[0].get_timestamp(),
+                        receive_timestamp=receive_time,
+                        first_action_timestep=timed_actions[0].get_timestep(),
+                        latest_action_timestep=latest_action,
+                        metadata={"server_address": self.server_address},
+                    )
 
                 # Calculate network latency if we have matching observations
                 if len(timed_actions) > 0 and verbose:

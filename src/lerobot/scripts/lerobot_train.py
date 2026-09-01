@@ -16,6 +16,7 @@
 import dataclasses
 import logging
 import time
+from collections.abc import Callable
 from contextlib import nullcontext
 from pprint import pformat
 from typing import Any
@@ -154,6 +155,7 @@ def update_policy(
 def train(
     cfg: TrainPipelineConfig,
     accelerator: Accelerator | None = None,
+    config_validator: Callable[[TrainPipelineConfig], None] | None = None,
 ):
     """
     Main function to train a policy.
@@ -169,8 +171,11 @@ def train(
     Args:
         cfg: A `TrainPipelineConfig` object containing all training configurations.
         accelerator: Optional Accelerator instance. If None, one will be created automatically.
+        config_validator: Optional entrypoint-specific validation applied after the shared config validation.
     """
     cfg.validate()
+    if config_validator is not None:
+        config_validator(cfg)
     acp_raw_batch_hook = build_acp_raw_batch_hook(cfg.acp, cfg.seed)
 
     # Create Accelerator if not provided

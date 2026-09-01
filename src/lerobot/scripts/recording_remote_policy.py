@@ -18,6 +18,7 @@ This adapter talks to ``lerobot.async_inference.policy_server`` but leaves robot
 control and dataset writing inside ``recording_loop.py`` so human-in-loop
 takeover semantics stay in one place.
 """
+
 import logging
 import pickle  # nosec
 import threading
@@ -26,6 +27,8 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 import torch
+
+from lerobot.policies.rtc.delay_telemetry import RTCDelayTelemetrySender, parse_udp_address
 
 if TYPE_CHECKING:
     from lerobot.async_inference.helpers import TimedAction
@@ -57,6 +60,7 @@ class RemotePolicyRecordConfig:
     chunk_size_threshold: float = 0.0
     aggregate_fn_name: str = "latest_only"
     obs_queue_timeout_s: float = 10.0
+    rtc_d_monitor_address: str = ""
     rename_map: dict[str, str] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -81,6 +85,8 @@ class RemotePolicyRecordConfig:
             )
         if self.obs_queue_timeout_s < 0:
             raise ValueError("`remote_policy.obs_queue_timeout_s` must be non-negative.")
+        if self.rtc_d_monitor_address:
+            parse_udp_address(self.rtc_d_monitor_address)
 
 
 class RemotePolicyActionClient:
@@ -93,23 +99,32 @@ class RemotePolicyActionClient:
         self.cfg = cfg
         self.robot = robot
         self.environment_dt = 1 / fps
+        import grpc
+
         from lerobot.transport import services_pb2, services_pb2_grpc
         from lerobot.transport.utils import grpc_channel_options
-
-        import grpc
 
         self.services_pb2 = services_pb2
         self.channel = grpc.insecure_channel(
             cfg.server_address, grpc_channel_options(initial_backoff=f"{self.environment_dt:.4f}s")
         )
         self.stub = services_pb2_grpc.AsyncInferenceStub(self.channel)
-        self.action_queue: list["TimedAction"] = []
+        self.action_queue: list[TimedAction] = []
         self.latest_action_timestep = -1
         self.latest_action = None
         self.aggregate_fn = AGGREGATE_FUNCTIONS[cfg.aggregate_fn_name]
         self._state_lock = threading.Lock()
         self._request_thread: threading.Thread | None = None
         self._generation = 0
+        self.rtc_d_telemetry = (
+            RTCDelayTelemetrySender(
+                cfg.rtc_d_monitor_address,
+                control_hz=fps,
+                source="recording_remote_policy",
+            )
+            if cfg.rtc_d_monitor_address
+            else None
+        )
 
     @property
     def _rpc_timeout_s(self) -> float:
@@ -136,6 +151,8 @@ class RemotePolicyActionClient:
 
     def stop(self) -> None:
         self.channel.close()
+        if self.rtc_d_telemetry is not None:
+            self.rtc_d_telemetry.close()
 
     def reset(self) -> None:
         self._wait_for_background_request()
@@ -193,7 +210,19 @@ class RemotePolicyActionClient:
                 timeout=rpc_timeout_s,
             )
             if actions_chunk.data:
+                receive_time = time.time()
                 timed_actions = pickle.loads(actions_chunk.data)  # nosec
+                telemetry = getattr(self, "rtc_d_telemetry", None)
+                if timed_actions and telemetry is not None:
+                    with self._state_lock:
+                        latest_action_timestep = self.latest_action_timestep
+                    telemetry.emit(
+                        observation_timestamp=timed_actions[0].get_timestamp(),
+                        receive_timestamp=receive_time,
+                        first_action_timestep=timed_actions[0].get_timestep(),
+                        latest_action_timestep=latest_action_timestep,
+                        metadata={"server_address": self.cfg.server_address},
+                    )
                 self._merge_actions(timed_actions, generation=generation)
                 return
 
@@ -311,7 +340,9 @@ class RemotePolicyActionClient:
             if request_thread is not None:
                 request_thread.join(timeout=self._rpc_timeout_s + self.environment_dt)
                 if request_thread.is_alive():
-                    logging.warning("Remote policy action queue is empty; still waiting for in-flight inference.")
+                    logging.warning(
+                        "Remote policy action queue is empty; still waiting for in-flight inference."
+                    )
                 continue
 
             try:

@@ -1,0 +1,19 @@
+python -m pip install -e . --no-deps
+
+$env:CUDA_DEVICE_ORDER = "PCI_BUS_ID"
+Remove-Item Env:CUDA_VISIBLE_DEVICES -ErrorAction SilentlyContinue
+
+python -m lerobot.async_inference.policy_server `
+  --host=0.0.0.0 `
+  --port=8090 `
+  --fps=30 `
+  --inference_latency=0 `
+  --obs_queue_timeout=5
+
+  lerobot-rtc-test-d `
+  --policy-path="你的PI05检查点绝对路径" `
+  --server-address=127.0.0.1:8090 `
+  --gpu-id=7 `
+  --duration-s=600 `
+  --fps=30 `
+  --output=d.txt

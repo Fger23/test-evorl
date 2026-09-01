@@ -58,6 +58,93 @@ class ActionSelectKwargs(TypedDict, total=False):
     execution_horizon: int | None
 
 
+def _sample_training_rtc_prefix_mask(
+    batch_size: int,
+    action_horizon: int,
+    max_delay: int,
+    device: torch.device,
+) -> Tensor | None:
+    """Sample an independent clean-prefix length for each training example."""
+    if max_delay <= 0:
+        return None
+    if max_delay >= action_horizon:
+        raise ValueError(
+            f"Training-Time RTC max_delay ({max_delay}) must be smaller than action_horizon ({action_horizon})."
+        )
+    delays = torch.randint(0, max_delay + 1, (batch_size,), device=device)
+    positions = torch.arange(action_horizon, device=device)
+    return positions.unsqueeze(0) < delays.unsqueeze(1)
+
+
+def _build_flow_matching_inputs(
+    actions: Tensor,
+    noise: Tensor,
+    time: Tensor,
+    prefix_mask: Tensor | None,
+) -> tuple[Tensor, Tensor]:
+    """Keep the sampled RTC prefix clean while noising the remaining action chunk."""
+    if prefix_mask is None:
+        model_time = time
+        expanded_time = time[:, None, None]
+    else:
+        if prefix_mask.shape != actions.shape[:2]:
+            raise ValueError(
+                f"RTC prefix mask must have shape {tuple(actions.shape[:2])}, got {tuple(prefix_mask.shape)}."
+            )
+        model_time = time[:, None].expand_as(prefix_mask)
+        model_time = torch.where(prefix_mask, torch.zeros_like(model_time), model_time)
+        expanded_time = model_time.unsqueeze(-1)
+
+    x_t = expanded_time * noise + (1 - expanded_time) * actions
+    return x_t, model_time
+
+
+def _reduce_training_rtc_loss(
+    losses: Tensor,
+    prefix_mask: Tensor | None,
+    reduction: str,
+) -> Tensor:
+    """Average flow loss over the predicted postfix, excluding the clean RTC prefix."""
+    if reduction not in {"mean", "none"}:
+        raise ValueError(f"Unsupported loss reduction: {reduction!r}")
+    if prefix_mask is None:
+        return losses.mean() if reduction == "mean" else losses.mean(dim=(1, 2))
+
+    postfix_mask = (~prefix_mask).unsqueeze(-1).expand_as(losses)
+    if reduction == "none":
+        numerator = (losses * postfix_mask).sum(dim=(1, 2))
+        denominator = postfix_mask.sum(dim=(1, 2))
+        return numerator / denominator.clamp(min=1)
+    return (losses * postfix_mask).sum() / postfix_mask.sum().clamp(min=1)
+
+
+def _apply_adarms_norm(norm: nn.Module, x: Tensor, cond: Tensor | None) -> tuple[Tensor, Tensor | None]:
+    """Apply the patched Gemma AdaRMS norm with scalar or per-action conditioning.
+
+    The transformers branch used by this checkout supports ``(B, D)`` conditions but
+    unconditionally inserts a token axis. Training-time RTC supplies ``(B, T, D)``
+    conditions, so that form is evaluated here without the extra unsqueeze.
+    """
+    dense = getattr(norm, "dense", None)
+    if cond is None or dense is None or cond.ndim == 2:
+        return norm(x, cond=cond)
+    if cond.ndim != 3:
+        raise ValueError(f"AdaRMS condition must have shape (B, D) or (B, T, D), got {tuple(cond.shape)}")
+    if x.ndim != 3 or cond.shape[:2] != x.shape[:2]:
+        raise ValueError(
+            f"Per-token AdaRMS condition shape {tuple(cond.shape[:2])} must match input {tuple(x.shape[:2])}."
+        )
+
+    cond_dim = getattr(norm, "cond_dim", dense.in_features)
+    if cond.shape[-1] != cond_dim:
+        raise ValueError(f"Expected AdaRMS condition dimension {cond_dim}, got {cond.shape[-1]}")
+
+    normed = norm._norm(x)  # noqa: SLF001 - mirrors the patched transformers implementation
+    scale, shift, gate = dense(cond).chunk(3, dim=-1)
+    normed = normed * (1 + scale.float()) + shift.float()
+    return normed.to(x.dtype), gate.to(x.dtype)
+
+
 def get_safe_dtype(target_dtype, device_type):
     """Get a safe dtype for the given device type."""
     if device_type == "mps" and target_dtype == torch.float64:
@@ -74,21 +161,20 @@ def get_safe_dtype(target_dtype, device_type):
 def create_sinusoidal_pos_embedding(  # see openpi `create_sinusoidal_pos_embedding` (exact copy)
     time: torch.Tensor, dimension: int, min_period: float, max_period: float, device="cpu"
 ) -> Tensor:
-    """Computes sine-cosine positional embedding vectors for scalar positions."""
+    """Compute sine-cosine embeddings for scalar or per-action positions."""
     if dimension % 2 != 0:
         raise ValueError(f"dimension ({dimension}) must be divisible by 2")
 
-    if time.ndim != 1:
-        raise ValueError("The time tensor is expected to be of shape `(batch_size, )`.")
+    if time.ndim not in (1, 2):
+        raise ValueError("The time tensor must have shape (batch_size,) or (batch_size, action_horizon).")
 
     dtype = get_safe_dtype(torch.float64, device.type)
     fraction = torch.linspace(0.0, 1.0, dimension // 2, dtype=dtype, device=device)
     period = min_period * (max_period / min_period) ** fraction
 
-    # Compute the outer product
     scaling_factor = 1.0 / period * 2 * math.pi
-    sin_input = scaling_factor[None, :] * time[:, None]
-    return torch.cat([torch.sin(sin_input), torch.cos(sin_input)], dim=1)
+    sin_input = time[..., None] * scaling_factor
+    return torch.cat([torch.sin(sin_input), torch.cos(sin_input)], dim=-1)
 
 
 def sample_beta(alpha, beta, bsize, device):  # see openpi `sample_beta` (exact copy)
@@ -226,7 +312,9 @@ def compute_layer_complete(
     gates = []
     for i, hidden_states in enumerate(inputs_embeds):
         layer = models[i].layers[layer_idx]
-        hidden_states, gate = layer.input_layernorm(hidden_states, cond=adarms_cond[i])  # noqa: PLW2901
+        hidden_states, gate = _apply_adarms_norm(  # noqa: PLW2901
+            layer.input_layernorm, hidden_states, adarms_cond[i]
+        )
         gates.append(gate)
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, layer.self_attn.head_dim)
@@ -277,7 +365,7 @@ def compute_layer_complete(
         # first residual
         out_emb = modeling_gemma._gated_residual(hidden_states, out_emb, gates[i])  # noqa: SLF001
         after_first_residual = out_emb.clone()
-        out_emb, gate = layer.post_attention_layernorm(out_emb, cond=adarms_cond[i])
+        out_emb, gate = _apply_adarms_norm(layer.post_attention_layernorm, out_emb, adarms_cond[i])
         # Convert to bfloat16 if the next layer (mlp) uses bfloat16
         if layer.mlp.up_proj.weight.dtype == torch.bfloat16:
             out_emb = out_emb.to(dtype=torch.bfloat16)
@@ -508,7 +596,7 @@ class PaliGemmaWithExpertModel(
             def compute_final_norms(inputs_embeds, adarms_cond):
                 outputs_embeds = []
                 for i, hidden_states in enumerate(inputs_embeds):
-                    out_emb, _ = models[i].norm(hidden_states, cond=adarms_cond[i])
+                    out_emb, _ = _apply_adarms_norm(models[i].norm, hidden_states, adarms_cond[i])
                     outputs_embeds.append(out_emb)
                 return outputs_embeds
 
@@ -721,7 +809,17 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
         return embs, pad_masks, att_masks, adarms_cond
 
-    def forward(self, images, img_masks, tokens, masks, actions, noise=None, time=None) -> Tensor:
+    def forward(
+        self,
+        images,
+        img_masks,
+        tokens,
+        masks,
+        actions,
+        noise=None,
+        time=None,
+        prefix_mask: Tensor | None = None,
+    ) -> Tensor:
         """Do a full training forward pass and compute the loss."""
         if noise is None:
             noise = self.sample_noise(actions.shape, actions.device)
@@ -729,12 +827,11 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         if time is None:
             time = self.sample_time(actions.shape[0], actions.device)
 
-        time_expanded = time[:, None, None]
-        x_t = time_expanded * noise + (1 - time_expanded) * actions
+        x_t, model_time = _build_flow_matching_inputs(actions, noise, time, prefix_mask)
         u_t = noise - actions
 
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, tokens, masks)
-        suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(x_t, time)
+        suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(x_t, model_time)
 
         if (
             self.paligemma_with_expert.paligemma.language_model.layers[0].self_attn.q_proj.weight.dtype
@@ -1328,28 +1425,39 @@ class PI05Policy(PreTrainedPolicy):
         tokens, masks = batch[f"{OBS_LANGUAGE_TOKENS}"], batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
 
         actions = self.prepare_action(batch)
+        prefix_mask = _sample_training_rtc_prefix_mask(
+            batch_size=actions.shape[0],
+            action_horizon=actions.shape[1],
+            max_delay=self.config.rtc_training_max_delay,
+            device=actions.device,
+        )
 
         # Compute loss (no separate state needed for PI05)
-        losses = self.model.forward(images, img_masks, tokens, masks, actions)
+        losses = self.model.forward(images, img_masks, tokens, masks, actions, prefix_mask=prefix_mask)
 
         # Truncate losses to actual action dimensions
         original_action_dim = self.config.output_features[ACTION].shape[0]
         losses = losses[:, :, :original_action_dim]
 
+        if prefix_mask is None:
+            loss_per_dim = losses.mean(dim=(0, 1))
+        else:
+            postfix_mask = (~prefix_mask).unsqueeze(-1).expand_as(losses)
+            loss_per_dim = (losses * postfix_mask).sum(dim=(0, 1)) / postfix_mask.sum(dim=(0, 1)).clamp(min=1)
         loss_dict = {
-            "loss_per_dim": losses.mean(dim=[0, 1]).detach().cpu().numpy().tolist(),
+            "loss_per_dim": loss_per_dim.detach().cpu().numpy().tolist(),
         }
+        if prefix_mask is not None:
+            loss_dict["rtc_prefix_length"] = prefix_mask.sum(dim=1).float().mean().item()
 
         if reduction == "none":
-            # Return per-sample losses (B,) by averaging over time and action dims
-            per_sample_loss = losses.mean(dim=(1, 2))
+            per_sample_loss = _reduce_training_rtc_loss(losses, prefix_mask, reduction="none")
             loss_dict["loss"] = per_sample_loss.mean().item()
             return per_sample_loss, loss_dict
-        else:
-            # Default: return scalar mean loss
-            loss = losses.mean()
-            loss_dict["loss"] = loss.item()
-            return loss, loss_dict
+
+        loss = _reduce_training_rtc_loss(losses, prefix_mask, reduction="mean")
+        loss_dict["loss"] = loss.item()
+        return loss, loss_dict
 
     def _get_default_peft_targets(self) -> dict[str, any]:
         """Return default PEFT target modules for PI0.5 fine-tuning."""
