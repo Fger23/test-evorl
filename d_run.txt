@@ -7,7 +7,11 @@
 # Terminal 1: H200 policy server
 # ============================================================
 
-cd ~/Evo-RL
+cd ~/training-rtc/Evo-RL
+
+# Environment installed at ~/miniforge3 (visible to user baiyuntian only).
+source ~/miniforge3/etc/profile.d/conda.sh
+conda activate evo-rl
 
 export CUDA_DEVICE_ORDER=PCI_BUS_ID
 unset CUDA_VISIBLE_DEVICES
@@ -31,19 +35,22 @@ cd ~/code/Evo-RL
 
 # Replace these two values before running.
 # PI05_POLICY must be accessible to both the client and server.
-export RTC_SERVER_IP="REPLACE_WITH_H200_SERVER_IP"
-export PI05_POLICY="REPLACE_WITH_PI05_CHECKPOINT_OR_HF_REPO"
+export RTC_SERVER_IP="10.61.5.3"
+export PI05_POLICY="/nfs/lerobot/s101/models/evo/so101/policy/banknote_binding_0805_06_pi05/checkpoints/last/pretrained_model"
 
 # Optional connectivity check:
 nc -vz "$RTC_SERVER_IP" 8090
 
-PYTHONPATH="$PWD/src" python -m lerobot.scripts.lerobot_rtc_test_d \
+
+  PYTHONPATH="$PWD/src" python -m lerobot.scripts.lerobot_rtc_test_d \
   --pretrained_name_or_path="$PI05_POLICY" \
   --server_address="$RTC_SERVER_IP:8090" \
   --policy_device=cuda:7 \
   --duration-s=600 \
   --fps=30 \
-  --output=d.txt
+  --chunk-size=50 \
+  --state-dim=12 \
+  --camera-keys=left_fixed,left_wrist,right_wrist
 
 # The 10-minute timer starts after model loading and 3 warm-up requests.
 # The final distribution is written to: ./d.txt
