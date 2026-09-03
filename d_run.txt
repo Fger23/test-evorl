@@ -55,3 +55,79 @@ nc -vz "$RTC_SERVER_IP" 8090
 # The 10-minute timer starts after model loading and 3 warm-up requests.
 # The final distribution is written to: ./d.txt
 # Stop the server with Ctrl+C after profiling finishes.
+
+
+# ============================================================
+# ACP + Training-Time RTC training (Linux / Bash, H200 GPU 7)
+# ============================================================
+# These commands run locally on the H200 training server.
+# No policy server, profiling client, or robot connection is needed.
+
+cd ~/training-rtc/Evo-RL
+source ~/miniforge3/etc/profile.d/conda.sh
+conda activate evo-rl
+
+# Run once after pulling the code. This installs the pinned PI0.5 Transformers
+# dependency and registers lerobot-train-trc-smoke.
+pip install -e ".[pi]"
+
+
+# ------------------------------------------------------------
+# 1. Real PI0.5 short training smoke test: 20 optimizer steps
+# ------------------------------------------------------------
+# The output directory contains a timestamp so repeated tests do not collide.
+
+export TRC_SMOKE_OUTPUT="outputs/train/banknote_binding_trc_smoke_$(date +%Y%m%d_%H%M%S)"
+
+CUDA_VISIBLE_DEVICES=7 lerobot-train-trc-smoke \
+  --dataset.repo_id=banknote_binding_iteration_1 \
+  --dataset.root=/nfs/lerobot/s101/datasets/aggregation/evo-rl/banknote_binding_iteration_1/ \
+  --policy.type=pi05 \
+  --policy.pretrained_path=/nfs/zxlong10/models/lerobot/pi05_base/ \
+  --policy.rtc_training_max_delay=37 \
+  --policy.freeze_vision_encoder=false \
+  --policy.train_expert_only=false \
+  --policy.device=cuda \
+  --policy.dtype=bfloat16 \
+  --batch_size=1 \
+  --steps=20 \
+  --num_workers=0 \
+  --acp.enable=true \
+  --acp.indicator_field=complementary_info.acp_indicator \
+  --acp.indicator_dropout_prob=0.3 \
+  --save_checkpoint=false \
+  --output_dir="$TRC_SMOKE_OUTPUT" \
+  --job_name=banknote_binding_trc_smoke
+
+# Success marker:
+# TRC_SHORT_TRAIN: PASS (20 optimizer steps completed with finite non-zero gradients)
+
+
+# ------------------------------------------------------------
+# 2. Formal ACP + Training-Time RTC training
+# ------------------------------------------------------------
+# Run this only after the short test prints TRC_SHORT_TRAIN: PASS.
+# The output directory must not already exist unless intentionally resuming.
+
+CUDA_VISIBLE_DEVICES=7 lerobot-train-trc \
+  --dataset.repo_id=banknote_binding_iteration_1 \
+  --dataset.root=/nfs/lerobot/s101/datasets/aggregation/evo-rl/banknote_binding_iteration_1/ \
+  --policy.type=pi05 \
+  --policy.pretrained_path=/nfs/zxlong10/models/lerobot/pi05_base/ \
+  --policy.rtc_training_max_delay=37 \
+  --policy.freeze_vision_encoder=false \
+  --policy.train_expert_only=false \
+  --policy.device=cuda \
+  --policy.dtype=bfloat16 \
+  --batch_size=8 \
+  --steps=160000 \
+  --save_checkpoint=true \
+  --save_freq=40000 \
+  --num_workers=4 \
+  --acp.enable=true \
+  --acp.indicator_field=complementary_info.acp_indicator \
+  --acp.indicator_dropout_prob=0.3 \
+  --output_dir=/nfs/lerobot/s101/models/evo/so101/policy/banknote_binding_iteration_1_pi05_trc_d37 \
+  --job_name=banknote_binding_pi05_trc_d37 \
+  --wandb.enable=false \
+  --policy.push_to_hub=false

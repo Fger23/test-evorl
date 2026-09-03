@@ -483,6 +483,34 @@ it samples a clean action-prefix length from `0..rtc_training_max_delay`, assign
 and computes flow-matching loss only on the remaining postfix. ACP tagging still runs first and reaches the
 unchanged PI05 prompt tokenizer.
 
+Before a long run, use the bounded real-model smoke trainer. It runs the same dataset, PI05 checkpoint,
+ACP tokenizer, RTC loss, backward pass, and optimizer update as formal training, but rejects more than 1,000
+steps, disables environment evaluation/W&B/Hub upload, validates the entire ACP indicator column before loading
+the policy, and stops immediately on non-finite loss/gradients or zero gradients:
+
+```bash
+CUDA_VISIBLE_DEVICES=7 lerobot-train-trc-smoke \
+  --dataset.repo_id=<DATASET_NAME> \
+  --dataset.root=<DATASET_ROOT> \
+  --policy.type=pi05 \
+  --policy.pretrained_path=<PI05_PRETRAINED_PATH> \
+  --policy.rtc_training_max_delay=37 \
+  --policy.device=cuda \
+  --policy.dtype=bfloat16 \
+  --batch_size=1 \
+  --steps=20 \
+  --num_workers=0 \
+  --acp.enable=true \
+  --acp.indicator_field=complementary_info.acp_indicator \
+  --acp.indicator_dropout_prob=0.3 \
+  --save_checkpoint=false \
+  --output_dir=outputs/train/trc_smoke \
+  --job_name=trc_smoke
+```
+
+Success ends with `TRC_SHORT_TRAIN: PASS`. This is a real weight-update test but does not contact or move a
+robot. Use a new/nonexistent `output_dir` for every run.
+
 Before choosing `rtc_training_max_delay`, start the inference server in the first terminal. Do not set
 `CUDA_VISIBLE_DEVICES` in this two-process mode: the profiling client will explicitly request `cuda:7`:
 

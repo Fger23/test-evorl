@@ -67,6 +67,28 @@ def test_acp_hook_dropout_keeps_original_task():
     assert out["task"] == ["pick bottle", "place bottle"]
 
 
+def test_acp_hook_dropout_is_identical_after_resume_at_same_step():
+    cfg = ACPConfig(
+        enable=True,
+        indicator_field="complementary_info.acp_indicator",
+        indicator_dropout_prob=0.5,
+    )
+    batch = {
+        "task": [f"task {i}" for i in range(32)],
+        "index": torch.arange(100, 132),
+        "complementary_info.acp_indicator": torch.tensor([i % 2 for i in range(32)]),
+    }
+
+    uninterrupted_hook = build_acp_raw_batch_hook(cfg, seed=42)
+    resumed_hook = build_acp_raw_batch_hook(cfg, seed=42)
+    uninterrupted = uninterrupted_hook({key: value.copy() if isinstance(value, list) else value for key, value in batch.items()}, 17)
+    resumed = resumed_hook({key: value.copy() if isinstance(value, list) else value for key, value in batch.items()}, 17)
+
+    assert uninterrupted["task"] == resumed["task"]
+    assert any("Advantage:" in task for task in uninterrupted["task"])
+    assert any("Advantage:" not in task for task in uninterrupted["task"])
+
+
 def test_acp_hook_missing_indicator_skips():
     hook = build_acp_raw_batch_hook(
         ACPConfig(enable=True, indicator_field="missing_field"),

@@ -14,7 +14,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import random
+import hashlib
+import os
 from collections.abc import Callable
 from typing import Any
 
@@ -48,14 +49,43 @@ class ACPPromptHook:
     def __init__(self, cfg: ACPConfig, seed: int | None):
         self.indicator_field = cfg.indicator_field
         self.dropout = cfg.indicator_dropout_prob
-        self.rng = random.Random(seed if seed is not None else 0)
+        self.seed = seed if seed is not None else 0
+
+    @staticmethod
+    def _distributed_rank() -> int:
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            return torch.distributed.get_rank()
+        return int(os.environ.get("RANK", "0"))
+
+    def _sample_key(self, batch: dict[str, Any], sample_index: int) -> str:
+        indices = batch.get("index")
+        if isinstance(indices, torch.Tensor) and indices.numel() > sample_index:
+            return str(indices.reshape(-1)[sample_index].item())
+        return f"rank={self._distributed_rank()}:position={sample_index}"
+
+    def _drop_indicator(self, *, step: int, sample_index: int, sample_key: str) -> bool:
+        """Make ACP dropout deterministic across checkpoint resume.
+
+        The old implementation owned a mutable ``random.Random`` instance whose state was
+        not part of the training checkpoint. Deriving each draw from stable training
+        coordinates removes that hidden state while retaining independent sample dropout.
+        """
+        if self.dropout <= 0.0:
+            return False
+        if self.dropout >= 1.0:
+            return True
+
+        payload = f"{self.seed}:{step}:{sample_index}:{sample_key}".encode()
+        digest = hashlib.blake2b(payload, digest_size=8, person=b"lerobot-acp").digest()
+        draw = int.from_bytes(digest, byteorder="big") / 2**64
+        return draw < self.dropout
 
     def _resolve_indicators(self, batch: dict[str, Any], batch_size: int) -> list[bool]:
         if self.indicator_field not in batch:
             raise KeyError(f"ACP indicator field '{self.indicator_field}' is missing from batch.")
         return _extract_indicators(batch[self.indicator_field], batch_size)
 
-    def __call__(self, batch: Any, _: int) -> Any:
+    def __call__(self, batch: Any, step: int) -> Any:
         if not isinstance(batch, dict):
             raise TypeError(f"ACP batch must be dict, got {type(batch).__name__}.")
         if "task" not in batch:
@@ -70,8 +100,9 @@ class ACPPromptHook:
         indicators = self._resolve_indicators(batch, len(tasks))
 
         conditioned_tasks: list[str] = []
-        for task, is_positive in zip(tasks, indicators, strict=True):
-            if self.dropout > 0.0 and self.rng.random() < self.dropout:
+        for sample_index, (task, is_positive) in enumerate(zip(tasks, indicators, strict=True)):
+            sample_key = self._sample_key(batch, sample_index)
+            if self._drop_indicator(step=step, sample_index=sample_index, sample_key=sample_key):
                 conditioned_tasks.append(task)
                 continue
             conditioned_tasks.append(build_acp_tagged_task(task, is_positive=is_positive))

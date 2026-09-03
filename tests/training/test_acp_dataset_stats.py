@@ -2,7 +2,9 @@
 
 from types import SimpleNamespace
 
-from lerobot.rl.acp_dataset_stats import compute_acp_indicator_stats
+import pytest
+
+from lerobot.rl.acp_dataset_stats import compute_acp_indicator_stats, validate_acp_training_dataset
 
 
 class DummyHFDataset:
@@ -12,6 +14,19 @@ class DummyHFDataset:
 
     def __getitem__(self, key: str):
         return self._columns[key]
+
+
+class DummyTrainingDataset:
+    def __init__(self, columns: dict[str, list], *, task="pick", include_task=True):
+        self.hf_dataset = DummyHFDataset(columns)
+        self.task = task
+        self.include_task = include_task
+
+    def __getitem__(self, index: int):
+        item = {"index": index}
+        if self.include_task:
+            item["task"] = self.task
+        return item
 
 
 def test_compute_acp_indicator_stats_from_meta_stats():
@@ -86,3 +101,40 @@ def test_compute_acp_indicator_stats_prefers_meta_stats():
     assert stats.positive_ratio == 0.75
     assert stats.total_count == 8
     assert stats.positive_count == 6
+
+
+def test_validate_acp_training_dataset_accepts_scalar_integer_binary_column():
+    field = "complementary_info.acp_indicator"
+    dataset = DummyTrainingDataset({field: [0, 1, 0, 1]})
+
+    stats = validate_acp_training_dataset(dataset, field)
+
+    assert stats.source == "strict_hf_dataset_scan"
+    assert stats.total_count == 4
+    assert stats.positive_count == 2
+
+
+@pytest.mark.parametrize(
+    ("values", "exception", "message"),
+    [
+        ([0.0, 1.0], TypeError, "integer scalars"),
+        ([[0], [1]], ValueError, "one scalar per frame"),
+        ([0, 2], ValueError, "only 0/1"),
+        ([1, 1], ValueError, "both 0"),
+        ([], ValueError, "empty"),
+    ],
+)
+def test_validate_acp_training_dataset_rejects_invalid_annotations(values, exception, message):
+    field = "complementary_info.acp_indicator"
+    dataset = DummyTrainingDataset({field: values})
+
+    with pytest.raises(exception, match=message):
+        validate_acp_training_dataset(dataset, field)
+
+
+def test_validate_acp_training_dataset_rejects_missing_task():
+    field = "complementary_info.acp_indicator"
+    dataset = DummyTrainingDataset({field: [0, 1]}, include_task=False)
+
+    with pytest.raises(KeyError, match="task"):
+        validate_acp_training_dataset(dataset, field)

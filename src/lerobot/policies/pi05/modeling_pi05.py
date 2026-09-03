@@ -1448,7 +1448,10 @@ class PI05Policy(PreTrainedPolicy):
             "loss_per_dim": loss_per_dim.detach().cpu().numpy().tolist(),
         }
         if prefix_mask is not None:
-            loss_dict["rtc_prefix_length"] = prefix_mask.sum(dim=1).float().mean().item()
+            prefix_lengths = prefix_mask.sum(dim=1)
+            loss_dict["rtc_prefix_length"] = prefix_lengths.float().mean().item()
+            loss_dict["rtc_prefix_length_min"] = prefix_lengths.min().item()
+            loss_dict["rtc_prefix_length_max"] = prefix_lengths.max().item()
 
         if reduction == "none":
             per_sample_loss = _reduce_training_rtc_loss(losses, prefix_mask, reduction="none")

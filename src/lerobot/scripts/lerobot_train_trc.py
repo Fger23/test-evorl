@@ -17,9 +17,11 @@
 """ACP-conditioned PI05 training with Training-Time Real-Time Chunking."""
 
 import logging
+from typing import Any
 
 from lerobot.configs import parser
 from lerobot.configs.train import TrainPipelineConfig
+from lerobot.rl.acp_dataset_stats import validate_acp_training_dataset
 from lerobot.scripts.lerobot_train import train
 from lerobot.utils.import_utils import register_third_party_plugins
 
@@ -39,6 +41,10 @@ def validate_trc_training_config(cfg: TrainPipelineConfig) -> None:
         raise ValueError(
             "lerobot-train-trc requires --acp.enable=true so ACP prompt conditioning is preserved."
         )
+    if cfg.acp.indicator_dropout_prob >= 1.0:
+        raise ValueError(
+            "lerobot-train-trc requires --acp.indicator_dropout_prob<1 so at least some Advantage prompts remain."
+        )
 
     logging.info(
         "TRC training enabled: policy=pi05 rtc_training_max_delay=%d acp_indicator_field=%s "
@@ -49,10 +55,19 @@ def validate_trc_training_config(cfg: TrainPipelineConfig) -> None:
     )
 
 
+def validate_trc_training_dataset(dataset: Any, cfg: TrainPipelineConfig) -> None:
+    """Fail before policy creation when the ACP annotations cannot train both prompts."""
+    validate_acp_training_dataset(dataset, cfg.acp.indicator_field, require_both_classes=True)
+
+
 @parser.wrap()
 def train_trc(cfg: TrainPipelineConfig):
     """Run the shared trainer after enforcing ACP plus Training-Time RTC."""
-    return train(cfg, config_validator=validate_trc_training_config)
+    return train(
+        cfg,
+        config_validator=validate_trc_training_config,
+        dataset_validator=validate_trc_training_dataset,
+    )
 
 
 def main():

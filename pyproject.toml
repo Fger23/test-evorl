@@ -135,7 +135,8 @@ wallx = [
     "torchdiffeq==0.2.5",
     "qwen_vl_utils==0.0.11"
 ]
-pi = ["transformers @ git+https://github.com/huggingface/transformers.git@fix/lerobot_openpi", "scipy>=1.10.1,<1.15"]
+# Keep the custom AdaRMSNorm API used by PI0/PI0.5 reproducible; do not replace this with a moving branch.
+pi = ["transformers @ git+https://github.com/huggingface/transformers.git@dcddb970176382c0fcf4521b0c0e6fc15894dfe0", "scipy>=1.10.1,<1.15"]
 smolvla = ["lerobot[transformers-dep]", "num2words>=0.5.14,<0.6.0", "accelerate>=1.7.0,<2.0.0", "safetensors>=0.4.3,<1.0.0"]
 groot = [
     "lerobot[transformers-dep]",
@@ -206,6 +207,7 @@ lerobot-teleoperate="lerobot.scripts.lerobot_teleoperate:main"
 lerobot-eval="lerobot.scripts.lerobot_eval:main"
 lerobot-train="lerobot.scripts.lerobot_train:main"
 lerobot-train-trc="lerobot.scripts.lerobot_train_trc:main"
+lerobot-train-trc-smoke="lerobot.scripts.lerobot_train_trc_smoke:main"
 lerobot-rtc-test-d="lerobot.scripts.lerobot_rtc_test_d:main"
 lerobot-train-tokenizer="lerobot.scripts.lerobot_train_tokenizer:main"
 lerobot-dataset-viz="lerobot.scripts.lerobot_dataset_viz:main"

@@ -140,7 +140,7 @@ teleop<0.2.0,>=0.1.0
 fastapi<1.0
 
 [pi]
-transformers @ git+https://github.com/huggingface/transformers.git@fix/lerobot_openpi
+transformers @ git+https://github.com/huggingface/transformers.git@dcddb970176382c0fcf4521b0c0e6fc15894dfe0
 scipy<1.15,>=1.10.1
 
 [placo-dep]

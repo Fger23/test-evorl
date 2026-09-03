@@ -67,6 +67,7 @@ def update_policy(
     lr_scheduler=None,
     lock=None,
     rabc_weights_provider=None,
+    fail_on_nonfinite: bool = False,
 ) -> tuple[MetricsTracker, dict]:
     """
     Performs a single training step to update the policy's weights.
@@ -119,6 +120,9 @@ def update_policy(
 
         # TODO(rcadene): policy.unnormalize_outputs(out_dict)
 
+    if fail_on_nonfinite and not torch.isfinite(loss.detach()).all():
+        raise FloatingPointError(f"Training loss is non-finite: {loss.detach().cpu()!r}")
+
     # Use accelerator's backward method
     accelerator.backward(loss)
 
@@ -129,6 +133,13 @@ def update_policy(
         grad_norm = torch.nn.utils.clip_grad_norm_(
             policy.parameters(), float("inf"), error_if_nonfinite=False
         )
+
+    if fail_on_nonfinite:
+        detached_grad_norm = torch.as_tensor(grad_norm).detach()
+        if not torch.isfinite(detached_grad_norm).all():
+            raise FloatingPointError(f"Training gradient norm is non-finite: {detached_grad_norm.cpu()!r}")
+        if detached_grad_norm.item() <= 0.0:
+            raise RuntimeError("Training gradient norm is zero; no learnable parameter received a useful gradient.")
 
     # Optimizer step
     with lock if lock is not None else nullcontext():
@@ -156,6 +167,8 @@ def train(
     cfg: TrainPipelineConfig,
     accelerator: Accelerator | None = None,
     config_validator: Callable[[TrainPipelineConfig], None] | None = None,
+    dataset_validator: Callable[[Any, TrainPipelineConfig], None] | None = None,
+    fail_on_nonfinite: bool = False,
 ):
     """
     Main function to train a policy.
@@ -172,6 +185,8 @@ def train(
         cfg: A `TrainPipelineConfig` object containing all training configurations.
         accelerator: Optional Accelerator instance. If None, one will be created automatically.
         config_validator: Optional entrypoint-specific validation applied after the shared config validation.
+        dataset_validator: Optional entrypoint-specific dataset validation performed before policy creation.
+        fail_on_nonfinite: Stop before the optimizer update on non-finite loss/gradients or zero gradients.
     """
     cfg.validate()
     if config_validator is not None:
@@ -222,42 +237,46 @@ def train(
     if is_main_process:
         logging.info("Creating dataset")
         dataset = make_dataset(cfg)
-        if cfg.acp.enable:
-            indicator_stats = compute_acp_indicator_stats(dataset, cfg.acp.indicator_field)
-            if indicator_stats is None:
-                logging.warning(
-                    "ACP is enabled but indicator statistics are unavailable for field '%s'.",
-                    cfg.acp.indicator_field,
-                )
-            else:
-                if indicator_stats.total_count >= 0:
-                    logging.info(
-                        "ACP indicator stats (%s): field='%s' ratio=%.6f positive=%d total=%d",
-                        indicator_stats.source,
-                        indicator_stats.indicator_field,
-                        indicator_stats.positive_ratio,
-                        indicator_stats.positive_count,
-                        indicator_stats.total_count,
-                    )
-                else:
-                    logging.info(
-                        "ACP indicator stats (%s): field='%s' ratio=%.6f",
-                        indicator_stats.source,
-                        indicator_stats.indicator_field,
-                        indicator_stats.positive_ratio,
-                    )
-                if indicator_stats.invalid_count > 0:
-                    logging.warning(
-                        "ACP indicator field '%s' contains %d non-binary values (expected only 0/1).",
-                        indicator_stats.indicator_field,
-                        indicator_stats.invalid_count,
-                    )
 
     accelerator.wait_for_everyone()
 
     # Now all other processes can safely load the dataset
     if not is_main_process:
         dataset = make_dataset(cfg)
+
+    if dataset_validator is not None:
+        dataset_validator(dataset, cfg)
+
+    if cfg.acp.enable and is_main_process:
+        indicator_stats = compute_acp_indicator_stats(dataset, cfg.acp.indicator_field)
+        if indicator_stats is None:
+            logging.warning(
+                "ACP is enabled but indicator statistics are unavailable for field '%s'.",
+                cfg.acp.indicator_field,
+            )
+        else:
+            if indicator_stats.total_count >= 0:
+                logging.info(
+                    "ACP indicator stats (%s): field='%s' ratio=%.6f positive=%d total=%d",
+                    indicator_stats.source,
+                    indicator_stats.indicator_field,
+                    indicator_stats.positive_ratio,
+                    indicator_stats.positive_count,
+                    indicator_stats.total_count,
+                )
+            else:
+                logging.info(
+                    "ACP indicator stats (%s): field='%s' ratio=%.6f",
+                    indicator_stats.source,
+                    indicator_stats.indicator_field,
+                    indicator_stats.positive_ratio,
+                )
+            if indicator_stats.invalid_count > 0:
+                logging.warning(
+                    "ACP indicator field '%s' contains %d non-binary values (expected only 0/1).",
+                    indicator_stats.indicator_field,
+                    indicator_stats.invalid_count,
+                )
 
     # Create environment used for evaluating checkpoints during training on simulation data.
     # On real-world data, no need to create an environment as evaluations are done outside train.py,
@@ -475,6 +494,7 @@ def train(
             accelerator=accelerator,
             lr_scheduler=lr_scheduler,
             rabc_weights_provider=rabc_weights,
+            **({"fail_on_nonfinite": True} if fail_on_nonfinite else {}),
         )
 
         # Note: eval and checkpoint happens *after* the `step`th training update has completed, so we
