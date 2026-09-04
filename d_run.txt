@@ -79,7 +79,7 @@ pip install -e ".[pi]"
 
 export TRC_SMOKE_OUTPUT="outputs/train/banknote_binding_trc_smoke_$(date +%Y%m%d_%H%M%S)"
 
-CUDA_VISIBLE_DEVICES=7 lerobot-train-trc-smoke \
+CUDA_VISIBLE_DEVICES=3 lerobot-train-trc-smoke \
   --dataset.repo_id=banknote_binding_iteration_1 \
   --dataset.root=/nfs/lerobot/s101/datasets/aggregation/evo-rl/banknote_binding_iteration_1/ \
   --policy.type=pi05 \
@@ -109,7 +109,7 @@ CUDA_VISIBLE_DEVICES=7 lerobot-train-trc-smoke \
 # Run this only after the short test prints TRC_SHORT_TRAIN: PASS.
 # The output directory must not already exist unless intentionally resuming.
 
-CUDA_VISIBLE_DEVICES=7 lerobot-train-trc \
+CUDA_VISIBLE_DEVICES=3 lerobot-train-trc \
   --dataset.repo_id=banknote_binding_iteration_1 \
   --dataset.root=/nfs/lerobot/s101/datasets/aggregation/evo-rl/banknote_binding_iteration_1/ \
   --policy.type=pi05 \

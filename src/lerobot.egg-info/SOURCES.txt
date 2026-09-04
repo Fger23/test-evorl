@@ -277,8 +277,9 @@ src/lerobot/scripts/lerobot_setup_can.py
 src/lerobot/scripts/lerobot_setup_motors.py
 src/lerobot/scripts/lerobot_teleoperate.py
 src/lerobot/scripts/lerobot_train.py
-src/lerobot/scripts/lerobot_train_trc.py
 src/lerobot/scripts/lerobot_train_tokenizer.py
+src/lerobot/scripts/lerobot_train_trc.py
+src/lerobot/scripts/lerobot_train_trc_smoke.py
 src/lerobot/scripts/lerobot_value_infer.py
 src/lerobot/scripts/lerobot_value_train.py
 src/lerobot/scripts/recording_hil.py

@@ -18,6 +18,7 @@ import builtins
 import logging
 import math
 from collections import deque
+from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, TypedDict
 
@@ -53,9 +54,13 @@ from lerobot.utils.constants import (
 
 
 class ActionSelectKwargs(TypedDict, total=False):
+    """Keyword arguments accepted by PI0.5 chunk sampling."""
+
     inference_delay: int | None
     prev_chunk_left_over: Tensor | None
     execution_horizon: int | None
+    training_time_rtc: bool
+    rtc_action_prefix: Tensor | None
 
 
 def _sample_training_rtc_prefix_mask(
@@ -118,6 +123,134 @@ def _reduce_training_rtc_loss(
     return (losses * postfix_mask).sum() / postfix_mask.sum().clamp(min=1)
 
 
+def _prepare_training_rtc_inference_prefix(
+    noise: Tensor,
+    action_prefix: Tensor | None,
+    inference_delay: int | None,
+    max_delay: int,
+) -> tuple[Tensor, Tensor]:
+    """Validate and pad a clean Training-Time RTC prefix for PI0.5 sampling.
+
+    ``action_prefix`` is expressed in the policy's normalized action space. Its
+    action dimension may be smaller than ``max_action_dim``; the remaining
+    dimensions are zero padded exactly like training actions.
+    """
+    if noise.ndim != 3:
+        raise ValueError(f"PI0.5 sampling noise must have shape (B, T, A), got {tuple(noise.shape)}.")
+    if not isinstance(max_delay, int) or isinstance(max_delay, bool) or max_delay <= 0:
+        raise ValueError(
+            "Training-Time RTC inference requires a checkpoint trained with ``rtc_training_max_delay > 0``."
+        )
+
+    delay = 0 if inference_delay is None else inference_delay
+    if not isinstance(delay, int) or isinstance(delay, bool):
+        raise TypeError(f"Training-Time RTC inference delay must be an integer, got {delay!r}.")
+    if delay < 0:
+        raise ValueError(f"Training-Time RTC inference delay must be non-negative, got {delay}.")
+
+    _, action_horizon, padded_action_dim = noise.shape
+    if delay >= action_horizon:
+        raise ValueError(
+            f"Training-Time RTC inference delay ({delay}) must be smaller than chunk_size ({action_horizon})."
+        )
+    if delay > max_delay:
+        raise ValueError(
+            f"Training-Time RTC inference delay ({delay}) exceeds the checkpoint's trained maximum "
+            f"({max_delay})."
+        )
+
+    prefix_mask = (torch.arange(action_horizon, device=noise.device).unsqueeze(0) < delay).expand(
+        noise.shape[0], -1
+    )
+    padded_prefix = torch.zeros_like(noise)
+    if delay == 0:
+        return padded_prefix, prefix_mask
+    if action_prefix is None:
+        raise ValueError("A normalized ``rtc_action_prefix`` is required when inference_delay > 0.")
+    if not isinstance(action_prefix, torch.Tensor):
+        raise TypeError(
+            f"Training-Time RTC action prefix must be a tensor, got {type(action_prefix).__name__}."
+        )
+
+    if action_prefix.ndim == 2:
+        action_prefix = action_prefix.unsqueeze(0)
+    if action_prefix.ndim != 3:
+        raise ValueError(
+            "Training-Time RTC action prefix must have shape (T, A) or (B, T, A), "
+            f"got {tuple(action_prefix.shape)}."
+        )
+    if action_prefix.shape[0] != noise.shape[0]:
+        raise ValueError(
+            "Training-Time RTC prefix batch size must match the observation batch: "
+            f"{action_prefix.shape[0]} != {noise.shape[0]}."
+        )
+    if action_prefix.shape[1] < delay:
+        raise ValueError(
+            f"Training-Time RTC prefix contains {action_prefix.shape[1]} steps, but delay={delay}."
+        )
+    if action_prefix.shape[2] > padded_action_dim:
+        raise ValueError(
+            "Training-Time RTC prefix action dimension exceeds PI0.5 max_action_dim: "
+            f"{action_prefix.shape[2]} > {padded_action_dim}."
+        )
+
+    action_prefix = action_prefix.to(device=noise.device, dtype=noise.dtype)
+    if not torch.isfinite(action_prefix[:, :delay]).all():
+        raise ValueError("Training-Time RTC action prefix contains NaN or Inf values.")
+    padded_prefix[:, :delay, : action_prefix.shape[2]] = action_prefix[:, :delay]
+    return padded_prefix, prefix_mask
+
+
+def _integrate_training_rtc_actions(
+    denoise_fn: Callable[[Tensor, Tensor], Tensor],
+    noise: Tensor,
+    clean_prefix: Tensor,
+    prefix_mask: Tensor,
+    num_steps: int,
+) -> Tensor:
+    """Euler sample a postfix while hard-clamping the learned clean prefix.
+
+    PI0.5 in this checkout integrates from time 1 (noise) to time 0 (data), so
+    known prefix tokens use time 0. This is the time-reversed equivalent of
+    Algorithm 1 in *Training-Time Action Conditioning for Efficient Real-Time
+    Chunking*.
+    """
+    if not isinstance(num_steps, int) or isinstance(num_steps, bool) or num_steps <= 0:
+        raise ValueError(f"num_steps must be a positive integer, got {num_steps!r}.")
+    if clean_prefix.shape != noise.shape:
+        raise ValueError(
+            f"Clean prefix shape must match sampling noise: {tuple(clean_prefix.shape)} != {tuple(noise.shape)}."
+        )
+    if prefix_mask.shape != noise.shape[:2]:
+        raise ValueError(
+            f"Prefix mask must have shape {tuple(noise.shape[:2])}, got {tuple(prefix_mask.shape)}."
+        )
+
+    dt = -1.0 / num_steps
+    x_t = noise
+    expanded_mask = prefix_mask.unsqueeze(-1)
+    for step in range(num_steps):
+        # Re-clamp before every model call. The model is not trained to predict
+        # the prefix velocity, so allowing Euler updates to move it is invalid.
+        x_t = torch.where(expanded_mask, clean_prefix, x_t)
+        time = 1.0 + step * dt
+        model_time = torch.full(
+            prefix_mask.shape,
+            time,
+            dtype=torch.float32,
+            device=noise.device,
+        )
+        model_time = torch.where(prefix_mask, torch.zeros_like(model_time), model_time)
+        v_t = denoise_fn(x_t, model_time)
+        if v_t.shape != x_t.shape:
+            raise ValueError(
+                f"PI0.5 denoiser returned shape {tuple(v_t.shape)}, expected {tuple(x_t.shape)}."
+            )
+        x_t = x_t + dt * v_t
+
+    return torch.where(expanded_mask, clean_prefix, x_t)
+
+
 def _apply_adarms_norm(norm: nn.Module, x: Tensor, cond: Tensor | None) -> tuple[Tensor, Tensor | None]:
     """Apply the patched Gemma AdaRMS norm with scalar or per-action conditioning.
 
@@ -143,6 +276,96 @@ def _apply_adarms_norm(norm: nn.Module, x: Tensor, cond: Tensor | None) -> tuple
     scale, shift, gate = dense(cond).chunk(3, dim=-1)
     normed = normed * (1 + scale.float()) + shift.float()
     return normed.to(x.dtype), gate.to(x.dtype)
+
+
+def _forward_expert_suffix_with_per_token_adarms(
+    model: nn.Module,
+    inputs_embeds: Tensor,
+    attention_mask: Tensor | None,
+    position_ids: Tensor | None,
+    past_key_values,
+    adarms_cond: Tensor,
+) -> Tensor:
+    """Run the cached action expert without collapsing per-action time conditions.
+
+    The pinned Transformers fork broadcasts a scalar AdaRMS condition correctly,
+    but it also unconditionally adds a token axis when the condition already has
+    shape ``(B, T, D)``. That turns suffix hidden states into a rank-4 tensor.
+    Keep the legacy scalar path in Transformers and use this equivalent layer
+    loop only for Training-Time RTC's per-action condition.
+
+    ``past_key_values`` contains the PaliGemma prefix cache. It is read with
+    ``use_cache=False`` so denoising steps cannot mutate the shared prefix.
+    """
+    if inputs_embeds.ndim != 3:
+        raise ValueError(
+            f"Expert suffix embeddings must have shape (B, T, D), got {tuple(inputs_embeds.shape)}."
+        )
+    if adarms_cond.ndim != 3 or adarms_cond.shape[:2] != inputs_embeds.shape[:2]:
+        raise ValueError(
+            "Per-action AdaRMS condition must match the suffix batch/token axes: "
+            f"{tuple(adarms_cond.shape)} vs {tuple(inputs_embeds.shape)}."
+        )
+
+    past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
+    cache_position = torch.arange(
+        past_seen_tokens,
+        past_seen_tokens + inputs_embeds.shape[1],
+        device=inputs_embeds.device,
+    )
+    if position_ids is None:
+        position_ids = cache_position.unsqueeze(0)
+
+    causal_mask = modeling_gemma.create_causal_mask(
+        config=model.config,
+        input_embeds=inputs_embeds,
+        attention_mask=attention_mask,
+        cache_position=cache_position,
+        past_key_values=past_key_values,
+        position_ids=position_ids,
+    )
+
+    hidden_states = inputs_embeds
+    if len(model.layers) > 0 and model.layers[0].self_attn.q_proj.weight.dtype == torch.bfloat16:
+        hidden_states = hidden_states.to(torch.bfloat16)
+    position_embeddings = model.rotary_emb(hidden_states, position_ids)
+
+    for decoder_layer in model.layers[: model.config.num_hidden_layers]:
+        residual = hidden_states
+        hidden_states, gate = _apply_adarms_norm(
+            decoder_layer.input_layernorm,
+            hidden_states,
+            adarms_cond,
+        )
+        hidden_states, _ = decoder_layer.self_attn(
+            hidden_states=hidden_states,
+            attention_mask=causal_mask,
+            past_key_value=past_key_values,
+            use_cache=False,
+            cache_position=cache_position,
+            position_embeddings=position_embeddings,
+        )
+        hidden_states = modeling_gemma._gated_residual(  # noqa: SLF001
+            residual,
+            hidden_states,
+            gate,
+        )
+
+        residual = hidden_states
+        hidden_states, gate = _apply_adarms_norm(
+            decoder_layer.post_attention_layernorm,
+            hidden_states,
+            adarms_cond,
+        )
+        hidden_states = decoder_layer.mlp(hidden_states)
+        hidden_states = modeling_gemma._gated_residual(  # noqa: SLF001
+            residual,
+            hidden_states,
+            gate,
+        )
+
+    hidden_states, _ = _apply_adarms_norm(model.norm, hidden_states, adarms_cond)
+    return hidden_states
 
 
 def get_safe_dtype(target_dtype, device_type):
@@ -544,15 +767,28 @@ class PaliGemmaWithExpertModel(
             prefix_output = prefix_output.last_hidden_state
             suffix_output = None
         elif inputs_embeds[0] is None:
-            suffix_output = self.gemma_expert.model.forward(
-                inputs_embeds=inputs_embeds[1],
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-                past_key_values=past_key_values,
-                use_cache=use_cache,
-                adarms_cond=adarms_cond[1] if adarms_cond is not None else None,
-            )
-            suffix_output = suffix_output.last_hidden_state
+            expert_cond = adarms_cond[1] if adarms_cond is not None else None
+            if expert_cond is not None and expert_cond.ndim == 3:
+                if use_cache:
+                    raise ValueError("Per-action expert inference reads a prefix cache but must not update it.")
+                suffix_output = _forward_expert_suffix_with_per_token_adarms(
+                    model=self.gemma_expert.model,
+                    inputs_embeds=inputs_embeds[1],
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    past_key_values=past_key_values,
+                    adarms_cond=expert_cond,
+                )
+            else:
+                suffix_output = self.gemma_expert.model.forward(
+                    inputs_embeds=inputs_embeds[1],
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    past_key_values=past_key_values,
+                    use_cache=use_cache,
+                    adarms_cond=expert_cond,
+                )
+                suffix_output = suffix_output.last_hidden_state
             prefix_output = None
             prefix_past_key_values = None
         else:
@@ -887,6 +1123,17 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         """Do a full inference forward and compute the action."""
         if num_steps is None:
             num_steps = self.config.num_inference_steps
+        if not isinstance(num_steps, int) or isinstance(num_steps, bool) or num_steps <= 0:
+            raise ValueError(f"`num_steps` must be a positive integer, got {num_steps!r}.")
+
+        training_time_rtc = kwargs.get("training_time_rtc", False)
+        if not isinstance(training_time_rtc, bool):
+            raise TypeError(f"`training_time_rtc` must be a bool, got {training_time_rtc!r}.")
+        if training_time_rtc and self._rtc_enabled():
+            raise ValueError(
+                "Training-Time RTC and legacy inference-time RTC guidance cannot be enabled together. "
+                "Disable `rtc_config.enabled` for a Training-Time RTC checkpoint."
+            )
 
         bsize = tokens.shape[0]
         device = tokens.device
@@ -899,6 +1146,22 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
                 self.config.max_action_dim,
             )  # Use config max_action_dim for internal processing
             noise = self.sample_noise(actions_shape, device)
+        else:
+            expected_shape = (
+                bsize,
+                self.config.chunk_size,
+                self.config.max_action_dim,
+            )
+            if not isinstance(noise, torch.Tensor):
+                raise TypeError(f"Sampling noise must be a tensor, got {type(noise).__name__}.")
+            if tuple(noise.shape) != expected_shape:
+                raise ValueError(
+                    f"Sampling noise must have shape {expected_shape}, got {tuple(noise.shape)}."
+                )
+            if noise.device != device:
+                raise ValueError(f"Sampling noise must be on {device}, got {noise.device}.")
+            if not noise.is_floating_point() or not bool(torch.isfinite(noise).all()):
+                raise ValueError("Sampling noise must be a finite floating-point tensor.")
 
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, tokens, masks)
         prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
@@ -915,20 +1178,37 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             use_cache=True,
         )
 
-        dt = -1.0 / num_steps
+        def denoise_step_call(input_x_t: Tensor, current_timestep: Tensor) -> Tensor:
+            return self.denoise_step(
+                prefix_pad_masks=prefix_pad_masks,
+                past_key_values=past_key_values,
+                x_t=input_x_t,
+                timestep=current_timestep,
+            )
 
+        if training_time_rtc:
+            clean_prefix, prefix_mask = _prepare_training_rtc_inference_prefix(
+                noise=noise,
+                action_prefix=kwargs.get("rtc_action_prefix"),
+                inference_delay=kwargs.get("inference_delay"),
+                max_delay=self.config.rtc_training_max_delay,
+            )
+            return _integrate_training_rtc_actions(
+                denoise_fn=denoise_step_call,
+                noise=noise,
+                clean_prefix=clean_prefix,
+                prefix_mask=prefix_mask,
+                num_steps=num_steps,
+            )
+
+        dt = -1.0 / num_steps
         x_t = noise
         for step in range(num_steps):
             time = 1.0 + step * dt
             time_tensor = torch.tensor(time, dtype=torch.float32, device=device).expand(bsize)
 
             def denoise_step_partial_call(input_x_t, current_timestep=time_tensor):
-                return self.denoise_step(
-                    prefix_pad_masks=prefix_pad_masks,
-                    past_key_values=past_key_values,
-                    x_t=input_x_t,
-                    timestep=current_timestep,
-                )
+                return denoise_step_call(input_x_t, current_timestep)
 
             if self._rtc_enabled():
                 inference_delay = kwargs.get("inference_delay")
@@ -1156,9 +1436,9 @@ class PI05Policy(PreTrainedPolicy):
                 original_state_dict = load_file(resolved_file)
                 print("✓ Loaded state dict from model.safetensors")
             except Exception as e:
-                print(f"Could not load state dict from remote files: {e}")
-                print("Returning model without loading pretrained weights")
-                return model
+                raise RuntimeError(
+                    f"Could not load PI0.5 model.safetensors from {pretrained_name_or_path!s}."
+                ) from e
 
             # First, fix any key differences # see openpi `model.py, _fix_pytorch_state_dict_keys`
             fixed_state_dict = model._fix_pytorch_state_dict_keys(original_state_dict, model.config)
@@ -1213,7 +1493,9 @@ class PI05Policy(PreTrainedPolicy):
                 print("All keys loaded successfully!")
 
         except Exception as e:
-            print(f"Warning: Could not remap state dict keys: {e}")
+            raise RuntimeError(
+                f"Failed to load PI0.5 checkpoint weights from {pretrained_name_or_path!s}."
+            ) from e
 
         return model
 

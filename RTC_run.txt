@@ -1,0 +1,133 @@
+# RTC + ACP real-robot inference (Linux / Bash)
+#
+# Deploy the SAME checkout on the H200 server and the robot client. The gRPC
+# transport pickles Python classes, so mixing code versions is not supported.
+# Run once after updating each checkout:
+#
+#   # H200 server (PI0.5 model + gRPC):
+#   pip install -e ".[pi,async]"
+#
+#   # Robot client (gRPC + SO101 motors + RealSense camera):
+#   pip install -e ".[async,feetech,intelrealsense]"
+#
+# The supplied checkpoint is `checkpoints/last`, but LeRobot loads the exported
+# policy from its `pretrained_model` child directory.
+
+
+# ============================================================
+# Terminal 1: H200 policy server (start this first)
+# ============================================================
+
+cd ~/training-rtc/Evo-RL
+source ~/miniforge3/etc/profile.d/conda.sh
+conda activate evo-rl
+set -euo pipefail
+
+export TRC_CHECKPOINT_ON_SERVER="/nfs/baiyuntian/assets/models/banknote_binding_iteration_1_pi05_trc_d37_20260903_184214/checkpoints/last"
+export TRC_POLICY_ON_SERVER="$TRC_CHECKPOINT_ON_SERVER/pretrained_model"
+export RTC_SERVER_IP="10.61.5.3"
+
+# Fail before opening the port if the checkpoint/export is not visible here.
+test -f "$TRC_POLICY_ON_SERVER/config.json" || {
+  echo "Missing policy config: $TRC_POLICY_ON_SERVER/config.json" >&2
+  exit 1
+}
+test -f "$TRC_POLICY_ON_SERVER/model.safetensors" || {
+  echo "Missing policy weights: $TRC_POLICY_ON_SERVER/model.safetensors" >&2
+  exit 1
+}
+
+# Keep all GPUs visible because the client requests server device cuda:7.
+# If the H200 has a different CUDA ordinal, change H200_POLICY_DEVICE in the
+# client command below to match it.
+export CUDA_DEVICE_ORDER=PCI_BUS_ID
+unset CUDA_VISIBLE_DEVICES
+
+# This protocol uses Python pickle and keeps one RTC session state on the server.
+# Bind only the H200 private-network address, never a public interface, allow
+# exactly one robot client at a time, and restrict TCP/8090 to that client in
+# the host firewall before production use.
+PYTHONPATH="$PWD/src" python -m lerobot.async_inference.policy_server \
+  --host="$RTC_SERVER_IP" \
+  --port=8090 \
+  --fps=30 \
+  --inference_latency=0 \
+  --obs_queue_timeout=5
+
+# Expected first log line:
+# PolicyServer started on 10.61.5.3:8090
+# The model is loaded onto the H200 after the client connects and sends setup.
+
+
+# ============================================================
+# Terminal 2: robot-side RTC + ACP inference client
+# ============================================================
+
+cd ~/code/Evo-RL
+source ~/miniforge3/etc/profile.d/conda.sh
+conda activate evo-rl
+set -euo pipefail
+
+export RTC_SERVER_IP="10.61.5.3"
+export H200_POLICY_DEVICE="cuda:7"
+export TRC_CHECKPOINT_ON_SERVER="/nfs/baiyuntian/assets/models/banknote_binding_iteration_1_pi05_trc_d37_20260903_184214/checkpoints/last"
+export TRC_POLICY_ON_SERVER="$TRC_CHECKPOINT_ON_SERVER/pretrained_model"
+export LEFT_ARM_PORT="/dev/ttyACM0"
+export RIGHT_ARM_PORT="/dev/ttyACM1"
+
+# Required checks before enabling the robot. Compare the udev serial identities
+# with the last known-good left/right mapping; ttyACM numbers can swap after a
+# reboot. Prefer replacing LEFT_ARM_PORT/RIGHT_ARM_PORT with /dev/serial/by-id
+# paths once their stable names are known.
+test -e "$LEFT_ARM_PORT"
+test -e "$RIGHT_ARM_PORT"
+test -e /dev/v4l/by-path/pci-0000:c6:00.3-usb-0:2:1.0-video-index0
+test -e /dev/v4l/by-path/pci-0000:c6:00.3-usb-0:1:1.0-video-index0
+udevadm info --query=property --name="$LEFT_ARM_PORT" | grep -E '^ID_(SERIAL|PATH)='
+udevadm info --query=property --name="$RIGHT_ARM_PORT" | grep -E '^ID_(SERIAL|PATH)='
+
+# Do not let inference trigger a surprise calibration flow. These are the two
+# files selected by robot.id=bimanual_follower with the default calibration dir.
+export RTC_CALIBRATION_DIR="$(PYTHONPATH="$PWD/src" python -c \
+  'from lerobot.utils.constants import HF_LEROBOT_CALIBRATION; print(HF_LEROBOT_CALIBRATION / "robots" / "so_follower")')"
+test -f "$RTC_CALIBRATION_DIR/bimanual_follower_left.json"
+test -f "$RTC_CALIBRATION_DIR/bimanual_follower_right.json"
+
+# Confirm the policy server is reachable before the robot is connected.
+python -c 'import os, socket; socket.create_connection((os.environ["RTC_SERVER_IP"], 8090), timeout=3).close()'
+
+PYTHONPATH="$PWD/src" python -m lerobot.scripts.lerobot_infer_trc \
+  --robot.type=bi_so_follower \
+  --robot.id=bimanual_follower \
+  --robot.left_arm_config.port="$LEFT_ARM_PORT" \
+  --robot.right_arm_config.port="$RIGHT_ARM_PORT" \
+  --robot.left_arm_config.cameras='{
+    fixed: {"type": "intelrealsense", "serial_number_or_name": "260322276426", "width": 640, "height": 480, "fps": 30},
+    wrist: {"type": "opencv", "index_or_path": "/dev/v4l/by-path/pci-0000:c6:00.3-usb-0:2:1.0-video-index0", "width": 640, "height": 480, "fps": 30, "fourcc": "MJPG"}
+  }' \
+  --robot.right_arm_config.cameras='{
+    wrist: {"type": "opencv", "index_or_path": "/dev/v4l/by-path/pci-0000:c6:00.3-usb-0:1:1.0-video-index0", "width": 640, "height": 480, "fps": 30, "fourcc": "MJPG"}
+  }' \
+  --pretrained_name_or_path="$TRC_POLICY_ON_SERVER" \
+  --task="Pick up the banknotes from the desktop, straighten them out, and then place them into the banknote binding machine." \
+  --server_address="$RTC_SERVER_IP:8090" \
+  --policy_device="$H200_POLICY_DEVICE" \
+  --actions_per_chunk=50 \
+  --rtc_prefix_steps=21 \
+  --refill_threshold=0.7 \
+  --fps=30 \
+  --rpc_timeout_s=30 \
+  --setup_timeout_s=600 \
+  --queue_wait_timeout_s=60 \
+  --max_consecutive_late_chunks=3
+
+# Stop inference with Ctrl+C. The client sends only the base task. The server
+# appends exactly one `Advantage: positive` tag and performs one positive-branch
+# forward per refill (CFG disabled, beta=1).
+#
+# H=50 and trained D=37 are read from this checkpoint. Historical RTC runs use
+# d=21 as the starting point; keep it <=37. If actual d exceeds 21, that response is
+# discarded; three consecutive late responses stop the client for safety.
+#
+# Equivalent installed entry point:
+#   lerobot-infer-trc [the same options above]

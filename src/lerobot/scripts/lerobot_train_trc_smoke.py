@@ -89,6 +89,9 @@ def validate_trc_smoke_config(cfg: TrainPipelineConfig) -> None:
 @parser.wrap()
 def train_trc_smoke(cfg: TrainPipelineConfig):
     """Run real PI0.5 forward/backward optimizer steps with strict numerical checks."""
+    # train() runs its shared config validation first, which rejects the run when
+    # push_to_hub defaults to true without a policy.repo_id. Disable it up front.
+    cfg.policy.push_to_hub = False
     result = train(
         cfg,
         config_validator=validate_trc_smoke_config,

@@ -225,13 +225,53 @@ class TimedAction(TimedData):
         return self.action
 
 
+@dataclass(frozen=True)
+class TrainingTimeRTCMetadata:
+    """Per-request clean-prefix inputs for a Training-Time RTC checkpoint."""
+
+    request_id: str
+    action_prefix: torch.Tensor | None = None
+    prefix_steps: int = 0
+
+
 @dataclass
 class TimedObservation(TimedData):
     observation: RawObservation
     must_go: bool = False
+    rtc_metadata: TrainingTimeRTCMetadata | None = None
 
     def get_observation(self):
         return self.observation
+
+
+@dataclass
+class RemoteActionChunk:
+    """Protocol-v2 action response with aligned normalized and robot-space actions."""
+
+    request_id: str
+    actions: list[TimedAction]
+    raw_actions: torch.Tensor
+    observation_timestep: int
+    training_time_rtc: bool = False
+    prefix_steps: int = 0
+    acp_positive_prompt: bool = False
+    use_cfg: bool = False
+    cfg_beta: float = 1.0
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.raw_actions, torch.Tensor) or self.raw_actions.ndim != 2:
+            shape = getattr(self.raw_actions, "shape", None)
+            raise ValueError(f"`raw_actions` must have shape [T, A], got {shape}.")
+        if len(self.actions) != self.raw_actions.shape[0]:
+            raise ValueError(
+                "`actions` and `raw_actions` must contain the same number of timesteps, "
+                f"got {len(self.actions)} and {self.raw_actions.shape[0]}."
+            )
+        if not 0 <= self.prefix_steps < self.raw_actions.shape[0]:
+            raise ValueError(
+                f"`prefix_steps` must satisfy 0 <= d < T, got d={self.prefix_steps}, "
+                f"T={self.raw_actions.shape[0]}."
+            )
 
 
 @dataclass
@@ -270,6 +310,17 @@ class RemotePolicyConfig:
     actions_per_chunk: int
     device: str = "cpu"
     rename_map: dict[str, str] = field(default_factory=dict)
+    # Version 1 returns list[TimedAction]. Version 2 may return RemoteActionChunk
+    # with normalized actions required for the next learned RTC clean prefix.
+    protocol_version: int = 1
+    return_raw_actions: bool = False
+    training_time_rtc: bool = False
+    rtc_prefix_steps: int = 0
+    acp_positive_prompt: bool = False
+    # This entry point deliberately supports only one positive-conditioned
+    # branch. These fields make that contract explicit on both endpoints.
+    use_cfg: bool = False
+    cfg_beta: float = 1.0
 
 
 def _compare_observation_states(obs1_state: torch.Tensor, obs2_state: torch.Tensor, atol: float) -> bool:

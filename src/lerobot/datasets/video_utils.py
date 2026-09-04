@@ -17,6 +17,7 @@ import glob
 import importlib
 import logging
 import shutil
+import os
 import tempfile
 import warnings
 from dataclasses import dataclass, field
@@ -177,6 +178,7 @@ class VideoDecoderCache:
     def __init__(self):
         self._cache: dict[str, tuple[Any, Any]] = {}
         self._lock = Lock()
+        self._pid = os.getpid()
 
     def get_decoder(self, video_path: str):
         """Get a cached decoder or create a new one."""
@@ -188,12 +190,28 @@ class VideoDecoderCache:
         video_path = str(video_path)
 
         with self._lock:
+            # Decoders and file handles inherited through fork are not safe to
+            # reuse: FFmpeg internal state and shared file offsets get corrupted.
+            # Forked DataLoader workers must rebuild their own decoders.
+            if self._pid != os.getpid():
+                self._cache.clear()
+                self._pid = os.getpid()
             if video_path not in self._cache:
                 file_handle = fsspec.open(video_path).__enter__()
                 decoder = VideoDecoder(file_handle, seek_mode="approximate")
                 self._cache[video_path] = (decoder, file_handle)
 
             return self._cache[video_path][0]
+
+    def invalidate(self, video_path: str):
+        """Drop a possibly-corrupted decoder so the next call recreates it."""
+        with self._lock:
+            entry = self._cache.pop(str(video_path), None)
+        if entry is not None:
+            try:
+                entry[1].close()
+            except Exception:
+                pass
 
     def clear(self):
         """Clear the cache and close file handles."""
@@ -256,7 +274,14 @@ def decode_video_frames_torchcodec(
     # convert timestamps to frame indices
     frame_indices = [round(ts * average_fps) for ts in timestamps]
     # retrieve frames based on indices
-    frames_batch = decoder.get_frames_at(indices=frame_indices)
+    try:
+        frames_batch = decoder.get_frames_at(indices=frame_indices)
+    except RuntimeError:
+        # A transient read error (e.g. an NFS hiccup) can poison the cached
+        # decoder permanently. Recreate it once before giving up.
+        decoder_cache.invalidate(str(video_path))
+        decoder = decoder_cache.get_decoder(str(video_path))
+        frames_batch = decoder.get_frames_at(indices=frame_indices)
 
     for frame, pts in zip(frames_batch.data, frames_batch.pts_seconds, strict=True):
         loaded_frames.append(frame)
